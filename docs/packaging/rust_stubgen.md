@@ -135,7 +135,6 @@ fn main() -> tvm_ffi::Result<()> {
 - Generated object method wrappers (including constructor `new`) are resolved via type metadata rather than global function lookup.
 - Generated object-returning wrappers integrate with `ObjectRef` APIs and wrapper conversions.
 
-
 ## Related Docs
 
 - Rust language guide: `guides/rust_lang_guide.md`
