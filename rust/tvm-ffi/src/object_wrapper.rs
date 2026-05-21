@@ -22,8 +22,8 @@ use crate::object::{Object, ObjectArc, ObjectRef, ObjectRefCore};
 use crate::type_traits::AnyCompatible;
 use std::marker::PhantomData;
 use tvm_ffi_sys::{
-    TVMFFIAny, TVMFFIAnyViewToOwnedAny, TVMFFIByteArray, TVMFFIFieldGetter, TVMFFIGetTypeInfo,
-    TVMFFIObject, TVMFFITypeKeyToIndex,
+    TVMFFIAny, TVMFFIAnyViewToOwnedAny, TVMFFIByteArray, TVMFFIFieldGetter, TVMFFIGetTypeAttrColumn,
+    TVMFFIGetTypeInfo, TVMFFIObject, TVMFFITypeKeyToIndex,
 };
 
 /// Runtime support for stubgen-generated object wrappers.
@@ -136,38 +136,77 @@ fn resolve_type_method_by_type_index(
             );
         }
         let info = &*info;
-        if info.methods.is_null() || info.num_methods <= 0 {
+        if !info.methods.is_null() && info.num_methods > 0 {
+            let methods = std::slice::from_raw_parts(info.methods, info.num_methods as usize);
+            for method in methods {
+                if method.name.as_str() != method_name {
+                    continue;
+                }
+                let mut owned = TVMFFIAny::new();
+                crate::check_safe_call!(TVMFFIAnyViewToOwnedAny(&method.method, &mut owned))?;
+                let method_any = Any::from_raw_ffi_any(owned);
+                return method_any.try_into().map_err(|_err: crate::Error| {
+                    crate::Error::new(
+                        crate::TYPE_ERROR,
+                        &format!(
+                            "Method {}.{} is not callable as ffi.Function",
+                            type_key, method_name
+                        ),
+                        "",
+                    )
+                });
+            }
+        }
+        resolve_type_attr_function(type_index, type_key, method_name)
+    }
+}
+
+fn resolve_type_attr_function(
+    type_index: i32,
+    type_key: &str,
+    attr_name: &str,
+) -> crate::Result<crate::Function> {
+    unsafe {
+        let attr = TVMFFIByteArray::from_str(attr_name);
+        let column = TVMFFIGetTypeAttrColumn(&attr);
+        if column.is_null() {
             crate::bail!(
                 crate::error::ATTRIBUTE_ERROR,
-                "Type {} has no methods",
-                type_key
+                "Type attr column {} not found",
+                attr_name
             );
         }
-        let methods = std::slice::from_raw_parts(info.methods, info.num_methods as usize);
-        for method in methods {
-            if method.name.as_str() != method_name {
-                continue;
-            }
-            let mut owned = TVMFFIAny::new();
-            crate::check_safe_call!(TVMFFIAnyViewToOwnedAny(&method.method, &mut owned))?;
-            let method_any = Any::from_raw_ffi_any(owned);
-            return method_any.try_into().map_err(|_err: crate::Error| {
-                crate::Error::new(
-                    crate::TYPE_ERROR,
-                    &format!(
-                        "Method {}.{} is not callable as ffi.Function",
-                        type_key, method_name
-                    ),
-                    "",
-                )
-            });
+        let column = &*column;
+        if column.data.is_null() {
+            crate::bail!(
+                crate::error::ATTRIBUTE_ERROR,
+                "Type attr column {} has no data",
+                attr_name
+            );
         }
-        crate::bail!(
-            crate::error::ATTRIBUTE_ERROR,
-            "Method {}.{} not found in reflection metadata",
-            type_key,
-            method_name
-        );
+        let idx = type_index - column.begin_index;
+        if idx < 0 || idx >= column.size {
+            crate::bail!(
+                crate::error::ATTRIBUTE_ERROR,
+                "Type {} has no attr {}",
+                type_key,
+                attr_name
+            );
+        }
+        let any_view = column.data.add(idx as usize);
+        let mut owned = TVMFFIAny::new();
+        crate::check_safe_call!(TVMFFIAnyViewToOwnedAny(any_view, &mut owned))?;
+        let attr_any = Any::from_raw_ffi_any(owned);
+        attr_any.try_into().map_err(|_err: crate::Error| {
+            crate::Error::new(
+                crate::TYPE_ERROR,
+                &format!(
+                    "Type attr {}.{} is not callable as ffi.Function",
+                    type_key, attr_name
+                ),
+                "",
+            )
+        })
     }
 }
 

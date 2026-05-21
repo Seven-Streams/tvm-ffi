@@ -20,8 +20,7 @@ name = "tvm-ffi-macros"
 description = "Procedural macro crate for tvm-ffi"
 
 version = "0.1.0-alpha.0"
-edition = "2024"
-rust-version = "1.85"
+edition = "2021"
 license = "Apache-2.0"
 
 

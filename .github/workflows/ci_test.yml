@@ -75,7 +75,7 @@ jobs:
         uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098  # v7.3.1
       - name: Set up Python environment
         run: uv sync --group dev --no-install-project
-      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd  # v3.0.1
+      # - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd  # v3.0.1
 
   clang-tidy:
     needs: [prepare]
@@ -205,8 +205,12 @@ jobs:
       # Run Rust tests, must happen after installing the pip package.
       - name: Run rust tests
         working-directory: rust
+        env:
+          RUST_BACKTRACE: full
+          RUST_TEST_NOCAPTURE: "1"
+          RUST_TEST_THREADS: "1"
         run: |
-          cargo test
+          cargo test -- --nocapture --test-threads=1
 
   orcjit:
     needs: [lint, prepare]

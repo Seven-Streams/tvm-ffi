@@ -17,9 +17,11 @@
 
 use libloading::Library;
 use std::path::PathBuf;
+use tvm_ffi::Any;
 use tvm_ffi::Array;
 use tvm_ffi::tvm_ffi_sys::{
-    TVMFFIByteArray, TVMFFIGetTypeInfo, TVMFFITypeInfo, TVMFFITypeKeyToIndex,
+    TVMFFIAny, TVMFFIAnyViewToOwnedAny, TVMFFIByteArray, TVMFFIGetTypeAttrColumn,
+    TVMFFIGetTypeInfo, TVMFFITypeInfo, TVMFFITypeKeyToIndex,
 };
 use tvm_ffi::{Function, Result as FfiResult, String as FfiString};
 
@@ -67,6 +69,36 @@ pub(crate) fn get_type_info(type_key: &str) -> Option<&'static TVMFFITypeInfo> {
         }
         let info = TVMFFIGetTypeInfo(tindex);
         if info.is_null() { None } else { Some(&*info) }
+    }
+}
+
+pub(crate) fn get_type_attr_function(type_key: &str, attr_name: &str) -> Option<Function> {
+    unsafe {
+        let key = TVMFFIByteArray::from_str(type_key);
+        let mut tindex = 0;
+        if TVMFFITypeKeyToIndex(&key, &mut tindex) != 0 {
+            return None;
+        }
+        let attr = TVMFFIByteArray::from_str(attr_name);
+        let column = TVMFFIGetTypeAttrColumn(&attr);
+        if column.is_null() {
+            return None;
+        }
+        let column = &*column;
+        if column.data.is_null() {
+            return None;
+        }
+        let idx = tindex - column.begin_index;
+        if idx < 0 || idx >= column.size {
+            return None;
+        }
+        let any_view = column.data.add(idx as usize);
+        let mut owned = TVMFFIAny::new();
+        if TVMFFIAnyViewToOwnedAny(any_view, &mut owned) != 0 {
+            return None;
+        }
+        let any = Any::from_raw_ffi_any(owned);
+        any.try_into().ok()
     }
 }
 

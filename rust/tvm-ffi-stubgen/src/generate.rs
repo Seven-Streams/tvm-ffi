@@ -28,6 +28,9 @@ use std::fmt::Write as _;
 use toml::value::Table;
 
 const METHOD_FLAG_STATIC: i64 = 1 << 2;
+const FIELD_FLAG_HAS_DEFAULT: i64 = 1 << 1;
+const FIELD_FLAG_INIT_OFF: i64 = 1 << 9;
+const FIELD_FLAG_KW_ONLY: i64 = 1 << 10;
 
 pub(crate) fn build_type_map(type_keys: &[String], prefix: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
@@ -86,10 +89,12 @@ pub(crate) fn build_type_entries(
         let repr_c_info = repr_c::check_repr_c(key, type_map);
         if let Some(info) = ffi::get_type_info(key) {
             type_depth = info.type_depth;
+            let mut has_user_new = false;
+            let mut has_ffi_init_in_methods = false;
             if info.num_methods > 0 && !info.methods.is_null() {
                 let method_slice =
                     unsafe { std::slice::from_raw_parts(info.methods, info.num_methods as usize) };
-                let has_user_new = method_slice.iter().any(|method| {
+                has_user_new = method_slice.iter().any(|method| {
                     matches!(
                         ffi::byte_array_to_string_opt(&method.name).as_deref(),
                         Some("new")
@@ -100,6 +105,9 @@ pub(crate) fn build_type_entries(
                         Some(name) => name,
                         None => continue,
                     };
+                    if method_name == "__ffi_init__" {
+                        has_ffi_init_in_methods = true;
+                    }
                     let rust_method_name = if method_name == "__ffi_init__" {
                         if has_user_new {
                             "ffi_init".to_string()
@@ -124,6 +132,22 @@ pub(crate) fn build_type_entries(
                         is_static,
                     });
                 }
+            }
+            // Auto-generated __ffi_init__ lives in TypeAttrColumn only (no TypeMethod entry).
+            // Synthesize constructor signature from init-eligible fields across the inheritance chain.
+            if !has_ffi_init_in_methods && ffi::get_type_attr_function(key, "__ffi_init__").is_some()
+            {
+                let sig = build_auto_init_sig(info, type_map, Some(key.as_str()));
+                methods.push(MethodGen {
+                    source_name: "__ffi_init__".to_string(),
+                    rust_name: if has_user_new {
+                        "ffi_init".to_string()
+                    } else {
+                        "new".to_string()
+                    },
+                    sig,
+                    is_static: true,
+                });
             }
             if info.num_fields > 0 && !info.fields.is_null() {
                 let field_slice =
@@ -208,6 +232,98 @@ pub(crate) fn build_type_entries(
         out[idx].1.ancestor_chain = ancestor_chain;
     }
     Ok(out)
+}
+
+fn for_each_field_info<F>(info: &tvm_ffi::tvm_ffi_sys::TVMFFITypeInfo, mut callback: F)
+where
+    F: FnMut(&tvm_ffi::tvm_ffi_sys::TVMFFIFieldInfo),
+{
+    unsafe {
+        for i in 1..info.type_depth {
+            let parent = *info.type_acenstors.add(i as usize);
+            if parent.is_null() {
+                continue;
+            }
+            let parent = &*parent;
+            if parent.fields.is_null() || parent.num_fields <= 0 {
+                continue;
+            }
+            let parent_fields =
+                std::slice::from_raw_parts(parent.fields, parent.num_fields as usize);
+            for field in parent_fields {
+                callback(field);
+            }
+        }
+        if info.fields.is_null() || info.num_fields <= 0 {
+            return;
+        }
+        let fields = std::slice::from_raw_parts(info.fields, info.num_fields as usize);
+        for field in fields {
+            callback(field);
+        }
+    }
+}
+
+fn build_auto_init_sig(
+    info: &tvm_ffi::tvm_ffi_sys::TVMFFITypeInfo,
+    type_map: &BTreeMap<String, String>,
+    self_type_key: Option<&str>,
+) -> FunctionSig {
+    let mut positional = Vec::new();
+    for_each_field_info(info, |field| {
+        if (field.flags & FIELD_FLAG_INIT_OFF) != 0 {
+            return;
+        }
+        if (field.flags & FIELD_FLAG_KW_ONLY) != 0 {
+            return;
+        }
+        let meta = ffi::byte_array_to_string_opt(&field.metadata);
+        let schema = meta
+            .as_deref()
+            .and_then(extract_type_schema)
+            .and_then(|s| parse_type_schema(&s));
+        let ty = match schema.as_ref() {
+            Some(schema) => rust_type_for_schema(schema, type_map, self_type_key),
+            None => RustType::unsupported("tvm_ffi::Any"),
+        };
+        let has_default = (field.flags & FIELD_FLAG_HAS_DEFAULT) != 0;
+        positional.push((ty, has_default));
+    });
+
+    let mut required = Vec::new();
+    let mut optional = Vec::new();
+    for (ty, has_default) in positional {
+        if has_default {
+            optional.push(ty);
+        } else {
+            required.push(ty);
+        }
+    }
+    required.extend(optional);
+    if required.is_empty() || !required.iter().all(|arg| arg.supported) {
+        return FunctionSig::packed();
+    }
+    FunctionSig::from_types(
+        required,
+        RustType::supported("tvm_ffi::object::ObjectRef"),
+    )
+}
+
+fn render_field_accessor_alias(
+    out: &mut String,
+    indent_str: &str,
+    getter_name: &str,
+    alias_name: &str,
+    ret_type: &str,
+) {
+    writeln!(
+        out,
+        "{}    pub fn {}(&self) -> tvm_ffi::Result<{}> {{",
+        indent_str, alias_name, ret_type
+    )
+    .ok();
+    writeln!(out, "{}        Ok(self.{}())", indent_str, getter_name).ok();
+    writeln!(out, "{}    }}", indent_str).ok();
 }
 
 fn build_getter_specs(
@@ -448,7 +564,7 @@ pub(crate) fn render_cargo_toml(
     );
     package.insert(
         "edition".to_string(),
-        toml::Value::String("2024".to_string()),
+        toml::Value::String("2021".to_string()),
     );
 
     let mut tvm_ffi = Table::new();
@@ -494,7 +610,18 @@ pub mod _tvm_ffi_stubgen_detail {
     out.push_str(
         r#"
 pub fn load_library(path: &str) -> tvm_ffi::Result<tvm_ffi::Module> {
-    tvm_ffi::Module::load_from_file(path)
+    static LOADED_MODULES: std::sync::LazyLock<std::sync::Mutex<Vec<tvm_ffi::Module>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+    let module = tvm_ffi::Module::load_from_file(path)?;
+    let mut modules = LOADED_MODULES.lock().map_err(|_| {
+        tvm_ffi::Error::new(
+            tvm_ffi::RUNTIME_ERROR,
+            "failed to lock module keepalive storage",
+            "",
+        )
+    })?;
+    modules.push(module.clone());
+    Ok(module)
 }
 "#,
     );
@@ -911,6 +1038,7 @@ fn render_repr_c_type(
         .ok();
         writeln!(out, "{}        {}", indent_str, access_expr).ok();
         writeln!(out, "{}    }}", indent_str).ok();
+        render_field_accessor_alias(out, &indent_str, &method_name, &f.rust_name, &f.rust_type);
     }
     writeln!(out, "{}}}\n", indent_str).ok();
 
@@ -989,6 +1117,8 @@ fn render_repr_c_type(
         .ok();
         writeln!(out, "{}        {}", indent_str, call_expr).ok();
         writeln!(out, "{}    }}", indent_str).ok();
+        let alias_name = nlf.rust_name.clone();
+        render_field_accessor_alias(out, &indent_str, &method_name, &alias_name, return_type);
     }
     writeln!(out, "{}}}\n", indent_str).ok();
 }

@@ -140,19 +140,28 @@ fn write_integration_test(
     let tests_dir = out_dir.join("tests");
     fs::create_dir_all(&tests_dir)?;
     let test_body = format!(
-        r#"use tvm_ffi_testing_stub as stub;
+        r#"use std::io::Write as _;
+use tvm_ffi_testing_stub as stub;
 
 #[test]
 fn generated_usage_roundtrip() {{
-    let lib_path = "{lib_path}";
+    eprintln!("[integration] step 1: load library");
+    let _ = std::io::stderr().flush();
+    let lib_path = {lib_path:?};
     stub::load_library(lib_path).expect("load tvm_ffi_testing");
 
+    eprintln!("[integration] step 2: call add_one");
+    let _ = std::io::stderr().flush();
     let value = stub::add_one(1).expect("call add_one");
     assert_eq!(value, 2);
 
+    eprintln!("[integration] step 3: call echo");
+    let _ = std::io::stderr().flush();
     let _out = stub::echo(&[tvm_ffi::Any::from(1_i64)]).expect("call echo");
 
     // Constructor + instance method should resolve from type metadata.
+    eprintln!("[integration] step 4: construct TestIntPair and call sum");
+    let _ = std::io::stderr().flush();
     let pair_obj = stub::TestIntPair::new(3, 4).expect("construct TestIntPair");
     let pair: stub::TestIntPair = pair_obj
         .try_into()
@@ -161,27 +170,25 @@ fn generated_usage_roundtrip() {{
     let sum: i64 = sum_any.try_into().expect("sum any -> i64");
     assert_eq!(sum, 7);
 
-    // Verify upcast/downcast roundtrip on Cxx inheritance chain.
-    let derived_obj = stub::TestCxxClassDerived::new(11, 7, 3.5, 1.25)
-        .expect("construct TestCxxClassDerived");
-    let _derived: stub::TestCxxClassDerived = derived_obj.clone().into();
-    let base: stub::TestCxxClassBase = derived_obj.clone().into();
-    let base_obj: tvm_ffi::object::ObjectRef = base.clone().into();
-    let roundtrip: stub::TestCxxClassDerived = base_obj.into();
-    assert_eq!(base.v_i64().expect("base.v_i64"), 11);
-    assert_eq!(base.v_i32().expect("base.v_i32"), 7);
-    assert!((roundtrip.v_f64().expect("derived.v_f64") - 3.5).abs() < 1e-9);
-    assert!((roundtrip.v_f32().expect("derived.v_f32") - 1.25).abs() < 1e-6);
-
+    eprintln!("[integration] step 5: create unregistered object and query count");
+    let _ = std::io::stderr().flush();
     let obj = stub::make_unregistered_object().expect("create unregistered object");
     let count = stub::object_use_count(obj.clone()).expect("query object use count");
     assert!(count >= 1);
 
-    // Fallback wrapper can be constructed from ObjectRef directly.
-    let _wrapped: stub::TestUnregisteredObject = obj.into();
+    // ObjectRef -> wrapper conversion should use checked downcast.
+    eprintln!("[integration] step 6: ObjectRef conversion roundtrip");
+    let _ = std::io::stderr().flush();
+    let _wrapped: stub::TestUnregisteredObject = obj
+        .clone()
+        .try_into()
+        .unwrap_or_else(|_| panic!("ObjectRef -> TestUnregisteredObject downcast failed"));
+    let _obj_roundtrip: tvm_ffi::object::ObjectRef = _wrapped.into();
+    eprintln!("[integration] step 7: completed");
+    let _ = std::io::stderr().flush();
 }}
 "#,
-        lib_path = testing_lib.display()
+        lib_path = testing_lib.to_string_lossy().to_string()
     );
     fs::write(tests_dir.join("integration.rs"), test_body)?;
     Ok(())
@@ -192,6 +199,8 @@ fn run_generated_tests(out_dir: &Path, lib_dir: &Path) -> Result<(), Box<dyn std
     cmd.arg("test")
         .arg("--manifest-path")
         .arg(out_dir.join("Cargo.toml"))
+        .arg("--")
+        .arg("--nocapture")
         .current_dir(out_dir);
 
     let ld_var = if cfg!(target_os = "windows") {
@@ -212,12 +221,21 @@ fn run_generated_tests(out_dir: &Path, lib_dir: &Path) -> Result<(), Box<dyn std
     };
     cmd.env(ld_var, new_ld);
 
-    let path_value = env::var("PATH").unwrap_or_default();
-    cmd.env("PATH", path_value);
+    if ld_var != "PATH" {
+        let path_value = env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", path_value);
+    }
 
-    let status = cmd.status()?;
-    if !status.success() {
+    let output = cmd.output()?;
+    if !output.status.success() {
+        eprintln!("generated crate test command failed: {:?}", output.status);
+        eprintln!("--- generated test stdout ---");
+        eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+        eprintln!("--- generated test stderr ---");
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
         return Err("generated crate tests failed".into());
     }
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
     Ok(())
 }

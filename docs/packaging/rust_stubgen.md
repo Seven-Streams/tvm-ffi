@@ -130,11 +130,11 @@ fn main() -> tvm_ffi::Result<()> {
 }
 ```
 
-- Load the library once before using the APIs.
+- Load the library once before using the APIs. `load_library` keeps loaded modules alive
+  in an internal global storage so exported symbols remain valid for later calls.
 - Generated functions support typed signatures when possible and fall back to `Any` for dynamic calling.
 - Generated object method wrappers (including constructor `new`) are resolved via type metadata rather than global function lookup.
 - Generated object-returning wrappers integrate with `ObjectRef` APIs and wrapper conversions.
-
 
 ## Related Docs
 
