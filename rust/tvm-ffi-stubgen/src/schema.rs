@@ -64,3 +64,72 @@ fn parse_type_schema_json(json: &TypeSchemaJson) -> TypeSchema {
         args: json.args.iter().map(parse_type_schema_json).collect(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeSet, HashSet};
+
+    #[test]
+    fn extract_type_schema_from_metadata() {
+        let meta = r#"{"type_schema":"{\"type\":\"ffi.Function\",\"args\":[{\"type\":\"int\"},{\"type\":\"int\"}]}"}"#;
+        let raw = extract_type_schema(meta).expect("type_schema");
+        let schema = parse_type_schema(&raw).expect("parse");
+        assert_eq!(schema.origin, "ffi.Function");
+        assert_eq!(schema.args.len(), 2);
+        assert_eq!(schema.args[0].origin, "int");
+    }
+
+    #[test]
+    fn extract_type_schema_invalid_json() {
+        assert!(extract_type_schema("not json").is_none());
+        assert!(extract_type_schema("{}").is_none());
+    }
+
+    #[test]
+    fn parse_type_schema_optional_array_map() {
+        let opt = parse_type_schema(r#"{"type":"Optional","args":[{"type":"int"}]}"#).unwrap();
+        assert_eq!(opt.origin, "Optional");
+        assert_eq!(opt.args[0].origin, "int");
+
+        let arr = parse_type_schema(r#"{"type":"ffi.Array","args":[{"type":"str"}]}"#).unwrap();
+        assert_eq!(arr.origin, "ffi.Array");
+
+        let map = parse_type_schema(
+            r#"{"type":"ffi.Map","args":[{"type":"str"},{"type":"int"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(map.args.len(), 2);
+    }
+
+    #[test]
+    fn collect_type_keys_nested_and_ordered() {
+        let schema = parse_type_schema(
+            r#"{"type":"ffi.Function","args":[{"type":"testing.SchemaAllTypes"},{"type":"testing.TestIntPair"}]}"#,
+        )
+        .unwrap();
+        let known: HashSet<String> = ["testing.SchemaAllTypes", "testing.TestIntPair", "other.X"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut out = BTreeSet::new();
+        collect_type_keys(&schema, &known, &mut out);
+        assert_eq!(
+            out.into_iter().collect::<Vec<_>>(),
+            vec![
+                "testing.SchemaAllTypes".to_string(),
+                "testing.TestIntPair".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_type_keys_ignores_unknown_origins() {
+        let schema = parse_type_schema(r#"{"type":"ffi.Function","args":[{"type":"unknown.Type"}]}"#)
+            .unwrap();
+        let known: HashSet<String> = HashSet::new();
+        let mut out = BTreeSet::new();
+        collect_type_keys(&schema, &known, &mut out);
+        assert!(out.is_empty());
+    }
+}

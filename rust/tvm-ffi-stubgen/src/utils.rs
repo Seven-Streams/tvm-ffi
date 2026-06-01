@@ -59,3 +59,67 @@ pub(crate) fn default_tvm_ffi_path() -> Result<PathBuf, Box<dyn std::error::Erro
     }
     Err("unable to locate tvm-ffi path (use --tvm-ffi-path)".into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn normalize_prefix_adds_trailing_dot() {
+        assert_eq!(normalize_prefix(""), "");
+        assert_eq!(normalize_prefix("testing"), "testing.");
+        assert_eq!(normalize_prefix("testing."), "testing.");
+    }
+
+    #[test]
+    fn ensure_out_dir_creates_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "tvm_ffi_stubgen_utils_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        ensure_out_dir(&dir, false).expect("create");
+        assert!(dir.is_dir());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_out_dir_rejects_nonempty_without_overwrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "tvm_ffi_stubgen_utils_nonempty_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("marker.txt"), "x").unwrap();
+        let err = ensure_out_dir(&dir, false).unwrap_err();
+        assert!(err.to_string().contains("not empty"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_out_dir_allows_nonempty_with_overwrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "tvm_ffi_stubgen_utils_overwrite_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("marker.txt"), "x").unwrap();
+        ensure_out_dir(&dir, true).expect("overwrite");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

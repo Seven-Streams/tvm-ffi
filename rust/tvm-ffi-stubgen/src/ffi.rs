@@ -117,3 +117,18 @@ pub(crate) fn byte_array_to_string_opt(value: &TVMFFIByteArray) -> Option<String
     let slice = unsafe { std::slice::from_raw_parts(value.data, value.size) };
     Some(String::from_utf8_lossy(slice).to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::byte_array_to_string_opt;
+    use tvm_ffi::tvm_ffi_sys::TVMFFIByteArray;
+
+    #[test]
+    fn byte_array_to_string_opt_empty() {
+        let empty = TVMFFIByteArray {
+            data: std::ptr::null(),
+            size: 0,
+        };
+        assert!(byte_array_to_string_opt(&empty).is_none());
+    }
+}

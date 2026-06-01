@@ -180,3 +180,42 @@ impl RustType {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn function_sig_packed_when_schema_missing() {
+        assert!(FunctionSig::packed().packed);
+        let sig = FunctionSig::from_types(vec![RustType::supported("i64")], RustType::supported("i64"));
+        assert!(!sig.packed);
+    }
+
+    #[test]
+    fn function_sig_packed_when_too_many_args() {
+        let args: Vec<_> = (0..13)
+            .map(|i| RustType::supported(&format!("i{}", i)))
+            .collect();
+        let sig = FunctionSig::from_types(args, RustType::supported("i64"));
+        assert!(sig.packed);
+    }
+
+    #[test]
+    fn function_sig_packed_when_any_unsupported() {
+        let sig = FunctionSig::from_types(
+            vec![RustType::supported("i64"), RustType::unsupported("tvm_ffi::Any")],
+            RustType::supported("i64"),
+        );
+        assert!(sig.packed);
+    }
+
+    #[test]
+    fn rust_type_object_wrapper_call_and_return_wrap() {
+        let ty = RustType::object_wrapper("crate::TestIntPair");
+        assert_eq!(ty.typed_arg_name(), "tvm_ffi::object::ObjectRef");
+        assert_eq!(ty.call_expr("x"), "x.into()");
+        let wrapped = ty.wrap_typed_return("typed()", "tvm_ffi::object::ObjectRef");
+        assert!(wrapped.contains(".map(crate::TestIntPair::from)"));
+    }
+}

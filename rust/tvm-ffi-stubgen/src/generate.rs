@@ -1437,3 +1437,129 @@ fn static_ident(prefix: &str, full_name: &str) -> String {
     }
     out
 }
+
+/// Test-only accessors for pure codegen helpers (no FFI).
+#[cfg(test)]
+pub(crate) mod test_api {
+    use super::*;
+    use crate::schema::TypeSchema;
+
+    pub fn split_name_for_test(full_name: &str, prefix: &str) -> (Vec<String>, String) {
+        split_name(full_name, prefix)
+    }
+
+    pub fn sanitize_type_ident_for_test(name: &str) -> String {
+        sanitize_ident(name, IdentStyle::Type)
+    }
+
+    pub fn sanitize_fn_ident_for_test(name: &str) -> String {
+        sanitize_ident(name, IdentStyle::Function)
+    }
+
+    pub fn rust_type_for_schema_for_test(
+        schema: &TypeSchema,
+        type_map: &BTreeMap<String, String>,
+    ) -> RustType {
+        rust_type_for_schema(schema, type_map, None)
+    }
+
+    pub fn build_function_sig_for_test(
+        schema: Option<&TypeSchema>,
+        type_map: &BTreeMap<String, String>,
+    ) -> FunctionSig {
+        build_function_sig(schema, type_map, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_api::*;
+    use crate::schema::parse_type_schema;
+    use std::collections::BTreeMap;
+
+    fn type_map_sample() -> BTreeMap<String, String> {
+        BTreeMap::from([(
+            "testing.TestIntPair".to_string(),
+            "crate::TestIntPair".to_string(),
+        )])
+    }
+
+    #[test]
+    fn split_name_strips_single_prefix() {
+        let (mods, name) = split_name_for_test("testing.foo.bar", "testing.");
+        assert_eq!(mods, vec!["foo"]);
+        assert_eq!(name, "bar");
+    }
+
+    #[test]
+    fn split_name_without_prefix_keeps_segments() {
+        let (mods, name) = split_name_for_test("testing.foo.bar", "");
+        assert_eq!(mods, vec!["testing", "foo"]);
+        assert_eq!(name, "bar");
+    }
+
+    #[test]
+    fn build_type_map_crate_paths() {
+        let map = build_type_map(&["testing.sub.Type".to_string()], "testing.");
+        assert_eq!(map.get("testing.sub.Type").map(String::as_str), Some("crate::sub::Type"));
+    }
+
+    #[test]
+    fn sanitize_ident_keyword_and_type_case() {
+        assert_eq!(sanitize_fn_ident_for_test("type"), "type_");
+        assert_eq!(sanitize_type_ident_for_test("foo_bar"), "FooBar");
+    }
+
+    #[test]
+    fn rust_type_for_primitives_and_containers() {
+        let map = type_map_sample();
+        let int = parse_type_schema(r#"{"type":"int"}"#).unwrap();
+        assert_eq!(
+            rust_type_for_schema_for_test(&int, &map).name,
+            "i64"
+        );
+
+        let opt = parse_type_schema(r#"{"type":"Optional","args":[{"type":"int"}]}"#).unwrap();
+        assert_eq!(
+            rust_type_for_schema_for_test(&opt, &map).name,
+            "Option<i64>"
+        );
+
+        let arr = parse_type_schema(r#"{"type":"ffi.Array","args":[{"type":"int"}]}"#).unwrap();
+        assert!(rust_type_for_schema_for_test(&arr, &map)
+            .name
+            .contains("tvm_ffi::Array"));
+
+        let unknown = parse_type_schema(r#"{"type":"list","args":[{"type":"int"}]}"#).unwrap();
+        assert!(!rust_type_for_schema_for_test(&unknown, &map).supported);
+    }
+
+    #[test]
+    fn rust_type_for_registered_object() {
+        let map = type_map_sample();
+        let key = parse_type_schema(r#"{"type":"testing.TestIntPair"}"#).unwrap();
+        let ty = rust_type_for_schema_for_test(&key, &map);
+        assert!(ty.supported);
+        assert_eq!(ty.name, "crate::TestIntPair");
+    }
+
+    #[test]
+    fn build_function_sig_callable_typed() {
+        let map = type_map_sample();
+        let schema = parse_type_schema(
+            r#"{"type":"ffi.Function","args":[{"type":"int"},{"type":"int"}]}"#,
+        )
+        .unwrap();
+        let sig = build_function_sig_for_test(Some(&schema), &map);
+        assert!(!sig.packed);
+        assert_eq!(sig.args.len(), 1);
+        assert_eq!(sig.ret.name, "i64");
+    }
+
+    #[test]
+    fn build_function_sig_non_callable_packed() {
+        let map = type_map_sample();
+        let schema = parse_type_schema(r#"{"type":"int"}"#).unwrap();
+        assert!(build_function_sig_for_test(Some(&schema), &map).packed);
+    }
+}

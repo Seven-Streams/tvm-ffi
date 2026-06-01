@@ -133,3 +133,37 @@ pub fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn minimal_args(out_dir: PathBuf, dlls: Vec<PathBuf>) -> Args {
+        Args {
+            out_dir,
+            dlls,
+            init_prefix: vec!["testing.".to_string()],
+            init_crate: "tvm_ffi_testing_stub".to_string(),
+            tvm_ffi_path: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tvm-ffi")),
+            overwrite: true,
+            no_format: true,
+        }
+    }
+
+    #[test]
+    fn run_rejects_empty_dlls() {
+        let out = std::env::temp_dir().join(format!("stubgen_empty_dlls_{}", std::process::id()));
+        let err = run(minimal_args(out, vec![])).unwrap_err();
+        assert!(err.to_string().contains("dlls"));
+    }
+
+    #[test]
+    fn run_rejects_empty_init_prefix() {
+        let out = std::env::temp_dir().join(format!("stubgen_empty_prefix_{}", std::process::id()));
+        let mut args = minimal_args(out, vec![PathBuf::from("/nonexistent/lib.so")]);
+        args.init_prefix.clear();
+        let err = run(args).unwrap_err();
+        assert!(err.to_string().contains("init-prefix"));
+    }
+}
