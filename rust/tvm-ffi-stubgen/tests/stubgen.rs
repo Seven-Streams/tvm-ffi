@@ -170,21 +170,40 @@ fn generated_usage_roundtrip() {{
     let sum: i64 = sum_any.try_into().expect("sum any -> i64");
     assert_eq!(sum, 7);
 
-    eprintln!("[integration] step 5: create unregistered object and query count");
+    // Verify upcast/downcast roundtrip on Cxx inheritance chain.
+    eprintln!("[integration] step 5: construct TestCxxClassDerived and roundtrip");
+    let _ = std::io::stderr().flush();
+    let derived_obj = stub::TestCxxClassDerived::new(11, 7, 3.5, 1.25)
+        .expect("construct TestCxxClassDerived");
+    let derived: stub::TestCxxClassDerived = derived_obj
+        .clone()
+        .try_into()
+        .unwrap_or_else(|_| panic!("object -> TestCxxClassDerived downcast failed"));
+    let base: stub::TestCxxClassBase = derived.clone().into();
+    let base_obj: tvm_ffi::object::ObjectRef = base.clone().into();
+    let roundtrip: stub::TestCxxClassDerived = base_obj
+        .try_into()
+        .unwrap_or_else(|_| panic!("ObjectRef -> TestCxxClassDerived downcast failed"));
+    assert_eq!(base.v_i64().expect("base.v_i64"), 11);
+    assert_eq!(base.v_i32().expect("base.v_i32"), 7);
+    assert!((roundtrip.v_f64().expect("derived.v_f64") - 3.5).abs() < 1e-9);
+    assert!((roundtrip.v_f32().expect("derived.v_f32") - 1.25).abs() < 1e-6);
+
+    eprintln!("[integration] step 6: create unregistered object and query count");
     let _ = std::io::stderr().flush();
     let obj = stub::make_unregistered_object().expect("create unregistered object");
     let count = stub::object_use_count(obj.clone()).expect("query object use count");
     assert!(count >= 1);
 
     // ObjectRef -> wrapper conversion should use checked downcast.
-    eprintln!("[integration] step 6: ObjectRef conversion roundtrip");
+    eprintln!("[integration] step 7: ObjectRef conversion roundtrip");
     let _ = std::io::stderr().flush();
     let _wrapped: stub::TestUnregisteredObject = obj
         .clone()
         .try_into()
         .unwrap_or_else(|_| panic!("ObjectRef -> TestUnregisteredObject downcast failed"));
     let _obj_roundtrip: tvm_ffi::object::ObjectRef = _wrapped.into();
-    eprintln!("[integration] step 7: completed");
+    eprintln!("[integration] step 8: completed");
     let _ = std::io::stderr().flush();
 }}
 "#,
