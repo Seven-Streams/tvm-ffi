@@ -22,7 +22,7 @@ from typing import Callable
 
 from . import consts as C
 from .file_utils import CodeBlock
-from .utils import FuncInfo, ImportItem, InitConfig, ObjectInfo, Options
+from .utils import FuncInfo, ImportItem, InitConfig, ObjectInfo, Options, RenderType
 
 
 def _type_suffix_and_record(
@@ -52,6 +52,7 @@ def generate_global_funcs(
     ty_map: dict[str, str],
     imports: list[ImportItem],
     opt: Options,
+    render_type: RenderType | None = None,
 ) -> None:
     """Generate function signatures for global functions.
 
@@ -83,7 +84,7 @@ def generate_global_funcs(
         "# fmt: off",
         f'_FFI_INIT_FUNC("{prefix}", __name__)',
         "if TYPE_CHECKING:",
-        *[func.gen(fn_ty_map, indent=opt.indent) for func in global_funcs],
+        *[func.gen(fn_ty_map, opt.indent, render_type) for func in global_funcs],
         "# fmt: on",
     ]
     indent = " " * code.indent
@@ -100,6 +101,7 @@ def generate_object(
     imports: list[ImportItem],
     opt: Options,
     obj_info: ObjectInfo,
+    render_type: RenderType | None = None,
 ) -> None:
     """Generate a class definition for an object type.
 
@@ -109,12 +111,12 @@ def generate_object(
     info = obj_info
     method_names = {m.schema.name.rsplit(".", 1)[-1] for m in info.methods}
     fn_ty_map = _type_suffix_and_record(ty_map, imports, func_names=method_names)
-    init_lines = info.gen_init(fn_ty_map, indent=opt.indent)
-    ffi_init_lines = info.gen_ffi_init(fn_ty_map, indent=opt.indent)
+    init_lines = info.gen_init(fn_ty_map, opt.indent, render_type)
+    ffi_init_lines = info.gen_ffi_init(fn_ty_map, opt.indent, render_type)
     type_checking_lines = [
         *init_lines,
         *ffi_init_lines,
-        *info.gen_methods(fn_ty_map, indent=opt.indent),
+        *info.gen_methods(fn_ty_map, opt.indent, render_type),
     ]
     if type_checking_lines:
         imports.append(
@@ -125,7 +127,7 @@ def generate_object(
         )
         results = [
             "# fmt: off",
-            *info.gen_fields(fn_ty_map, indent=0),
+            *info.gen_fields(fn_ty_map, 0, render_type),
             "if TYPE_CHECKING:",
             *type_checking_lines,
             "# fmt: on",
@@ -133,7 +135,7 @@ def generate_object(
     else:
         results = [
             "# fmt: off",
-            *info.gen_fields(fn_ty_map, indent=0),
+            *info.gen_fields(fn_ty_map, 0, render_type),
             "# fmt: on",
         ]
     indent = " " * code.indent

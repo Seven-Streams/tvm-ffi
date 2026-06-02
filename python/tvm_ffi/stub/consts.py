@@ -18,16 +18,78 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Literal
 
 from typing_extensions import TypeAlias
 
-STUB_PREFIX = "# tvm-ffi-stubgen("
-STUB_BEGIN = f"{STUB_PREFIX}begin):"
-STUB_END = f"{STUB_PREFIX}end)"
-STUB_TY_MAP = f"{STUB_PREFIX}ty-map):"
-STUB_IMPORT_OBJECT = f"{STUB_PREFIX}import-object):"
-STUB_SKIP_FILE = f"{STUB_PREFIX}skip-file)"
+
+@dataclasses.dataclass(frozen=True)
+class MarkerSyntax:
+    """Comment-syntax-specific stub directive markers.
+
+    All stub directives are embedded inside single-line comments. Only the
+    comment token differs between languages (Python ``#`` vs Rust ``//``); the
+    rest of the directive grammar (``tvm-ffi-stubgen(begin): ...`` etc.) is
+    identical. A single ``comment`` token therefore parameterizes the whole
+    marker set, so the block parser in :mod:`.file_utils` is language-agnostic.
+    """
+
+    comment: str
+    """The line-comment token for the target language, e.g. ``"#"`` or ``"//"``."""
+
+    @property
+    def prefix(self) -> str:
+        """Common prefix shared by every stub directive on a line."""
+        return f"{self.comment} tvm-ffi-stubgen("
+
+    @property
+    def begin(self) -> str:
+        """Marker that opens a generated block: ``<comment> tvm-ffi-stubgen(begin):``."""
+        return f"{self.prefix}begin):"
+
+    @property
+    def end(self) -> str:
+        """Marker that closes a generated block: ``<comment> tvm-ffi-stubgen(end)``."""
+        return f"{self.prefix}end)"
+
+    @property
+    def ty_map(self) -> str:
+        """One-line type-map directive: ``<comment> tvm-ffi-stubgen(ty-map):``."""
+        return f"{self.prefix}ty-map):"
+
+    @property
+    def import_object(self) -> str:
+        """One-line import-object directive: ``<comment> tvm-ffi-stubgen(import-object):``."""
+        return f"{self.prefix}import-object):"
+
+    @property
+    def skip_file(self) -> str:
+        """Whole-file opt-out directive: ``<comment> tvm-ffi-stubgen(skip-file)``."""
+        return f"{self.prefix}skip-file)"
+
+
+PYTHON_SYNTAX = MarkerSyntax(comment="#")
+RUST_SYNTAX = MarkerSyntax(comment="//")
+
+#: Map a source-file extension to the marker syntax used inside it. The block
+#: parser selects the syntax per file, so a single run can process a mixed tree
+#: of ``.py`` and ``.rs`` files.
+SYNTAX_BY_EXT: dict[str, MarkerSyntax] = {
+    ".py": PYTHON_SYNTAX,
+    ".pyi": PYTHON_SYNTAX,
+    ".rs": RUST_SYNTAX,
+}
+
+# Legacy module-level aliases for the Python markers. The Python code-generation
+# templates below and in `codegen.py` still hard-code these; new, language-aware
+# code should go through a `MarkerSyntax` instance instead.
+STUB_PREFIX = PYTHON_SYNTAX.prefix
+STUB_BEGIN = PYTHON_SYNTAX.begin
+STUB_END = PYTHON_SYNTAX.end
+STUB_TY_MAP = PYTHON_SYNTAX.ty_map
+STUB_IMPORT_OBJECT = PYTHON_SYNTAX.import_object
+STUB_SKIP_FILE = PYTHON_SYNTAX.skip_file
 STUB_BLOCK_KINDS: TypeAlias = Literal[
     "global",
     "object",
@@ -51,7 +113,7 @@ TERM_CYAN = "\033[36m"
 TERM_WHITE = "\033[37m"
 DOC_URL = "https://tvm.apache.org/ffi/packaging/stubgen.html"
 
-DEFAULT_SOURCE_EXTS = {".py", ".pyi"}
+DEFAULT_SOURCE_EXTS = set(SYNTAX_BY_EXT)
 TY_MAP_DEFAULTS = {
     "Any": "typing.Any",
     "Callable": "typing.Callable",
