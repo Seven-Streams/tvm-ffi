@@ -18,6 +18,7 @@
  */
 //! Rust side of cpp_rust_test: Expr / Add types backed by the same C++ heap objects.
 
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -54,7 +55,7 @@ fn lookup_type_index(type_key: &'static str) -> i32 {
 #[repr(C)]
 struct ExprObj {
     object: Object,
-    value: i64,
+    pub value: i64,
 }
 
 unsafe impl ObjectCore for ExprObj {
@@ -75,16 +76,16 @@ struct Expr {
     data: ObjectArc<ExprObj>,
 }
 
-impl Expr {
-    fn value(&self) -> i64 {
-        self.data.value
+impl Deref for Expr {
+    type Target = ExprObj;
+    fn deref(&self) -> &ExprObj {
+        &self.data
     }
+}
 
-    /// Calls C++ `ExprObj::SetValue()` via reflected `set_value` method.
-    fn set_value(&mut self, value: i64) -> Result<()> {
-        let set_value_fn = get_type_method(ExprObj::TYPE_KEY, "set_value")?;
-        let call = into_typed_fn!(set_value_fn, Fn(&Expr, i64) -> Result<()>);
-        call(self, value)
+impl DerefMut for Expr {
+    fn deref_mut(&mut self) -> &mut ExprObj {
+        &mut self.data
     }
 }
 
@@ -92,8 +93,8 @@ impl Expr {
 #[repr(C)]
 struct AddObj {
     base: ExprObj,
-    a: Expr,
-    b: Expr,
+    pub a: Expr,
+    pub b: Expr,
 }
 
 unsafe impl ObjectCore for AddObj {
@@ -108,6 +109,20 @@ unsafe impl ObjectCore for AddObj {
     }
 }
 
+/// `AddObj` inherits `ExprObj` in C++; deref to the embedded base for `value` etc.
+impl Deref for AddObj {
+    type Target = ExprObj;
+    fn deref(&self) -> &ExprObj {
+        &self.base
+    }
+}
+
+impl DerefMut for AddObj {
+    fn deref_mut(&mut self) -> &mut ExprObj {
+        &mut self.base
+    }
+}
+
 #[repr(C)]
 #[derive(DeriveObjectRef, Clone)]
 struct Add {
@@ -115,18 +130,6 @@ struct Add {
 }
 
 impl Add {
-    fn value(& mut self) -> i64 {
-        self.data.base.value
-    }
-
-    fn a(& mut self) -> &mut Expr {
-        &mut self.data.a
-    }
-
-    fn b(& mut self) -> &mut Expr {
-        &mut self.data.b
-    }
-
     /// Calls C++ `AddObj::Update()` via the reflected `update` method.
     fn update(&mut self) -> Result<()> {
         let update_fn = get_type_method(AddObj::TYPE_KEY, "update")?;
@@ -163,6 +166,19 @@ fn get_type_method(type_key: &'static str, method_name: &str) -> Result<Function
         &format!("method `{method_name}` not found on type `{type_key}`"),
         "",
     ))
+}
+
+impl Deref for Add {
+    type Target = AddObj;
+    fn deref(&self) -> &AddObj {
+        &self.data
+    }
+}
+
+impl DerefMut for Add {
+    fn deref_mut(&mut self) -> &mut AddObj {
+        &mut self.data
+    }
 }
 
 fn expr_lib_path() -> &'static str {
@@ -288,15 +304,10 @@ fn main() -> Result<()> {
 
     // --- Expr demo ---
     let mut expr = make_expr(42)?;
-    println!("created Expr.value = {}", expr.value());
-    expr.set_value(50)?;
-    println!("after C++ Expr::SetValue(): value={}", expr.value());
-    ensure!(
-        expr.value() == 50,
-        VALUE_ERROR,
-        "expected 50, got {}",
-        expr.value()
-    );
+    println!("created Expr.value = {}", expr.value);
+    expr.value = expr.value + 8;
+    println!("after Rust mutation Expr.value = {}", expr.value);
+    ensure!(expr.value == 50, VALUE_ERROR, "expected 50, got {}", expr.value);
     println!("dropping Expr; expect ~ExprObj() value=50");
     drop(expr);
 
@@ -306,41 +317,41 @@ fn main() -> Result<()> {
     let mut add = make_add(a, b, 0)?;
     println!(
         "created Add: a={}, b={}, value={}",
-        add.a().value(),
-        add.b().value(),
-        add.value()
+        add.a.value,
+        add.b.value,
+        add.value
     );
 
     add.update()?;
-    println!("after C++ Add::Update(): value={}", add.value());
+    println!("after C++ Add::Update(): value={}", add.value);
     ensure!(
-        add.value() == 42,
+        add.value == 42,
         VALUE_ERROR,
         "expected 42, got {}",
-        add.value()
+        add.value
     );
 
-    add.a().set_value(100)?;
+    add.a.value = 100;
     println!(
-        "after C++ Expr::SetValue() on Add.a only: a={}, b={}, value={} (value stale)",
-        add.a().value(),
-        add.b().value(),
-        add.value()
+        "after Rust mutates Add.a only: a={}, b={}, value={} (value still stale)",
+        add.a.value,
+        add.b.value,
+        add.value
     );
     ensure!(
-        add.a().value() == 100,
+        add.a.value == 100,
         VALUE_ERROR,
         "expected a=100, got {}",
-        add.a().value()
+        add.a.value
     );
 
     add.update()?;
-    println!("after second C++ Add::Update(): value={}", add.value());
+    println!("after second C++ Add::Update(): value={}", add.value);
     ensure!(
-        add.value() == 132,
+        add.value == 132,
         VALUE_ERROR,
         "expected 132, got {}",
-        add.value()
+        add.value
     );
 
     println!("dropping Add; ~AddObj() then ~ExprObj for a and b");

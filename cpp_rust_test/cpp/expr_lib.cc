@@ -35,11 +35,6 @@ class ExprObj : public ffi::Object {
 
   explicit ExprObj(int64_t value) : value(value) {}
 
-  void SetValue(int64_t new_value) {
-    value = new_value;
-    std::cout << "[cpp_rust_test] ExprObj::SetValue() value=" << value << std::endl;
-  }
-
   ~ExprObj() {
     std::cout << "[cpp_rust_test] ~ExprObj() value=" << value << std::endl;
   }
@@ -89,8 +84,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::ObjectDef<ExprObj>()
       .def(refl::init<int64_t>())
-      .def_ro("value", &ExprObj::value, "scalar value")
-      .def("set_value", &ExprObj::SetValue, "set scalar value");
+      .def_rw("value", &ExprObj::value, "scalar value");
 
   refl::TypeAttrDef<ExprObj>().def(refl::type_attr::kConvert,
                                    &refl::details::FFIConvertFromAnyViewToObjectRef<Expr>);
