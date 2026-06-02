@@ -182,7 +182,7 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
                 let data_ptr = data.data_union.v_obj;
                 // need to increase ref because original weak ptr
                 // do not own the code
-                #tvm_ffi_crate::object::unsafe_::inc_ref(
+                #tvm_ffi_crate::object::inc_ref_raw_object(
                     data_ptr as *mut  #tvm_ffi_crate::tvm_ffi_sys::TVMFFIObject
                 );
                 Self {
