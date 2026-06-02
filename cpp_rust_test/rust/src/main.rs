@@ -96,13 +96,12 @@ impl DerefMut for Expr {
     }
 }
 
-/// Mirrors C++ `cpp_rust_test::AddObj` (`Object` + `Expr a` + `Expr b` + `value`).
+/// Mirrors C++ `cpp_rust_test::AddObj` (`ExprObj` + `Expr a` + `Expr b`).
 #[repr(C)]
 struct AddObj {
-    object: Object,
+    base: ExprObj,
     a: Expr,
     b: Expr,
-    value: i64,
 }
 
 unsafe impl ObjectCore for AddObj {
@@ -113,7 +112,7 @@ unsafe impl ObjectCore for AddObj {
     }
 
     unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject {
-        Object::object_header_mut(&mut this.object)
+        ExprObj::object_header_mut(&mut this.base)
     }
 }
 
@@ -125,7 +124,7 @@ struct Add {
 
 impl Add {
     fn value(&self) -> i64 {
-        self.data.value
+        self.data.base.value
     }
 
     fn a(&self) -> &Expr {

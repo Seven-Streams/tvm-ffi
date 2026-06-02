@@ -40,7 +40,7 @@ class ExprObj : public ffi::Object {
   }
 
   static constexpr bool _type_mutable = true;
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("cpp_rust_test.Expr", ExprObj, ffi::Object);
+  TVM_FFI_DECLARE_OBJECT_INFO("cpp_rust_test.Expr", ExprObj, ffi::Object);
 };
 
 class Expr : public ffi::ObjectRef {
@@ -50,13 +50,12 @@ class Expr : public ffi::ObjectRef {
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(Expr, ffi::ObjectRef, ExprObj);
 };
 
-class AddObj : public ffi::Object {
+class AddObj : public ExprObj {
  public:
   Expr a;
   Expr b;
-  int64_t value;
 
-  AddObj(Expr a, Expr b, int64_t value) : a(std::move(a)), b(std::move(b)), value(value) {}
+  AddObj(Expr a, Expr b, int64_t value) : ExprObj(value), a(std::move(a)), b(std::move(b)) {}
 
   void Update() {
     value = a->value + b->value;
@@ -69,17 +68,16 @@ class AddObj : public ffi::Object {
               << " b->value=" << b->value << std::endl;
   }
 
-  static constexpr bool _type_mutable = true;
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("cpp_rust_test.Add", AddObj, ffi::Object);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("cpp_rust_test.Add", AddObj, ExprObj);
 };
 
-class Add : public ffi::ObjectRef {
+class Add : public Expr {
  public:
-  Add(Expr a, Expr b, int64_t value) {
+  Add(Expr a, Expr b, int64_t value) : Expr(ffi::UnsafeInit{}) {
     data_ = ffi::make_object<AddObj>(std::move(a), std::move(b), value);
   }
 
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(Add, ffi::ObjectRef, AddObj);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(Add, Expr, AddObj);
 };
 
 TVM_FFI_STATIC_INIT_BLOCK() {
@@ -95,7 +93,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def(refl::init<Expr, Expr, int64_t>())
       .def_rw("a", &AddObj::a, "left Expr")
       .def_rw("b", &AddObj::b, "right Expr")
-      .def_rw("value", &AddObj::value, "combined scalar")
       .def("update", &AddObj::Update, "set value to a.value + b.value");
 
   refl::TypeAttrDef<AddObj>().def(refl::type_attr::kConvert,
