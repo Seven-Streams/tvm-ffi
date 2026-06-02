@@ -45,6 +45,8 @@ class PythonGenerator:
 
     name = "python"
     syntax = C.PYTHON_SYNTAX
+    #: Object blocks live inside a `class` body -> not safely removable wholesale.
+    standalone_object_blocks = False
 
     def default_ty_map(self) -> dict[str, str]:
         """Return the default FFI-origin -> Python-type name map."""
@@ -151,8 +153,14 @@ class PythonGenerator:
         object_infos: list[ObjectInfo],
         init_cfg: InitConfig,
         is_root: bool,
+        is_new_file: bool,
     ) -> str:
-        """Return text appended to a scaffolded ``_ffi_api.py``."""
+        """Return text appended to a scaffolded ``_ffi_api.py``.
+
+        ``is_new_file`` is unused: the Python scaffold has no whole-file header
+        that would be invalid mid-file.
+        """
+        _ = is_new_file
         return G.generate_python_ffi_api(
             code_blocks, ty_map, module_name, object_infos, init_cfg, is_root, self.syntax
         )

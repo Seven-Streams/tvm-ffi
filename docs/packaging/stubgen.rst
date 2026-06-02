@@ -20,9 +20,12 @@
 Stub Generation
 ===============
 
-TVM-FFI provides ``tvm-ffi-stubgen``, a tool that generates Python type stubs from C++
-reflection metadata. It turns registered global functions and classes into proper Python
-type hints, enabling IDE auto-completion and static type checking.
+TVM-FFI provides ``tvm-ffi-stubgen``, a tool that generates typed language bindings from C++
+reflection metadata. It turns registered global functions and classes into native type hints,
+enabling IDE auto-completion and static type checking.
+
+The sections below describe the default Python target. The Rust target is covered in
+:ref:`sec-stubgen-rust`.
 
 .. admonition:: Prerequisite
    :class: hint
@@ -46,7 +49,13 @@ This runs stub generation automatically after each build.
        [STUB_INIT ON|OFF]
        [STUB_PKG <pkg>]
        [STUB_PREFIX <prefix>]
+       [STUB_TARGET python|rust]
    )
+
+.. note::
+
+   ``STUB_TARGET`` (default ``python``) selects the backend, mirroring the CLI's
+   ``--target``. See :ref:`sec-stubgen-rust` for the Rust target.
 
 From the example's
 `CMakeLists.txt <https://github.com/apache/tvm-ffi/blob/main/examples/python_packaging/CMakeLists.txt>`_:
@@ -239,6 +248,9 @@ All three are required together. When omitted, the tool operates in directive-on
 
 **Optional arguments:**
 
+``--target``
+   Code generator backend: ``python`` (default) or ``rust``. See :ref:`sec-stubgen-rust`.
+
 ``--verbose``
    Print a unified diff of changes to each file.
 
@@ -252,6 +264,154 @@ All three are required together. When omitted, the tool operates in directive-on
    Indentation width for generated code (default: 4).
 
 For a complete list of options, run ``tvm-ffi-stubgen --help``.
+
+.. _sec-stubgen-rust:
+
+Rust Target
+-----------
+
+With ``--target rust`` (CLI) or ``STUB_TARGET rust`` (CMake), the generator emits a tree of
+Rust object bindings instead of Python stubs. For each registered class it produces a
+``#[repr(C)]`` data struct, an ``ObjectRef`` wrapper, ``Deref``/ ``DerefMut``, and an
+``impl`` block exposing the reflected constructor and methods.
+
+.. note::
+
+   The Rust target generates **object bindings only**. Global functions are not generated —
+   call them from Rust with ``Function::get_global("name")``. See the
+   :doc:`Rust guide <../guides/rust_lang_guide>` for the runtime API.
+
+Consider a C++ extension that registers ``my_ffi_extension.IntPair`` with two integer fields
+``a``/ ``b`` and a method ``sum``.
+
+Generating from CMake
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Add ``STUB_TARGET rust`` to :ref:`tvm_ffi_configure_target <sec-stubgen-cmake>`. The generator
+runs as a post-build step against the freshly built shared library:
+
+.. code-block:: cmake
+
+   add_library(my_ffi_extension SHARED src/extension.cc)
+   tvm_ffi_configure_target(my_ffi_extension
+       STUB_DIR rust/src/generated   # output directory for the Rust module tree
+       STUB_TARGET rust
+       STUB_INIT ON                  # ON: scaffold a fresh tree; OFF: refresh in place
+   )
+
+To emit both Python stubs and Rust bindings for the same target, call
+``tvm_ffi_configure_target`` twice with different ``STUB_DIR`` / ``STUB_TARGET`` values.
+
+Generating from the CLI
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The CLI mirrors the CMake options. To scaffold a fresh module tree:
+
+.. code-block:: bash
+
+   tvm-ffi-stubgen rust/src/generated          \
+     --target rust                             \
+     --dlls build/libmy_ffi_extension.so       \
+     --init-pypkg my-ffi-extension             \
+     --init-lib my_ffi_extension               \
+     --init-prefix "my_ffi_extension."
+
+.. note::
+
+   The CLI requires the three ``--init-*`` flags to be given together, but for the Rust
+   target only ``--init-prefix`` affects the output (it selects which registry prefixes to
+   scaffold). ``--init-pypkg`` / ``--init-lib`` are Python-packaging metadata.
+
+To refresh an existing tree in place (regenerate inside existing directive blocks only), omit
+the ``--init-*`` flags:
+
+.. code-block:: bash
+
+   tvm-ffi-stubgen rust/src/generated --target rust --dlls build/libmy_ffi_extension.so
+
+Generated Output
+~~~~~~~~~~~~~~~~
+
+Each registry prefix becomes a ``mod.rs`` under ``STUB_DIR``. For ``my_ffi_extension.IntPair``
+the generated binding looks like (boilerplate trimmed):
+
+.. code-block:: rust
+
+   #[repr(C)]
+   #[derive(DeriveObject)]   // `use tvm_ffi::derive::Object as DeriveObject;`
+   #[type_key = "my_ffi_extension.IntPair"]
+   pub struct IntPairObj {
+       base: Object,   // parent embedded as the first field
+       pub a: i64,     // fields are public: read (and write, if mutable) via Deref
+       pub b: i64,
+   }
+
+   #[repr(C)]
+   #[derive(DeriveObjectRef, Clone)]
+   pub struct IntPair {
+       data: ObjectArc<IntPairObj>,
+   }
+
+   impl IntPair {
+       /// Native (FFI-free) construction: allocates the struct and binds fields directly.
+       pub fn ffi_new(a: i64, b: i64) -> Result<Self> { /* ... */ }
+       pub fn sum(&mut self) -> Result<i64> { /* ... */ }
+   }
+
+Scalar fields are rendered width-correct from reflection's per-field size: an ``int32_t``
+C++ field becomes ``i32`` in the ``#[repr(C)]`` struct (method arguments and returns travel
+through the packed-``Any`` convention and stay ``i64``/``f64``).
+
+Mutability follows the C++ field flags: if **all** fields are writable the wrapper gets
+``DerefMut`` and ``&mut self`` methods; if all are read-only it gets ``Deref`` only. A class
+with a mix of writable and read-only fields is treated as immutable (with a warning).
+
+Constructors: ``ffi_new``
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The generated constructor is named ``ffi_new`` and takes one parameter per init-eligible
+field, in declaration order. Whenever possible it constructs the object **natively** -- a
+direct Rust allocation that writes every field, with no FFI round-trip. This deliberately
+bypasses the C++ constructor body: validation, derived fields, or side effects in an
+explicit ``refl::init<...>`` constructor are **not** replayed. When you need the faithful
+C++ semantics, hand-write a ``new`` outside the stubgen markers (anywhere in the crate)
+that wraps ``ffi_new``; regeneration never touches code outside the markers.
+
+A type can opt out of native construction by setting the ``__ffi_no_native__`` type
+attribute on the C++ side:
+
+.. code-block:: cpp
+
+   refl::TypeAttrDef<MyObj>().attr("__ffi_no_native__", true);
+
+Use this for types whose constructor/destructor must run on the C++ side (side effects,
+resource management). The generated ``ffi_new`` then dispatches the reflected
+``__ffi_init__`` through the FFI instead. The same FFI fallback is chosen automatically
+when native construction cannot faithfully lay out the object (e.g. an ``Optional`` or
+tuple field, or a non-init field without a statically renderable default).
+
+Mounting the Module Tree
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The generator wires the tree together with ``pub mod`` declarations and writes a root
+``mod.rs`` under ``STUB_DIR``, but it cannot edit your crate root. Add a single ``mod``
+declaration where you want the bindings mounted, e.g. in ``src/lib.rs``:
+
+.. code-block:: rust
+
+   mod generated;   // points at src/generated/mod.rs
+
+Limitations
+~~~~~~~~~~~
+
+- **Unsupported field/parameter types** (``Map``, ``Dict``, ``List``, ``Variant``) have no
+  Rust equivalent. The affected object or method is skipped with a ``[Skipped]`` warning
+  rather than aborting generation; the rest of the file is still produced.
+- **Cross-prefix references** are not resolved: a type referenced from a different prefix
+  -- as a parent class or as a field/parameter type -- is not auto-imported, and the
+  emitted ``use my_pkg::Foo;`` path does not exist in your crate. Keep an inheritance
+  hierarchy and mutually-referencing types under a single prefix, or add the ``use`` by
+  hand.
 
 .. _sec-stubgen-advanced:
 

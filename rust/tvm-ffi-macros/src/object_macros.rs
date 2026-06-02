@@ -58,7 +58,7 @@ pub fn derive_object(input: proc_macro::TokenStream) -> TokenStream {
                                 &type_key_arg, &mut tindex
                             );
                             if ret != 0 {
-                                proc_macro_error::abort!("Failed to get type index for type key: {}", #type_key);
+                                panic!("Failed to get type index for type key: {}", #type_key);
                             }
                             tindex
                         }
@@ -182,7 +182,7 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
                 let data_ptr = data.data_union.v_obj;
                 // need to increase ref because original weak ptr
                 // do not own the code
-                #tvm_ffi_crate::object::unsafe_::inc_ref(
+                #tvm_ffi_crate::object::inc_ref_raw_object(
                     data_ptr as *mut  #tvm_ffi_crate::tvm_ffi_sys::TVMFFIObject
                 );
                 Self {

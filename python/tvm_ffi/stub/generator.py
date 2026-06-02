@@ -24,8 +24,9 @@ The stub generator separates two concerns:
    :class:`.utils.FuncInfo`). None of this knows or cares about the target
    language.
 2. *Language-specific* rendering — turning that metadata into concrete source
-   text, rendering a :class:`~tvm_ffi.core.TypeSchema` into a target-language
-   type expression, and modelling that language's imports.
+   text (Python ``def``/``class`` vs Rust ``fn``/``struct``/``impl``), rendering
+   a :class:`~tvm_ffi.core.TypeSchema` into a target-language type expression
+   (``T | None`` vs ``Option<T>``), and modelling that language's imports.
 
 A :class:`Generator` encapsulates concern (2); ``cli.py`` drives concern (1) and
 delegates every act of emitting text — and every act of collecting imports — to
@@ -41,6 +42,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
 from . import consts as C
 from .python_generator import PythonGenerator
+from .rust_generator import RustGenerator
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -71,11 +73,18 @@ class Generator(Protocol):
     that created it understands its contents.
     """
 
-    #: Short identifier, e.g. ``"python"``.
+    #: Short identifier, e.g. ``"python"`` or ``"rust"``.
     name: str
 
     #: Comment-marker syntax for the files this generator emits.
     syntax: C.MarkerSyntax
+
+    #: Whether an ``object/<key>`` block is a self-contained top-level item that
+    #: can be deleted wholesale (markers included) when its type is no longer
+    #: registered. True for Rust (a ``struct``+``impl`` stands alone); False for
+    #: Python (the block lives inside a ``class`` body, so removing it would leave
+    #: a broken empty class).
+    standalone_object_blocks: bool
 
     def default_ty_map(self) -> dict[str, str]:
         """Return the default FFI-origin -> target-type name map for this language."""
@@ -85,7 +94,7 @@ class Generator(Protocol):
         """Render a single :class:`TypeSchema` into a target-language type expression.
 
         This is the core seam: it walks ``schema.origin`` / ``schema.args`` and
-        produces the corresponding source-level type string.
+        produces e.g. ``"int | None"`` (Python) or ``"Option<i64>"`` (Rust).
         ``ty_render`` maps a leaf origin name and records the import it needs.
         """
         ...
@@ -158,13 +167,17 @@ class Generator(Protocol):
         ...
 
     def generate_helpers_block(self, code: CodeBlock, opt: Options) -> None:
-        """Emit shared per-file support code for generator-specific helper blocks."""
+        """Emit shared per-file support code for a ``helpers`` block.
+
+        Python is a no-op (no support code needed); Rust fills it with the
+        ``lookup_type_index`` / ``get_type_method`` helpers.
+        """
         ...
 
     # --- whole-file scaffolding (used by `--init` mode) ---------------------
 
     def api_filename(self) -> str:
-        """File name of the scaffolded API file."""
+        """File name of the scaffolded API file (Python ``_ffi_api.py``; Rust ``mod.rs``)."""
         ...
 
     def init_filename(self) -> str:
@@ -179,8 +192,14 @@ class Generator(Protocol):
         object_infos: list[ObjectInfo],
         init_cfg: InitConfig,
         is_root: bool,
+        is_new_file: bool,
     ) -> str:
-        """Return text appended to a freshly scaffolded API file (Python ``_ffi_api.py``)."""
+        """Return text appended to a scaffolded API file (Python ``_ffi_api.py``).
+
+        ``is_new_file`` is True only when the target file did not exist or was
+        empty: whole-file headers (e.g. Rust's ``#![allow]`` inner attribute,
+        which must precede every item) may be emitted only then.
+        """
         ...
 
     def generate_init_file(
@@ -190,12 +209,17 @@ class Generator(Protocol):
         ...
 
     def finalize_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
-        """Post-``--init`` hook to stitch the generated tree after file creation."""
+        """Post-``--init`` hook to stitch the generated tree (after all files exist).
+
+        Python is a no-op (packages need no parent declarations). Rust writes the
+        ``pub mod <child>;`` declarations that wire the module tree together.
+        """
         ...
 
 
 _GENERATORS: dict[str, Callable[[], Generator]] = {
     "python": PythonGenerator,
+    "rust": RustGenerator,
 }
 
 

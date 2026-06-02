@@ -24,6 +24,8 @@ from tvm_ffi.core import TypeSchema
 from tvm_ffi.stub import consts as C
 from tvm_ffi.stub.cli import _stage_2, _stage_3
 from tvm_ffi.stub.file_utils import CodeBlock, FileInfo
+from tvm_ffi.stub.generator import Generator, get_generator
+from tvm_ffi.stub.python_generator import PythonGenerator
 from tvm_ffi.stub.python_generator import consts as PC
 from tvm_ffi.stub.python_generator.codegen import (
     generate_python_all,
@@ -38,9 +40,23 @@ from tvm_ffi.stub.python_generator.codegen import (
     render_object_methods,
 )
 from tvm_ffi.stub.python_generator.utils import ImportItem
+from tvm_ffi.stub.rust_generator import codegen as rust_codegen
+from tvm_ffi.stub.rust_generator import consts as RC
+from tvm_ffi.stub.rust_generator.codegen import (
+    UnsupportedTypeError,
+    _render_default,
+    finalize_rust_module_tree,
+    generate_rust_import_section,
+    generate_rust_object,
+    render_rust_type,
+)
+from tvm_ffi.stub.rust_generator.generator import RustGenerator
+from tvm_ffi.stub.rust_generator.utils import RustImports, RustUse, _rust_ident
 from tvm_ffi.stub.utils import (
+    FieldInit,
     FuncInfo,
     InitConfig,
+    InitFieldInfo,
     NamedTypeSchema,
     ObjectInfo,
     Options,
@@ -753,3 +769,1280 @@ def test_stage_2_filters_prefix_and_marks_root(
     sub_text = sub_api.read_text(encoding="utf-8")
     assert 'LIB = _FFI_LOAD_LIB("demo-pkg", "demo_shared")' in root_text
     assert "LIB =" not in sub_text
+
+
+# ---------------------------------------------------------------------------
+# Rust backend: use modelling (rust_generator/imports.py)
+# ---------------------------------------------------------------------------
+
+
+def test_rustuse_keeps_qualified_path() -> None:
+    u = RustUse("tvm_ffi::Array")
+    assert u.path == "tvm_ffi::Array"
+    assert u.leaf == "Array"
+    assert u.full_name == "tvm_ffi::Array"
+    assert u.name_in_scope == "Array"
+    assert u.as_use_line() == "use tvm_ffi::Array;"
+
+
+def test_rustuse_normalizes_dotted_ffi_name() -> None:
+    # leading `ffi` segment rewritten via RUST_MOD_MAP, dots -> ::
+    assert RustUse("ffi.String").path == "tvm_ffi::String"
+    # unmapped crate prefix is preserved, dots still -> ::
+    u = RustUse("my_pkg.sub.Foo")
+    assert u.path == "my_pkg::sub::Foo"
+    assert u.leaf == "Foo"
+    assert u.as_use_line() == "use my_pkg::sub::Foo;"
+
+
+def test_rustuse_alias() -> None:
+    u = RustUse("tvm_ffi::Array", alias="_Array")
+    assert u.name_in_scope == "_Array"
+    assert u.as_use_line() == "use tvm_ffi::Array as _Array;"
+
+
+@pytest.mark.parametrize("bare", ["i64", "f64", "bool", "()", "Option"])
+def test_rustuse_bare_types_need_no_use(bare: str) -> None:
+    u = RustUse(bare)
+    assert u.path == bare
+    assert u.leaf == bare
+    assert u.as_use_line() == ""
+
+
+def test_rustuse_is_hashable_and_dedups() -> None:
+    a = RustUse("tvm_ffi::Array")
+    b = RustUse("tvm_ffi::Array")
+    assert a == b
+    assert len({a, b}) == 1
+
+
+def test_rustimports_default_empty() -> None:
+    imp = RustImports()
+    assert imp.items == []
+    imp.items.append(RustUse("tvm_ffi::Tensor"))
+    assert imp.items[0].leaf == "Tensor"
+
+
+# ---------------------------------------------------------------------------
+# Rust backend: type renderer (rust_generator/codegen.py)
+# ---------------------------------------------------------------------------
+
+
+def _rust_render(schema: TypeSchema) -> tuple[str, RustImports]:
+    """Render `schema` with a fresh collector; return (text, imports)."""
+    imports = RustImports()
+    ty_map = RC.RUST_TY_MAP_DEFAULTS
+
+    def ty_render(origin: str) -> str:
+        return imports.record(ty_map.get(origin, origin))
+
+    return render_rust_type(schema, ty_render), imports
+
+
+def test_render_primitive_no_import() -> None:
+    text, imports = _rust_render(TypeSchema("int"))
+    assert text == "i64"
+    assert imports.items == []  # primitives need no `use`
+
+
+def test_render_optional() -> None:
+    text, _ = _rust_render(TypeSchema("Optional", (TypeSchema("int"),)))
+    assert text == "Option<i64>"
+
+
+def test_render_array_records_use() -> None:
+    text, imports = _rust_render(TypeSchema("Array", (TypeSchema("int"),)))
+    assert text == "Array<i64>"
+    assert RustUse("tvm_ffi::Array") in imports.items
+
+
+def test_render_callable_is_function() -> None:
+    text, imports = _rust_render(TypeSchema("Callable", (TypeSchema("int"),)))
+    assert text == "Function"
+    assert RustUse("tvm_ffi::Function") in imports.items
+
+
+def test_render_tuple() -> None:
+    assert _rust_render(TypeSchema("tuple"))[0] == "()"
+    text, _ = _rust_render(TypeSchema("tuple", (TypeSchema("int"), TypeSchema("float"))))
+    assert text == "(i64, f64)"
+
+
+def test_render_object_leaf_records_use() -> None:
+    # `tvm_ffi::String` is rendered fully-qualified inline (RUST_NO_IMPORT_FULLPATH)
+    # and records no `use`, so it can't shadow `std::string::String` in the module
+    # (which would break `#[derive(ObjectRef)]`'s `type_str() -> String`).
+    text, imports = _rust_render(TypeSchema("ffi.String"))
+    assert text == "tvm_ffi::String"
+    assert RustUse("tvm_ffi::String") not in imports.items
+
+
+def test_render_nested() -> None:
+    schema = TypeSchema("Optional", (TypeSchema("Array", (TypeSchema("int"),)),))
+    text, imports = _rust_render(schema)
+    assert text == "Option<Array<i64>>"
+    assert RustUse("tvm_ffi::Array") in imports.items
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        TypeSchema("Union", (TypeSchema("int"), TypeSchema("str"))),
+        TypeSchema("Map", (TypeSchema("str"), TypeSchema("int"))),
+        TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))),
+        TypeSchema("List", (TypeSchema("int"),)),
+    ],
+)
+def test_render_unsupported_raises(schema: TypeSchema) -> None:
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _rust_render(schema)
+    assert exc.value.origin == schema.origin
+
+
+def test_render_unsupported_nested_raises() -> None:
+    # Map buried inside an Array still bubbles up.
+    schema = TypeSchema("Array", (TypeSchema("Map", (TypeSchema("str"), TypeSchema("int"))),))
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _rust_render(schema)
+    assert exc.value.origin == "Map"
+
+
+def test_rust_generator_render_type_delegates() -> None:
+    imports = RustImports()
+    ty_map = RC.RUST_TY_MAP_DEFAULTS
+
+    def ty_render(origin: str) -> str:
+        return imports.record(ty_map.get(origin, origin))
+
+    out = RustGenerator().render_type(TypeSchema("Optional", (TypeSchema("int"),)), ty_render)
+    assert out == "Option<i64>"
+
+
+def test_ty_render_dedups_same_path() -> None:
+    imports = RustImports()
+    ty_map = RC.RUST_TY_MAP_DEFAULTS
+
+    def tr(origin: str) -> str:
+        return imports.record(ty_map.get(origin, origin))
+
+    assert tr("Array") == "Array"
+    assert tr("Array") == "Array"  # same path again -> reuse binding
+    assert imports.items == [RustUse("tvm_ffi::Array")]  # recorded exactly once
+
+
+def test_ty_render_aliases_same_leaf_different_path() -> None:
+    imports = RustImports()
+    ty_map = {"A": "crate_a::Foo", "B": "crate_b::Foo", "C": "crate_c::Foo"}
+
+    def tr(origin: str) -> str:
+        return imports.record(ty_map.get(origin, origin))
+
+    assert tr("A") == "Foo"  # first claims the bare leaf
+    assert tr("B") == "Foo2"  # collision -> aliased
+    assert tr("C") == "Foo3"  # next collision
+    lines = [u.as_use_line() for u in imports.items]
+    assert lines == [
+        "use crate_a::Foo;",
+        "use crate_b::Foo as Foo2;",
+        "use crate_c::Foo as Foo3;",
+    ]
+
+
+def test_ty_render_bare_types_not_tracked() -> None:
+    imports = RustImports()
+    ty_map = RC.RUST_TY_MAP_DEFAULTS
+
+    def tr(origin: str) -> str:
+        return imports.record(ty_map.get(origin, origin))
+
+    assert tr("int") == "i64"
+    assert tr("Optional") == "Option"  # prelude, bare
+    assert imports.items == []
+
+
+def test_ty_render_seeds_from_existing_imports() -> None:
+    # A pre-seeded `use` (e.g. from an import-object directive) must be respected:
+    # a different path with the same leaf gets aliased rather than colliding.
+    imports = RustImports(items=[RustUse("crate_a::Foo")])
+    ty_map = {"B": "crate_b::Foo"}
+
+    def tr(origin: str) -> str:
+        return imports.record(ty_map.get(origin, origin))
+
+    assert tr("B") == "Foo2"
+
+
+def test_rustimports_prelude_leaf_gets_aliased() -> None:
+    # Bare prelude names (`Option`, `i64`, ...) render import-free and are
+    # pre-claimed: a type key whose leaf collides must be aliased -- a bare
+    # `use my_pkg::Option;` would silently shadow the prelude `Option` (and
+    # thereby every `Option<T>` field) for the whole module.
+    imp = RustImports()
+    assert imp.record("my_pkg.Option") == "Option2"
+    assert RustUse("my_pkg::Option", alias="Option2") in imp.items
+
+
+# ---------------------------------------------------------------------------
+# Rust backend: object generation (rust_generator/codegen.py)
+# ---------------------------------------------------------------------------
+
+
+def _rust_object_block(key: str) -> CodeBlock:
+    return CodeBlock(
+        kind="object",
+        param=key,
+        lineno_start=1,
+        lineno_end=2,
+        lines=[f"// tvm-ffi-stubgen(begin): object/{key}", "// tvm-ffi-stubgen(end)"],
+    )
+
+
+def _gen_rust_object(info: ObjectInfo) -> tuple[str, RustImports]:
+    block = _rust_object_block(info.type_key or "x")
+    imports = RustImports()
+    generate_rust_object(block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), info)
+    return "\n".join(block.lines), imports
+
+
+def _expr_info(*, value_frozen: bool = False) -> ObjectInfo:
+    """Root `Expr`: field `value: i64`, static `test() -> i64`, init(i64).
+
+    Marked ``no_native`` so it stays the canonical *FFI-new* fixture: native
+    construction is now used whenever possible, so the opt-out is what keeps the
+    structural/CLI tests below exercising the ``__ffi_init__`` dispatch path. The
+    native path is covered separately by the ``_native_*`` fixtures.
+    """
+    return ObjectInfo(
+        fields=[NamedTypeSchema("value", TypeSchema("int"), frozen=value_frozen)],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema("test", TypeSchema("Callable", (TypeSchema("int"),))),
+                is_member=False,
+            )
+        ],
+        type_key="cpp_rust_test.Expr",
+        parent_type_key="ffi.Object",
+        init_fields=[
+            InitFieldInfo("value", NamedTypeSchema("value", TypeSchema("int")), False, False)
+        ],
+        has_init=True,
+        no_native=True,
+    )
+
+
+def _add_info() -> ObjectInfo:
+    """Return derived `Add` info with fields, method, and constructor metadata."""
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("a", TypeSchema("cpp_rust_test.Expr")),
+            NamedTypeSchema("b", TypeSchema("cpp_rust_test.Expr")),
+        ],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema(
+                    "update",
+                    TypeSchema("Callable", (TypeSchema("None"), TypeSchema("cpp_rust_test.Add"))),
+                ),
+                is_member=True,
+            )
+        ],
+        type_key="cpp_rust_test.Add",
+        parent_type_key="cpp_rust_test.Expr",
+        init_fields=[
+            InitFieldInfo(
+                "a", NamedTypeSchema("a", TypeSchema("cpp_rust_test.Expr")), False, False
+            ),
+            InitFieldInfo(
+                "b", NamedTypeSchema("b", TypeSchema("cpp_rust_test.Expr")), False, False
+            ),
+            InitFieldInfo("value", NamedTypeSchema("value", TypeSchema("int")), False, False),
+        ],
+        has_init=True,
+    )
+
+
+def _native_point_info() -> ObjectInfo:
+    """Root auto-init `Point`: init fields x, y -> native `ObjectArc::new`."""
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("x", TypeSchema("int")),
+            NamedTypeSchema("y", TypeSchema("int")),
+        ],
+        methods=[],
+        type_key="cpp_rust_test.Point",
+        parent_type_key="ffi.Object",
+        init_fields=[
+            InitFieldInfo("x", NamedTypeSchema("x", TypeSchema("int")), False, False),
+            InitFieldInfo("y", NamedTypeSchema("y", TypeSchema("int")), False, False),
+        ],
+        has_init=True,
+        own_field_inits=[
+            FieldInit("x", has_default=False, default=None, has_factory=False),
+            FieldInit("y", has_default=False, default=None, has_factory=False),
+        ],
+    )
+
+
+def _native_config_info() -> ObjectInfo:
+    """Root auto-init `Config`: init field `scale` + `init(false)` defaulted fields."""
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("scale", TypeSchema("int")),
+            NamedTypeSchema("offset", TypeSchema("int")),
+            NamedTypeSchema("verbose", TypeSchema("bool")),
+            NamedTypeSchema("label", TypeSchema("ffi.String")),
+        ],
+        methods=[],
+        type_key="cpp_rust_test.Config",
+        parent_type_key="ffi.Object",
+        init_fields=[
+            InitFieldInfo("scale", NamedTypeSchema("scale", TypeSchema("int")), False, False),
+        ],
+        has_init=True,
+        own_field_inits=[
+            FieldInit("scale", has_default=False, default=None, has_factory=False),
+            FieldInit("offset", has_default=True, default=7, has_factory=False),
+            FieldInit("verbose", has_default=True, default=True, has_factory=False),
+            FieldInit("label", has_default=True, default="none", has_factory=False),
+        ],
+    )
+
+
+def test_rust_native_root_construction() -> None:
+    text, _ = _gen_rust_object(_native_point_info())
+    # Auto-init root -> native: `ffi_new` allocates via `ObjectArc::new` with a
+    # single inline struct literal -- no `__ffi_init__` round-trip. A root type
+    # without native children gets no bare-struct builder (`impl PointObj`).
+    assert "pub fn ffi_new(x: i64, y: i64) -> Result<Self> {" in text
+    assert "data: ObjectArc::new(PointObj {" in text
+    assert "base: Object::new()," in text
+    assert "impl PointObj {" not in text
+    assert "__ffi_init__" not in text
+    assert "get_type_method" not in text
+
+
+def test_rust_native_defaults_rendered() -> None:
+    text, _ = _gen_rust_object(_native_config_info())
+    # Only the init field is a parameter; `init(false)` fields are filled inline
+    # from their statically rendered defaults (int / bool / str).
+    assert "pub fn ffi_new(scale: i64) -> Result<Self> {" in text
+    assert "data: ObjectArc::new(ConfigObj {" in text
+    assert "offset: 7," in text
+    assert "verbose: true," in text
+    assert 'label: tvm_ffi::String::from("none"),' in text
+    assert "__ffi_init__" not in text
+
+
+def _native_narrow_info() -> ObjectInfo:
+    """Root auto-init `Pixel`: narrow scalar fields (int32/int8/float) + an int method.
+
+    Field schemas carry reflection's ``sizeof(T)`` so the renderer can emit the
+    width-correct ``#[repr(C)]`` field types; the method's ``int`` stays
+    schema-erased (no size) and must keep the packed-``Any`` default ``i64``.
+    """
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("x", TypeSchema("int"), size=4),
+            NamedTypeSchema("flag", TypeSchema("int"), size=1),
+            NamedTypeSchema("weight", TypeSchema("float"), size=4),
+            NamedTypeSchema("big", TypeSchema("int"), size=8),
+            NamedTypeSchema("ratio", TypeSchema("float"), size=4),
+        ],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema(
+                    "get_x",
+                    TypeSchema("Callable", (TypeSchema("int"), TypeSchema("cpp_rust_test.Pixel"))),
+                ),
+                is_member=True,
+            )
+        ],
+        type_key="cpp_rust_test.Pixel",
+        parent_type_key="ffi.Object",
+        init_fields=[
+            InitFieldInfo("x", NamedTypeSchema("x", TypeSchema("int"), size=4), False, False),
+        ],
+        has_init=True,
+        own_field_inits=[
+            FieldInit("x", has_default=False, default=None, has_factory=False),
+            FieldInit("flag", has_default=True, default=1, has_factory=False),
+            FieldInit("weight", has_default=True, default=2.5, has_factory=False),
+            FieldInit("big", has_default=True, default=9, has_factory=False),
+            FieldInit("ratio", has_default=True, default=float("inf"), has_factory=False),
+        ],
+    )
+
+
+def test_rust_scalar_fields_width_narrowed() -> None:
+    text, _ = _gen_rust_object(_native_narrow_info())
+    # Struct fields are laid out directly -> width-correct primitives by `size`.
+    assert "pub x: i32," in text
+    assert "pub flag: i8," in text
+    assert "pub weight: f32," in text
+    assert "pub big: i64," in text
+    # The native ctor parameter binds straight into the struct -> same width.
+    assert "pub fn ffi_new(x: i32) -> Result<Self> {" in text
+    # Bare literal defaults rely on struct-literal inference (no width suffix).
+    assert "flag: 1," in text
+    assert "weight: 2.5," in text
+    # A non-finite default renders as a typed constant matching the narrowed width.
+    assert "ratio: f32::INFINITY," in text
+    # Method args/returns travel as packed Any (v_int64) -> stay i64.
+    assert "pub fn get_x(&mut self) -> Result<i64> {" in text
+
+
+def _scrambled_layout_info(*, gap: bool = False) -> ObjectInfo:
+    """Fields REGISTERED out of memory order: beta@24, gamma@32, alpha@16.
+
+    Declaration (memory) order is ``alpha: i32 @16, beta: i64 @24 (4 bytes of
+    padding), gamma: i32 @32`` -- ``#[repr(C)]`` reproduces exactly this layout
+    when the fields are emitted by offset. With ``gap=True``, ``gamma`` moves to
+    offset 40 (as if an unregistered C++ member sat at 32..40), which no
+    ``#[repr(C)]`` ordering can reproduce -> the offset warning must fire.
+    """
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("beta", TypeSchema("int"), size=8, offset=24),
+            NamedTypeSchema("gamma", TypeSchema("int"), size=4, offset=40 if gap else 32),
+            NamedTypeSchema("alpha", TypeSchema("int"), size=4, offset=16),
+        ],
+        methods=[],
+        type_key="cpp_rust_test.Scrambled",
+        parent_type_key="ffi.Object",
+    )
+
+
+def test_rust_struct_fields_sorted_by_offset(capsys: pytest.CaptureFixture[str]) -> None:
+    text, _ = _gen_rust_object(_scrambled_layout_info())
+    # The struct lays fields out positionally -> memory (offset) order, not
+    # registration order.
+    alpha, beta, gamma = (text.index(f"pub {n}:") for n in ("alpha", "beta", "gamma"))
+    assert alpha < beta < gamma
+    # The repr(C) layout (with its natural alignment padding after `alpha`)
+    # matches the recorded offsets -> no warning.
+    assert "[Warning]" not in capsys.readouterr().out
+
+
+def test_rust_struct_offset_gap_warns(capsys: pytest.CaptureFixture[str]) -> None:
+    text, _ = _gen_rust_object(_scrambled_layout_info(gap=True))
+    # The binding is still emitted (warning, not an error) ...
+    assert "pub struct ScrambledObj {" in text
+    # ... but the unreproducible hole at 32..40 is reported: repr(C) places
+    # `gamma` right after `beta` (offset 32), reflection says 40.
+    out = capsys.readouterr().out
+    assert "[Warning] object cpp_rust_test.Scrambled" in out
+    assert "'gamma' is at C++ offset 40" in out
+    assert "places it at offset 32" in out
+
+
+def test_rust_offset_check_resumes_after_unverifiable_field(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A field without size metadata is skipped (not an early bail-out): the field
+    # right after it has no known predecessor end, but checking resumes one field
+    # later -- the hole before `d` must still be reported.
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("a", TypeSchema("int"), size=4, offset=16),
+            NamedTypeSchema("b", TypeSchema("int"), offset=20),  # no size -> unverifiable
+            NamedTypeSchema("c", TypeSchema("int"), size=4, offset=24),
+            NamedTypeSchema("d", TypeSchema("int"), size=4, offset=48),  # repr(C) says 28
+        ],
+        methods=[],
+        type_key="cpp_rust_test.Holey",
+        parent_type_key="ffi.Object",
+    )
+    _gen_rust_object(info)
+    out = capsys.readouterr().out
+    assert "'d' is at C++ offset 48" in out
+    assert "places it at offset 28" in out
+
+
+def _explicit_init_point_info() -> ObjectInfo:
+    """Like `_native_point_info` but an EXPLICIT `refl::init<i64, i64>` (a method)."""
+    info = _native_point_info()
+    info.methods = [
+        FuncInfo(
+            NamedTypeSchema(
+                "__ffi_init__",
+                TypeSchema(
+                    "Callable",
+                    (TypeSchema("cpp_rust_test.Point"), TypeSchema("int"), TypeSchema("int")),
+                ),
+            ),
+            is_member=False,
+        )
+    ]
+    return info
+
+
+def test_rust_native_explicit_init_field_binding() -> None:
+    # Explicit `refl::init<i64, i64>` whose arity (2) matches the init-field count
+    # (a, b) -> field-binding shape -> native, no FFI `__ffi_init__` dispatch.
+    text, _ = _gen_rust_object(_explicit_init_point_info())
+    assert "pub fn ffi_new(x: i64, y: i64) -> Result<Self> {" in text
+    assert "data: ObjectArc::new(PointObj {" in text
+    assert "__ffi_init__" not in text
+
+
+def test_rust_native_explicit_init_arity_mismatch_still_native() -> None:
+    # Explicit init arity (1) != init-field count (2): the C++ ctor derives a field
+    # (the `Circle(radius)` shape). Native is still emitted -- `ffi_new` binds ALL
+    # init fields (x, y), silently bypassing the derive. A user who needs the
+    # faithful semantics hand-writes a `new` (outside the markers) over `ffi_new`.
+    info = _explicit_init_point_info()
+    info.methods = [
+        FuncInfo(
+            NamedTypeSchema(
+                "__ffi_init__",
+                TypeSchema("Callable", (TypeSchema("cpp_rust_test.Point"), TypeSchema("int"))),
+            ),
+            is_member=False,
+        )
+    ]
+    text, _ = _gen_rust_object(info)
+    assert "pub fn ffi_new(x: i64, y: i64) -> Result<Self> {" in text
+    assert "data: ObjectArc::new(PointObj {" in text
+    assert "__ffi_init__" not in text
+
+
+def test_rust_native_opt_out_forces_ffi() -> None:
+    # `no_native` (the `__ffi_no_native__` attr) keeps a field-binding type on FFI.
+    info = _explicit_init_point_info()
+    info.no_native = True
+    text, _ = _gen_rust_object(info)
+    assert "impl PointObj {" not in text  # no bare-struct builder on the FFI path
+    assert 'get_type_method_cached(&CTOR, PointObj::type_index(), "__ffi_init__")' in text
+
+
+def test_rust_native_excluded_for_optional_field() -> None:
+    # A top-level `Optional` field renders to std `Option<T>`, whose layout differs
+    # from C++ `ffi::Optional<T>`; native writes would corrupt it -> FFI fallback.
+    info = _explicit_init_point_info()
+    info.fields = [
+        NamedTypeSchema("x", TypeSchema("int")),
+        NamedTypeSchema("y", TypeSchema("Optional", (TypeSchema("int"),))),
+    ]
+    text, _ = _gen_rust_object(info)
+    assert "impl PointObj {" not in text  # no bare-struct builder on the FFI path
+    assert 'get_type_method_cached(&CTOR, PointObj::type_index(), "__ffi_init__")' in text
+
+
+def _native_point3d_info() -> ObjectInfo:
+    """Build the derived `Point3D : Point` fixture: own init field `z` (x / y on the parent)."""
+    return ObjectInfo(
+        fields=[NamedTypeSchema("z", TypeSchema("int"))],
+        methods=[],
+        type_key="cpp_rust_test.Point3D",
+        parent_type_key="cpp_rust_test.Point",
+        init_fields=[
+            InitFieldInfo("x", NamedTypeSchema("x", TypeSchema("int")), False, False),
+            InitFieldInfo("y", NamedTypeSchema("y", TypeSchema("int")), False, False),
+            InitFieldInfo("z", NamedTypeSchema("z", TypeSchema("int")), False, False),
+        ],
+        has_init=True,
+        own_field_inits=[FieldInit("z", has_default=False, default=None, has_factory=False)],
+    )
+
+
+def _patch_native_point_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand in for the live registry: just the Point / Point3D fixture pair."""
+    fixtures = {
+        "cpp_rust_test.Point": _native_point_info,
+        "cpp_rust_test.Point3D": _native_point3d_info,
+    }
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key]())
+    monkeypatch.setattr(rust_codegen, "GetRegisteredTypeKeys", lambda: list(fixtures))
+
+
+def test_rust_native_derived_takes_base_param(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A derived native type does NOT flatten ancestor init fields: its `ffi_new`
+    # takes the already-built parent value as one `base: <Parent>Obj` parameter
+    # followed by the OWN init fields only, bound in an inline struct literal.
+    _patch_native_point_registry(monkeypatch)
+    text, _ = _gen_rust_object(_native_point3d_info())
+    assert "pub fn ffi_new(base: PointObj, z: i64) -> Result<Self> {" in text
+    assert "data: ObjectArc::new(Point3DObj {" in text
+    assert "            base," in text
+    # Point3D has no native children -> no bare-struct builder on its own Obj.
+    assert "impl Point3DObj {" not in text
+    # No flattened ancestor params, no FFI dispatch.
+    assert "ffi_new(x: i64, y: i64, z: i64)" not in text
+    assert "__ffi_init__" not in text
+
+
+def test_rust_native_parent_gets_bare_struct_builder(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A type some native child derives from additionally gets the bare-struct
+    # builder `impl <T>Obj { fn ffi_new(..) -> Self }` -- the only way a caller
+    # can produce the child's `base` argument. The ref-level `ffi_new` keeps the
+    # ordinary inline-literal shape (it does not delegate to the builder).
+    _patch_native_point_registry(monkeypatch)
+    text, _ = _gen_rust_object(_native_point_info())
+    assert "impl PointObj {" in text
+    assert "pub fn ffi_new(x: i64, y: i64) -> Self {" in text
+    assert "pub fn ffi_new(x: i64, y: i64) -> Result<Self> {" in text
+    assert "data: ObjectArc::new(PointObj {" in text
+    assert "base: Object::new()," in text
+
+
+def _fake_render_type(schema: TypeSchema) -> str:
+    """Width-erased stand-in for the renderer passed to `_render_default` in tests."""
+    return {"float": "f64", "ffi.String": "tvm_ffi::String"}.get(schema.origin, "T")
+
+
+@pytest.mark.parametrize(
+    ("default", "schema", "expected"),
+    [
+        (7, TypeSchema("int"), "7"),
+        (True, TypeSchema("bool"), "true"),
+        (False, TypeSchema("bool"), "false"),
+        (1.5, TypeSchema("float"), "1.5"),
+        (1.0, TypeSchema("float"), "1.0"),
+        ("none", TypeSchema("ffi.String"), 'tvm_ffi::String::from("none")'),
+        # non-finite floats have no bare literal -> typed constants from render_type
+        (float("inf"), TypeSchema("float"), "f64::INFINITY"),
+        (float("-inf"), TypeSchema("float"), "f64::NEG_INFINITY"),
+        (float("nan"), TypeSchema("float"), "f64::NAN"),
+    ],
+)
+def test_render_default_renderable_kinds(
+    default: object, schema: TypeSchema, expected: str
+) -> None:
+    fi = FieldInit("f", has_default=True, default=default, has_factory=False)
+    assert _render_default(fi, NamedTypeSchema("f", schema), _fake_render_type) == expected
+
+
+def test_render_default_string_escapes_control_chars() -> None:
+    # Control characters without a short escape must render as `\u{..}` --
+    # embedding them raw would corrupt the generated literal.
+    fi = FieldInit("f", has_default=True, default='a\x00"\nb\x7f', has_factory=False)
+    out = _render_default(fi, NamedTypeSchema("f", TypeSchema("ffi.String")), _fake_render_type)
+    assert out == 'tvm_ffi::String::from("a\\u{0}\\"\\nb\\u{7f}")'
+
+
+@pytest.mark.parametrize(
+    ("fi", "schema"),
+    [
+        # factory default (mutable container) -> not statically renderable
+        (FieldInit("f", True, [], True), TypeSchema("Array", (TypeSchema("int"),))),
+        # no default at all
+        (FieldInit("f", False, None, False), TypeSchema("int")),
+        # None default -> never renderable (an Optional field would need it, but
+        # Optional fields already force the FFI fallback via RUST_NATIVE_UNSAFE_ORIGINS)
+        (FieldInit("f", True, None, False), TypeSchema("int")),
+        (FieldInit("f", True, None, False), TypeSchema("Optional", (TypeSchema("int"),))),
+    ],
+)
+def test_render_default_unrenderable_returns_none(fi: FieldInit, schema: TypeSchema) -> None:
+    assert _render_default(fi, NamedTypeSchema("f", schema), _fake_render_type) is None
+
+
+def test_rust_object_root_struct_and_impl() -> None:
+    text, imports = _gen_rust_object(_expr_info())
+    # data struct embeds the root Object as `base`
+    assert "#[repr(C)]" in text
+    assert "struct ExprObj {" in text
+    assert "    base: Object," in text
+    assert "    pub value: i64," in text
+    # ObjectCore impl is folded into the `#[derive(Object)]` proc macro: the stub
+    # only emits the derive + `#[type_key]` attr, not a hand-written impl.
+    assert "#[derive(DeriveObject)]" in text
+    assert '#[type_key = "cpp_rust_test.Expr"]' in text
+    assert "unsafe impl ObjectCore" not in text
+    assert "lookup_type_index" not in text
+    assert "object_header_mut" not in text
+    # ref + Deref/DerefMut (value is def_rw -> mutable class)
+    assert "#[derive(DeriveObjectRef, Clone)]" in text
+    assert "struct Expr {" in text
+    assert "    data: ObjectArc<ExprObj>," in text
+    assert "impl Deref for Expr {" in text
+    assert "impl DerefMut for Expr {" in text
+    # new via __ffi_init__
+    # generated types/functions are `pub` (decision Q2)
+    assert "pub struct ExprObj {" in text
+    assert "pub struct Expr {" in text
+    assert "pub fn ffi_new(value: i64) -> Result<Self> {" in text
+    assert "pub fn test() -> Result<i64> {" in text
+    assert "fn ffi_new(value: i64) -> Result<Self> {" in text
+    assert (
+        'let ctor = get_type_method_cached(&CTOR, ExprObj::type_index(), "__ffi_init__")?;' in text
+    )
+    assert "thread_local!(static CTOR: std::cell::OnceCell<tvm_ffi::Function>" in text
+    # uniform packed-call convention: args -> &[AnyView], return via try_into
+    assert "Ok(ctor.call_packed(&[AnyView::from(&value)])?.try_into()?)" in text
+    # static method: no self
+    assert "fn test() -> Result<i64> {" in text
+    assert 'let f = get_type_method_cached(&F, ExprObj::type_index(), "test")?;' in text
+    assert "Ok(f.call_packed(&[])?.try_into()?)" in text
+    uses = {u.as_use_line() for u in imports.items}
+    assert "use tvm_ffi::object::Object;" in uses
+    assert "use std::ops::DerefMut;" in uses
+
+
+def test_rust_object_derived_embeds_parent() -> None:
+    text, _ = _gen_rust_object(_add_info())
+    assert "struct AddObj {" in text
+    assert "    base: ExprObj," in text  # parent Obj embedded, not Object
+    assert "    pub a: Expr," in text
+    # object_header_mut is derived by the `#[derive(Object)]` macro from the
+    # first field (`base: ExprObj`), so the stub no longer hand-writes it.
+    assert "object_header_mut" not in text
+    # derived Obj also derefs to its embedded base
+    assert "impl Deref for AddObj {" in text
+    assert "    type Target = ExprObj;" in text
+    # instance method: &mut self receiver (mutable class); self is packed as `&*self`
+    assert "fn update(&mut self) -> Result<()> {" in text
+    assert "Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)" in text
+    assert "fn ffi_new(a: Expr, b: Expr, value: i64) -> Result<Self> {" in text
+
+
+def test_rust_object_immutable_has_no_derefmut() -> None:
+    text, _ = _gen_rust_object(_expr_info(value_frozen=True))  # def_ro -> immutable
+    assert "impl Deref for Expr {" in text
+    assert "DerefMut" not in text
+    assert "fn test() -> Result<i64> {" in text  # static unaffected
+
+
+def test_rust_object_field_collides_with_boilerplate_object_is_aliased() -> None:
+    # Regression for an E0252 "Object defined multiple times" collision: a root
+    # object's boilerplate records `tvm_ffi::object::Object` (the struct `base`),
+    # claiming the bare `Object` leaf. A field whose type is itself `ffi.Object`
+    # maps to a *different* path, `tvm_ffi::Object`, with the *same* leaf -- so it
+    # must be aliased (`use tvm_ffi::Object as Object2;`) instead of emitting a
+    # second `use ...::Object;` that would fail to compile.
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("child", TypeSchema("ffi.Object"))],
+        methods=[],
+        type_key="demo.Holder",
+        parent_type_key="ffi.Object",
+    )
+    text, imports = _gen_rust_object(info)
+    assert "    base: Object," in text  # boilerplate Object as the struct base
+    assert "    pub child: Object2," in text  # field aliased to avoid the clash
+    uses = {u.as_use_line() for u in imports.items}
+    assert "use tvm_ffi::object::Object;" in uses
+    assert "use tvm_ffi::Object as Object2;" in uses
+    # The two `use`s bring distinct in-scope names: no duplicate bare `Object`.
+    assert "use tvm_ffi::Object;" not in uses
+
+
+def test_rust_boilerplate_aliased_when_field_claims_leaf_first() -> None:
+    # Reverse order of the collision above: within one file, a *derived* object
+    # (which records no root `Object` boilerplate) renders first, and its field
+    # claims the bare `Object` leaf via `use tvm_ffi::Object;`. A later *root*
+    # object's boilerplate `tvm_ffi::object::Object` is then the side that gets
+    # aliased -- and the emitted text must reference the alias: a bare `base:
+    # Object` would silently bind the field's `tvm_ffi::Object` ref type.
+    holder = ObjectInfo(
+        fields=[NamedTypeSchema("child", TypeSchema("ffi.Object"))],
+        methods=[],
+        type_key="demo.Holder",
+        parent_type_key="demo.Base",  # derived: no root `Object` boilerplate
+    )
+    ty_map = RC.RUST_TY_MAP_DEFAULTS.copy()
+    imports = RustImports()
+    holder_block = _rust_object_block("demo.Holder")
+    generate_rust_object(holder_block, ty_map, imports, Options(), holder)
+    root_block = _rust_object_block("cpp_rust_test.Expr")
+    generate_rust_object(root_block, ty_map, imports, Options(), _expr_info())
+    root_text = "\n".join(root_block.lines)
+    assert "    pub child: Object," in "\n".join(holder_block.lines)  # field claimed the leaf
+    assert "    base: Object2," in root_text  # boilerplate emits its alias
+    assert "    base: Object," not in root_text
+    uses = {u.as_use_line() for u in imports.items}
+    assert "use tvm_ffi::Object;" in uses
+    assert "use tvm_ffi::object::Object as Object2;" in uses
+
+
+def test_rust_method_any_return_stays_any_not_anyview() -> None:
+    # Q5: a top-level `Any` *return* stays owning `Any` (a borrow has no lifetime
+    # source coming back out of an FFI call); only top-level `Any` *params* become
+    # the non-owning `AnyView`. Regression for return type being rendered as AnyView.
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("value", TypeSchema("int"), frozen=False)],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema(
+                    # Callable(return=Any, self=Self, param=Any)
+                    "probe",
+                    TypeSchema(
+                        "Callable",
+                        (TypeSchema("Any"), TypeSchema("demo.Boxed"), TypeSchema("Any")),
+                    ),
+                ),
+                is_member=True,
+            )
+        ],
+        type_key="demo.Boxed",
+        parent_type_key="ffi.Object",
+    )
+    text, imports = _gen_rust_object(info)
+    # return -> owning Any; param -> non-owning AnyView
+    assert "pub fn probe(&mut self, _0: AnyView) -> Result<Any> {" in text
+    assert "Result<AnyView>" not in text  # the bug would have produced this
+    # All methods use the uniform `call_packed` convention (which natively speaks
+    # `AnyView` args and an `Any` return -- the only convention that can). An
+    # `Any` return is forwarded directly, with no trailing `try_into`.
+    assert "into_typed_fn!" not in text
+    assert "f.call_packed(&[AnyView::from(&*self), _0])" in text
+    # owning Any return must record its `use`
+    assert RustUse("tvm_ffi::Any") in imports.items
+    assert RustUse("tvm_ffi::AnyView") in imports.items
+
+
+def test_rust_object_mixed_fields_warns_and_immutable(capsys: pytest.CaptureFixture[str]) -> None:
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("ro", TypeSchema("int"), frozen=True),
+            NamedTypeSchema("rw", TypeSchema("int"), frozen=False),
+        ],
+        methods=[],
+        type_key="demo.Mixed",
+        parent_type_key="ffi.Object",
+    )
+    text, _ = _gen_rust_object(info)
+    out = capsys.readouterr().out
+    assert "mixed read-only/read-write" in out
+    assert "DerefMut" not in text  # treated as immutable
+
+
+def _has_map_info() -> ObjectInfo:
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("cfg", TypeSchema("Map", (TypeSchema("str"), TypeSchema("int")))),
+        ],
+        methods=[],
+        type_key="demo.HasMap",
+        parent_type_key="ffi.Object",
+    )
+
+
+def test_rust_object_unsupported_raises_without_leakage() -> None:
+    # `generate_rust_object` propagates UnsupportedTypeError (cli catches it and
+    # resets the block); the raise must leave the import collector untouched.
+    block = _rust_object_block("demo.HasMap")
+    imports = RustImports(items=[RustUse("tvm_ffi::Tensor")])
+    with pytest.raises(UnsupportedTypeError) as exc:
+        generate_rust_object(
+            block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), _has_map_info()
+        )
+    assert exc.value.origin == "Map"
+    assert imports.items == [RustUse("tvm_ffi::Tensor")]
+
+
+def test_rust_stage3_skipped_type_not_counted_as_defined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A skipped object must not enter `defined_types`: another object referencing
+    # it keeps its `use` in the import section (previously dropped -> E0412).
+    rs = tmp_path / "demo.rs"
+    rs.write_text(
+        "\n".join(
+            [
+                f"{C.RUST_SYNTAX.begin} import-section",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} object/demo.HasMap",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} object/demo.Holder",
+                C.RUST_SYNTAX.end,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    infos = {
+        "demo.HasMap": _has_map_info(),
+        "demo.Holder": ObjectInfo(
+            fields=[NamedTypeSchema("child", TypeSchema("demo.HasMap"))],
+            methods=[],
+            type_key="demo.Holder",
+            parent_type_key="ffi.Object",
+        ),
+    }
+    monkeypatch.setattr(stub_cli, "object_info_from_type_key", lambda key: infos[key])
+    info = FileInfo.from_file(rs)
+    assert info is not None
+    _stage_3(
+        info,
+        Options(dry_run=True),
+        RC.RUST_TY_MAP_DEFAULTS.copy(),
+        {},
+        generator=RustGenerator(),
+        registered_type_keys=set(infos),
+    )
+    text = "\n".join(info.lines)
+    assert "[Skipped] object demo.HasMap" in capsys.readouterr().out
+    assert "struct HasMapObj" not in text  # skipped block reset to bare markers
+    assert "    pub child: HasMap," in text  # the referencing object still renders
+    assert "use demo::HasMap;" in text  # ... and keeps its import
+
+
+def test_rust_bytes_field_maps_to_crate_bytes() -> None:
+    # C++ `Bytes` fields carry the schema origin "bytes" (string.h TypeStr).
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("payload", TypeSchema("bytes"))],
+        methods=[],
+        type_key="demo.Blob",
+        parent_type_key="ffi.Object",
+    )
+    text, imports = _gen_rust_object(info)
+    assert "    pub payload: Bytes," in text
+    assert RustUse("tvm_ffi::Bytes") in imports.items
+
+
+def test_rust_unknown_bare_origin_skips_object() -> None:
+    # An unmapped bare origin (no `.`) has no Rust rendering; emitting it
+    # verbatim would be invalid source, so the object is skipped instead.
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("name", TypeSchema("const char*"))],
+        methods=[],
+        type_key="demo.Raw",
+        parent_type_key="ffi.Object",
+    )
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _gen_rust_object(info)
+    assert exc.value.origin == "const char*"
+
+
+def test_rust_ident_keyword_escaping() -> None:
+    assert _rust_ident("value") == "value"
+    assert _rust_ident("type") == "r#type"
+    assert _rust_ident("try") == "r#try"  # reserved (2018) keyword
+    assert _rust_ident("yield") == "r#yield"  # reserved keyword
+    with pytest.raises(UnsupportedTypeError):  # cannot be a raw identifier
+        _rust_ident("crate")
+
+
+def test_rust_forbidden_ident_skips_object() -> None:
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("crate", TypeSchema("int"))],
+        methods=[],
+        type_key="demo.Bad",
+        parent_type_key="ffi.Object",
+    )
+    with pytest.raises(UnsupportedTypeError):
+        _gen_rust_object(info)
+
+
+def _rust_import_block() -> CodeBlock:
+    return CodeBlock(
+        kind="import-section",
+        param="",
+        lineno_start=1,
+        lineno_end=2,
+        lines=["// tvm-ffi-stubgen(begin): import-section", "// tvm-ffi-stubgen(end)"],
+    )
+
+
+def test_rust_import_section_renders_dedups_sorts() -> None:
+    block = _rust_import_block()
+    imports = RustImports(
+        items=[
+            RustUse("tvm_ffi::Tensor"),
+            RustUse("tvm_ffi::object::ObjectArc"),
+            RustUse("tvm_ffi::Tensor"),  # duplicate -> collapsed
+            RustUse("crate_b::Foo", alias="Foo2"),
+        ]
+    )
+    generate_rust_import_section(block, imports, Options(), defined_types=set())
+    assert block.lines == [
+        "// tvm-ffi-stubgen(begin): import-section",
+        "use crate_b::Foo as Foo2;",
+        "use tvm_ffi::Tensor;",
+        "use tvm_ffi::object::ObjectArc;",
+        "// tvm-ffi-stubgen(end)",
+    ]
+
+
+def test_rust_import_section_filters_defined_types() -> None:
+    block = _rust_import_block()
+    imports = RustImports(items=[RustUse("cpp_rust_test::Expr"), RustUse("tvm_ffi::Tensor")])
+    # Expr is defined in this file -> its `use` must be dropped.
+    generate_rust_import_section(block, imports, Options(), defined_types={"cpp_rust_test::Expr"})
+    assert block.lines == [
+        "// tvm-ffi-stubgen(begin): import-section",
+        "use tvm_ffi::Tensor;",
+        "// tvm-ffi-stubgen(end)",
+    ]
+
+
+def test_rust_import_section_empty() -> None:
+    block = _rust_import_block()
+    generate_rust_import_section(block, RustImports(), Options(), defined_types=set())
+    assert block.lines == [
+        "// tvm-ffi-stubgen(begin): import-section",
+        "// tvm-ffi-stubgen(end)",
+    ]
+
+
+def test_rust_generator_wired() -> None:
+    gen = get_generator("rust")
+    assert isinstance(gen, Generator)
+    imp = gen.new_imports()
+    assert isinstance(imp, RustImports)
+    gen.add_imported_object(imp, "cpp_rust_test.Expr", "False", "")
+    assert imp.items == [RustUse("cpp_rust_test::Expr")]
+    assert gen.canonical_type_name("cpp_rust_test.Expr") == "cpp_rust_test::Expr"
+    assert gen.extra_export_names(imp) == set()
+    # object block delegates to generate_rust_object
+    block = _rust_object_block("cpp_rust_test.Expr")
+    gen.generate_object_block(
+        block, RC.RUST_TY_MAP_DEFAULTS.copy(), gen.new_imports(), Options(), _expr_info()
+    )
+    assert "struct ExprObj {" in "\n".join(block.lines)
+    # all/export blocks are no-ops (deferred); must not raise
+    gen.generate_all_block(_rust_object_block("x"), {"Foo"}, Options())
+    gen.generate_export_block(_rust_object_block("x"))
+
+
+def test_rust_stage3_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rs = tmp_path / "demo.rs"
+    rs.write_text(
+        "\n".join(
+            [
+                f"{C.RUST_SYNTAX.begin} object/cpp_rust_test.Expr",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} import-section",
+                C.RUST_SYNTAX.end,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    info = FileInfo.from_file(rs)
+    assert info is not None
+    # Avoid needing a loaded shared library: feed a constructed ObjectInfo.
+    monkeypatch.setattr(stub_cli, "object_info_from_type_key", lambda key: _expr_info())
+
+    _stage_3(
+        info,
+        Options(dry_run=True),
+        RC.RUST_TY_MAP_DEFAULTS.copy(),
+        {},
+        generator=RustGenerator(),
+    )
+    text = "\n".join(info.lines)
+    # object block filled
+    assert "struct ExprObj {" in text
+    assert "impl Expr {" in text
+    assert 'get_type_method_cached(&CTOR, ExprObj::type_index(), "__ffi_init__")' in text
+    # import-section filled with the machinery `use`s
+    assert "use tvm_ffi::object::ObjectArc;" in text
+    assert "use tvm_ffi::object::ObjectCore;" in text
+    # Expr defines itself -> no self `use`
+    assert "use cpp_rust_test::Expr;" not in text
+
+
+def test_rust_default_ty_map_is_real() -> None:
+    # Regression: default_ty_map must be the real table, not an empty placeholder.
+    m = RustGenerator().default_ty_map()
+    assert m["int"] == "i64"
+    assert m["None"] == "()"
+
+
+def test_rust_new_uses_ffi_init_schema_order() -> None:
+    # __ffi_init__ schema arg order (a, b, value) is authoritative and differs
+    # from the parent-first init_fields order (value, a, b).
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("a", TypeSchema("demo.Expr")),
+            NamedTypeSchema("b", TypeSchema("demo.Expr")),
+        ],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema(
+                    "__ffi_init__",
+                    TypeSchema(
+                        "Callable",
+                        (
+                            TypeSchema("Object"),  # return (constructed object)
+                            TypeSchema("demo.Expr"),
+                            TypeSchema("demo.Expr"),
+                            TypeSchema("int"),
+                        ),
+                    ),
+                ),
+                is_member=True,
+            )
+        ],
+        type_key="demo.Add",
+        parent_type_key="demo.Expr",
+        init_fields=[
+            InitFieldInfo("value", NamedTypeSchema("value", TypeSchema("int")), False, False),
+            InitFieldInfo("a", NamedTypeSchema("a", TypeSchema("demo.Expr")), False, False),
+            InitFieldInfo("b", NamedTypeSchema("b", TypeSchema("demo.Expr")), False, False),
+        ],
+        has_init=True,
+    )
+    text, _ = _gen_rust_object(info)
+    assert "fn ffi_new(_0: Expr, _1: Expr, _2: i64) -> Result<Self> {" in text
+    assert (
+        "Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), "
+        "AnyView::from(&_2)])?.try_into()?)"
+    ) in text
+    # __ffi_init__ becomes `new`, not a regular method (only referenced once).
+    assert text.count("__ffi_init__") == 1
+
+
+def test_rust_api_filenames() -> None:
+    gen = RustGenerator()
+    assert gen.api_filename() == "mod.rs"
+    assert gen.init_filename() == "mod.rs"
+    assert gen.generate_init_file([], "demo", "mod") == ""
+
+
+def test_rust_api_file_scaffold() -> None:
+    text = RustGenerator().generate_api_file(
+        [],
+        {},
+        "demo",
+        [_expr_info()],
+        InitConfig("p", "l", "demo."),
+        is_root=True,
+        is_new_file=True,
+    )
+    assert "#![allow(dead_code, unused_imports)]" in text
+    # helpers now live in a marker block (filled by stage_3), not inline
+    assert f"{C.RUST_SYNTAX.begin} helpers" in text
+    assert "fn lookup_type_index(" not in text  # the scaffold only emits the marker
+    assert f"{C.RUST_SYNTAX.begin} import-section" in text
+    assert f"{C.RUST_SYNTAX.begin} object/cpp_rust_test.Expr" in text
+    # no global / __all__ / export markers for Rust
+    assert "global/" not in text
+    assert "__all__" not in text
+    assert "export/" not in text
+
+
+def test_rust_helpers_block_filled() -> None:
+    block = CodeBlock(
+        kind="helpers",
+        param="",
+        lineno_start=1,
+        lineno_end=2,
+        lines=[f"{C.RUST_SYNTAX.begin} helpers", C.RUST_SYNTAX.end],
+    )
+    RustGenerator().generate_helpers_block(block, Options())
+    text = "\n".join(block.lines)
+    # the type-index hashmap helper is gone; only `get_type_method` remains and it
+    # now takes a resolved `type_index: i32` (from each object's static).
+    assert "fn lookup_type_index(" not in text
+    assert "fn get_type_method(\n    type_index: i32," in text
+    # the per-call-site cache wrapper ships alongside it
+    assert "fn get_type_method_cached(" in text
+    # idempotent re-fill keeps a single copy
+    RustGenerator().generate_helpers_block(block, Options())
+    assert "\n".join(block.lines).count("fn get_type_method(") == 1
+
+
+def test_rust_helpers_block_scaffold_added_to_existing_file() -> None:
+    # Regression for #3: a pre-existing (non-empty) file without helpers still
+    # gets a helpers marker appended on --init (not only when brand-new).
+    existing = [
+        CodeBlock(kind=None, param="", lineno_start=1, lineno_end=1, lines=["// hand-written"]),
+    ]
+    text = RustGenerator().generate_api_file(
+        existing, {}, "demo", [], InitConfig("p", "l", "demo."), is_root=True, is_new_file=False
+    )
+    assert f"{C.RUST_SYNTAX.begin} helpers" in text
+    # `#![allow]` is an inner attribute (must precede all items): appending it to a
+    # pre-existing file -- even one without marker blocks -- would not compile.
+    assert "#![allow" not in text
+
+
+def test_rust_finalize_module_tree(tmp_path: Path) -> None:
+    # Two sibling binding modules under `a`, plus an intermediate `a` with no types.
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    (tmp_path / "a" / "b" / "mod.rs").write_text("// bindings b\n", encoding="utf-8")
+    (tmp_path / "a" / "c").mkdir(parents=True)
+    (tmp_path / "a" / "c" / "mod.rs").write_text("// bindings c\n", encoding="utf-8")
+
+    finalize_rust_module_tree(tmp_path, {"a.b", "a.c"})
+
+    # root declares the top-level module; `a/mod.rs` (created) declares its children
+    assert "pub mod a;" in (tmp_path / "mod.rs").read_text(encoding="utf-8")
+    a_mod = (tmp_path / "a" / "mod.rs").read_text(encoding="utf-8")
+    assert "pub mod b;" in a_mod and "pub mod c;" in a_mod
+    # leaf binding files are untouched
+    assert "// bindings b" in (tmp_path / "a" / "b" / "mod.rs").read_text(encoding="utf-8")
+
+    # idempotent: re-running adds no duplicates
+    finalize_rust_module_tree(tmp_path, {"a.b", "a.c"})
+    assert (tmp_path / "a" / "mod.rs").read_text(encoding="utf-8").count("pub mod b;") == 1
+
+
+def test_rust_stage3_prunes_stale_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Regression for #5: a block whose type is no longer registered is deleted.
+    rs = tmp_path / "demo.rs"
+    rs.write_text(
+        "\n".join(
+            [
+                f"{C.RUST_SYNTAX.begin} object/demo.Gone",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} object/demo.Kept",
+                C.RUST_SYNTAX.end,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    info = FileInfo.from_file(rs)
+    assert info is not None
+    monkeypatch.setattr(stub_cli, "object_info_from_type_key", lambda key: _expr_info())
+    _stage_3(
+        info,
+        Options(dry_run=True),
+        RC.RUST_TY_MAP_DEFAULTS.copy(),
+        {},
+        generator=RustGenerator(),
+        registered_type_keys={"demo.Kept"},  # demo.Gone is stale
+    )
+    text = "\n".join(info.lines)
+    assert "object/demo.Gone" not in text  # stale block removed entirely
+    assert "object/demo.Kept" in text  # surviving block kept + filled
+    assert "struct ExprObj {" in text
+    assert "[Removed] stale object block demo.Gone" in capsys.readouterr().out
+
+
+def test_python_generator_does_not_prune_objects() -> None:
+    # Python object blocks live inside a class body -> must NOT be pruned.
+    assert PythonGenerator().standalone_object_blocks is False
+    assert RustGenerator().standalone_object_blocks is True
+
+
+def test_rust_global_funcs_block_is_noop() -> None:
+    # Decision 5: Rust does not generate global functions; the block is untouched.
+    lines = ["// tvm-ffi-stubgen(begin): global/demo", "// tvm-ffi-stubgen(end)"]
+    block = CodeBlock(
+        kind="global", param=("demo", ""), lineno_start=1, lineno_end=2, lines=list(lines)
+    )
+    funcs = [
+        FuncInfo(
+            NamedTypeSchema("demo.f", TypeSchema("Callable", (TypeSchema("int"),))), is_member=False
+        )
+    ]
+    imports = RustImports()
+    RustGenerator().generate_global_funcs_block(
+        block, funcs, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options()
+    )
+    assert block.lines == lines
+    assert imports.items == []
+
+
+def test_rust_object_no_init_no_methods_has_no_impl() -> None:
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("value", TypeSchema("int"))],
+        methods=[],
+        type_key="demo.Plain",
+        parent_type_key="ffi.Object",
+        has_init=False,
+    )
+    text, _ = _gen_rust_object(info)
+    assert "struct PlainObj {" in text
+    assert "impl Plain {" not in text  # no new, no methods -> no impl block
+    assert "fn new" not in text
