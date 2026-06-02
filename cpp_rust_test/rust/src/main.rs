@@ -26,7 +26,10 @@ use tvm_ffi::derive::ObjectRef as DeriveObjectRef;
 use tvm_ffi::object::{Object, ObjectArc, ObjectCore};
 use tvm_ffi::type_traits::AnyCompatible;
 use tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFIGetTypeInfo, TVMFFIObject, TVMFFITypeKeyToIndex};
-use tvm_ffi::{ensure, into_typed_fn, AnyView, Function, Module, Result, TYPE_ERROR, VALUE_ERROR};
+use tvm_ffi::{
+    ensure, into_typed_fn, AnyView, Function, Module, Result, String as FFIString, TYPE_ERROR,
+    VALUE_ERROR,
+};
 
 fn lookup_type_index(type_key: &'static str) -> i32 {
     static EXPR_INDEX: OnceLock<i32> = OnceLock::new();
@@ -206,6 +209,95 @@ fn make_add(a: Expr, b: Expr, value: i64) -> Result<Add> {
     make(a, b, value)
 }
 
+/// Print global function registrations that come from `cpp/expr_lib.cc`.
+fn print_cpp_rust_test_global_registry() -> Result<()> {
+    let list_functor_factory = Function::get_global("ffi.FunctionListGlobalNamesFunctor")?;
+    let get_list_functor = into_typed_fn!(list_functor_factory, Fn() -> Result<Function>);
+    let list_functor = get_list_functor()?;
+    let get_global_metadata = Function::get_global("ffi.GetGlobalFuncMetadata")?;
+    let total: i64 = list_functor.call_packed(&[AnyView::from(&-1_i64)])?.try_into()?;
+
+    let mut cpp_names = Vec::new();
+    for i in 0..total {
+        let name: FFIString = list_functor.call_packed(&[AnyView::from(&i)])?.try_into()?;
+        let name = name.as_str().to_string();
+        if name.starts_with("cpp_rust_test.") {
+            cpp_names.push(name);
+        }
+    }
+    cpp_names.sort();
+
+    println!("== Global function registry (cpp_rust_test.*) ==");
+    if cpp_names.is_empty() {
+        println!("  (none)");
+    } else {
+        for name in cpp_names {
+            let name_ffi = FFIString::from(name.as_str());
+            let metadata_any = get_global_metadata.call_packed(&[AnyView::from(&name_ffi)])?;
+            let metadata: FFIString = metadata_any.try_into()?;
+            println!("  - {name}");
+            println!("    metadata: {}", metadata.as_str());
+        }
+    }
+    Ok(())
+}
+
+/// Print type reflection entries (fields and methods) for a registered object type.
+fn print_type_registry(type_key: &'static str) -> Result<()> {
+    let type_index = lookup_type_index(type_key);
+    unsafe {
+        let info_ptr = TVMFFIGetTypeInfo(type_index);
+        ensure!(
+            !info_ptr.is_null(),
+            TYPE_ERROR,
+            "TVMFFIGetTypeInfo returned null for type `{type_key}`"
+        );
+        let info = &*info_ptr;
+        println!("== Type registry: {} (index={}) ==", type_key, type_index);
+
+        println!("  fields:");
+        if info.num_fields == 0 {
+            println!("    - (none)");
+        } else {
+            for i in 0..info.num_fields {
+                let field = &*info.fields.add(i as usize);
+                let doc = field.doc.as_str();
+                if doc.is_empty() {
+                    println!("    - {}", field.name.as_str());
+                } else {
+                    println!("    - {}: {}", field.name.as_str(), doc);
+                }
+                println!("      type_index: {}", field.field_static_type_index);
+                println!("      flags: {}", field.flags);
+                if !field.metadata.as_str().is_empty() {
+                    println!("      metadata: {}", field.metadata.as_str());
+                }
+            }
+        }
+
+        println!("  methods:");
+        if info.num_methods == 0 {
+            println!("    - (none)");
+        } else {
+            for i in 0..info.num_methods {
+                let method = &*info.methods.add(i as usize);
+                let doc = method.doc.as_str();
+                if doc.is_empty() {
+                    println!("    - {}", method.name.as_str());
+                } else {
+                    println!("    - {}: {}", method.name.as_str(), doc);
+                }
+                println!("      any.type_index: {}", method.method.type_index);
+                println!("      flags: {}", method.flags);
+                if !method.metadata.as_str().is_empty() {
+                    println!("      metadata: {}", method.metadata.as_str());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let lib_path = expr_lib_path();
     ensure!(
@@ -217,6 +309,10 @@ fn main() -> Result<()> {
     );
 
     let _module = Module::load_from_file(lib_path)?;
+
+    print_cpp_rust_test_global_registry()?;
+    print_type_registry("cpp_rust_test.Expr")?;
+    print_type_registry("cpp_rust_test.Add")?;
 
     // --- Expr demo ---
     let mut expr = make_expr(42)?;
