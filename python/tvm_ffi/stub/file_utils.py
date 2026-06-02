@@ -53,6 +53,7 @@ class CodeBlock:
             "import-object",
             "export",
             "__all__",
+            "helpers",
             None,
         }
 
@@ -112,6 +113,9 @@ class CodeBlock:
         elif stub == "__all__":
             kind = "__all__"
             param = ""
+        elif stub == "helpers":
+            kind = "helpers"
+            param = ""
         else:
             raise ValueError(f"Unknown stub type `{stub}` at line {lineo}")
         return CodeBlock(
@@ -164,7 +168,8 @@ class FileInfo:
         """Parse a file to extract code blocks based on stub markers.
 
         The marker comment syntax is auto-detected from the file extension when
-        ``syntax`` is not given.
+        ``syntax`` is not given, so ``.py`` files use ``#`` markers and ``.rs``
+        files use ``//`` markers.
         """
         assert file.is_file(), f"Expected a file, but got: {file}"
         file = file.resolve()

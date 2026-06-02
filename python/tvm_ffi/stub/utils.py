@@ -81,7 +81,7 @@ class Options:
     verbose: bool = False
     dry_run: bool = False
     target: str = "python"
-    """Code generator target to use."""
+    """Code generator target to use, e.g. ``"python"`` or ``"rust"``."""
 
 
 @dataclasses.dataclass(init=False)
@@ -90,7 +90,9 @@ class NamedTypeSchema(TypeSchema):
 
     ``frozen`` is the field's read-only flag from reflection (``def_ro`` ->
     ``True``, ``def_rw`` -> ``False``). It is only meaningful for object fields;
-    method/init schemas leave it at the default ``False``.
+    method/init schemas leave it at the default ``False``. Backends that care
+    about mutability (e.g. the Rust backend's mutable-vs-immutable class shape)
+    read it; the Python backend ignores it.
     """
 
     name: str
