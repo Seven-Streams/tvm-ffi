@@ -39,6 +39,15 @@ def _parse_type_schema(raw: str | dict[str, Any]) -> TypeSchema:
     return TypeSchema.from_json_str(raw)
 
 
+class UnsupportedTypeError(Exception):
+    """Raised when a backend cannot represent an FFI construct in its target language."""
+
+    def __init__(self, origin: str, reason: str | None = None) -> None:
+        """Record the offending ``origin`` and build the message."""
+        super().__init__(reason or f"unsupported FFI type {origin!r}")
+        self.origin = origin
+
+
 @dataclasses.dataclass
 class InitConfig:
     """Configuration for generating new stubs.
@@ -81,19 +90,29 @@ class Options:
     verbose: bool = False
     dry_run: bool = False
     target: str = "python"
-    """Code generator target to use."""
+    """Code generator target to use, e.g. ``"python"`` or ``"rust"``."""
 
 
 @dataclasses.dataclass(init=False)
 class NamedTypeSchema(TypeSchema):
-    """A type schema with an associated name."""
+    """A type schema with an associated name, size and offset."""
 
     name: str
+    size: int | None = None
+    offset: int | None = None
 
-    def __init__(self, name: str, schema: TypeSchema) -> None:
-        """Initialize a `NamedTypeSchema` with the given name and schema."""
+    def __init__(
+        self,
+        name: str,
+        schema: TypeSchema,
+        size: int | None = None,
+        offset: int | None = None,
+    ) -> None:
+        """Initialize a `NamedTypeSchema` with the given name, schema and field metadata."""
         super().__init__(origin=schema.origin, args=schema.args)
         self.name = name
+        self.size = size
+        self.offset = offset
 
 
 @dataclasses.dataclass
@@ -121,7 +140,13 @@ class InitFieldInfo:
 
 @dataclasses.dataclass
 class ObjectInfo:
-    """Information of an object type, including its fields and methods."""
+    """Information of an object type, including its fields and methods.
+
+    ``mutable`` is the class-level mutability contract (C++ ``_type_mutable``),
+    read from the ``__ffi_type_mutable__`` type attr that ``ObjectDef``
+    registers for every reflected type. The default ``False`` mirrors the C++
+    default (``Object::_type_mutable = false``).
+    """
 
     fields: list[NamedTypeSchema]
     methods: list[FuncInfo]
@@ -129,6 +154,7 @@ class ObjectInfo:
     parent_type_key: str | None = None
     init_fields: list[InitFieldInfo] = dataclasses.field(default_factory=list)
     has_init: bool = False
+    mutable: bool = False
 
     @staticmethod
     def from_type_info(type_info: TypeInfo) -> ObjectInfo:
@@ -160,6 +186,7 @@ class ObjectInfo:
                             schema=NamedTypeSchema(
                                 name=field.name,
                                 schema=_parse_type_schema(field.metadata["type_schema"]),
+                                size=field.size,
                             ),
                             kw_only=field.c_kw_only,
                             has_default=field.c_has_default,
@@ -171,6 +198,8 @@ class ObjectInfo:
                 NamedTypeSchema(
                     name=field.name,
                     schema=_parse_type_schema(field.metadata["type_schema"]),
+                    size=field.size,
+                    offset=field.offset,
                 )
                 for field in type_info.fields
             ],
@@ -188,4 +217,5 @@ class ObjectInfo:
             parent_type_key=parent_type_key,
             init_fields=init_fields,
             has_init=has_init,
+            mutable=bool(_lookup_type_attr(type_info.type_index, "__ffi_type_mutable__")),
         )

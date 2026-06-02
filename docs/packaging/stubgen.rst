@@ -20,9 +20,12 @@
 Stub Generation
 ===============
 
-TVM-FFI provides ``tvm-ffi-stubgen``, a tool that generates Python type stubs from C++
-reflection metadata. It turns registered global functions and classes into proper Python
-type hints, enabling IDE auto-completion and static type checking.
+TVM-FFI provides ``tvm-ffi-stubgen``, a tool that generates typed language bindings from C++
+reflection metadata. It turns registered global functions and classes into native type hints,
+enabling IDE auto-completion and static type checking.
+
+The sections below describe the default Python target. The Rust target is covered in
+:ref:`sec-stubgen-rust`.
 
 .. admonition:: Prerequisite
    :class: hint
@@ -46,6 +49,7 @@ This runs stub generation automatically after each build.
        [STUB_INIT ON|OFF]
        [STUB_PKG <pkg>]
        [STUB_PREFIX <prefix>]
+       [STUB_TARGET python|rust]
    )
 
 From the example's
@@ -239,6 +243,9 @@ All three are required together. When omitted, the tool operates in directive-on
 
 **Optional arguments:**
 
+``--target``
+   Code generator backend: ``python`` (default) or ``rust``. See :ref:`sec-stubgen-rust`.
+
 ``--verbose``
    Print a unified diff of changes to each file.
 
@@ -252,6 +259,61 @@ All three are required together. When omitted, the tool operates in directive-on
    Indentation width for generated code (default: 4).
 
 For a complete list of options, run ``tvm-ffi-stubgen --help``.
+
+.. _sec-stubgen-rust:
+
+Rust Code Stubgen (Experimental)
+--------------------------------
+
+TVM-FFI provides an efficient, easy-to-use mechanism for exposing C++ classes to Rust.
+Objects share the same memory representation, so Rust code can directly access objects
+created in C++. However, users have to hand-write the Rust definition of each registered
+object to avoid memory layout and alignment mismatches between the two sides. To eliminate
+this manual work, ``tvm-ffi-stubgen`` supports generating Rust code directly.
+
+To generate Rust stubs, pass ``STUB_TARGET rust`` to ``tvm_ffi_configure_target``
+(see :ref:`sec-stubgen-cmake`) or ``--target rust`` on the command line
+(see :ref:`sec-stubgen-cli`).
+
+Key Features
+~~~~~~~~~~~~
+
+- Generate Rust code for registered C++ classes automatically (via CLI or CMake).
+- Mirror the C++ memory layout exactly in Rust.
+- Provide Rust-native memberwise constructors for registered classes.
+- Expose methods of registered classes through cross-language calls.
+
+Generation Output
+~~~~~~~~~~~~~~~~~
+
+For the type ``IntPair``, the generated Rust code looks like this:
+
+.. code-block:: rust
+
+   #[repr(C)]
+   #[derive(DeriveObject)]   // `use tvm_ffi::derive::Object as DeriveObject;`
+   #[type_key = "my_ffi_extension.IntPair"]
+   pub struct IntPairObj {
+       base: Object,   // the parent type (or `tvm_ffi::Object` if no parent), embedded as the first field
+       pub a: i64,     // fields are public: read (and write, if mutable) via `Deref`/`DerefMut`
+       pub b: i64,
+   }
+
+   #[repr(C)]
+   #[derive(DeriveObjectRef, Clone)]   // `use tvm_ffi::derive::ObjectRef as DeriveObjectRef;`
+   pub struct IntPair {
+       data: ObjectArc<IntPairObj>,
+   }
+
+   impl IntPair {
+       /// Native (FFI-free) construction: allocates the struct and binds fields directly.
+       pub fn ffi_new(a: i64, b: i64) -> Result<Self> { /* ... */ }
+   }
+
+The object has the same memory layout as its C++ counterpart. Users can create new objects
+on the Rust side and call the methods defined in C++. Stubgen will also generate a
+Rust-native memberwise constructor ``ffi_new`` automatically, and users can build their own
+``new`` constructors on top of it.
 
 .. _sec-stubgen-advanced:
 
