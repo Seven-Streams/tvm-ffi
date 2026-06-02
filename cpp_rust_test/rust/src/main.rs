@@ -109,6 +109,20 @@ unsafe impl ObjectCore for AddObj {
     }
 }
 
+/// `AddObj` inherits `ExprObj` in C++; deref to the embedded base for `value` etc.
+impl Deref for AddObj {
+    type Target = ExprObj;
+    fn deref(&self) -> &ExprObj {
+        &self.base
+    }
+}
+
+impl DerefMut for AddObj {
+    fn deref_mut(&mut self) -> &mut ExprObj {
+        &mut self.base
+    }
+}
+
 #[repr(C)]
 #[derive(DeriveObjectRef, Clone)]
 struct Add {
@@ -305,16 +319,16 @@ fn main() -> Result<()> {
         "created Add: a={}, b={}, value={}",
         add.a.value,
         add.b.value,
-        add.base.value
+        add.value
     );
 
     add.update()?;
-    println!("after C++ Add::Update(): value={}", add.base.value);
+    println!("after C++ Add::Update(): value={}", add.value);
     ensure!(
-        add.base.value == 42,
+        add.value == 42,
         VALUE_ERROR,
         "expected 42, got {}",
-        add.base.value
+        add.value
     );
 
     add.a.value = 100;
@@ -322,7 +336,7 @@ fn main() -> Result<()> {
         "after Rust mutates Add.a only: a={}, b={}, value={} (value still stale)",
         add.a.value,
         add.b.value,
-        add.base.value
+        add.value
     );
     ensure!(
         add.a.value == 100,
@@ -332,12 +346,12 @@ fn main() -> Result<()> {
     );
 
     add.update()?;
-    println!("after second C++ Add::Update(): value={}", add.base.value);
+    println!("after second C++ Add::Update(): value={}", add.value);
     ensure!(
-        add.base.value == 132,
+        add.value == 132,
         VALUE_ERROR,
         "expected 132, got {}",
-        add.base.value
+        add.value
     );
 
     println!("dropping Add; ~AddObj() then ~ExprObj for a and b");
