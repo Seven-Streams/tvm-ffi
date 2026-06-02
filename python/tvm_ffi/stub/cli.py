@@ -24,10 +24,11 @@ import importlib
 import sys
 import traceback
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from . import codegen as G
 from . import consts as C
-from .file_utils import FileInfo, collect_files
+from .backend import get_backend
+from .file_utils import FileInfo, collect_files, syntax_for
 from .lib_state import (
     collect_global_funcs,
     collect_type_keys,
@@ -35,6 +36,9 @@ from .lib_state import (
     toposort_objects,
 )
 from .utils import FuncInfo, ImportItem, InitConfig, Options
+
+if TYPE_CHECKING:
+    from .backend import Backend
 
 
 def __main__() -> int:
@@ -45,6 +49,7 @@ def __main__() -> int:
     overview and examples of the block syntax.
     """
     opt = _parse_args()
+    backend = get_backend(opt.target)
     for imp in opt.imports or []:
         importlib.import_module(imp)
     dlls = [ctypes.CDLL(lib) for lib in opt.dlls]
@@ -78,6 +83,7 @@ def __main__() -> int:
             init_cfg=opt.init,
             init_path=init_path,
             global_funcs=global_funcs,
+            backend=backend,
         )
 
     # Stage 3: Process
@@ -87,7 +93,7 @@ def __main__() -> int:
         if opt.verbose:
             print(f"{C.TERM_CYAN}[File] {file.path}{C.TERM_RESET}")
         try:
-            _stage_3(file, opt, ty_map, global_funcs)
+            _stage_3(file, opt, ty_map, global_funcs, backend=backend)
         except Exception:
             print(
                 f'{C.TERM_RED}[Failed] File "{file.path}": {traceback.format_exc()}{C.TERM_RESET}'
@@ -118,11 +124,14 @@ def _stage_2(
     init_cfg: InitConfig,
     init_path: Path,
     global_funcs: dict[str, list[FuncInfo]],
+    backend: Backend | None = None,
 ) -> None:
+    if backend is None:
+        backend = get_backend("python")
     def _find_or_insert_file(path: Path) -> FileInfo:
         ret: FileInfo | None
         if not path.exists():
-            ret = FileInfo(path=path, lines=(), code_blocks=[])
+            ret = FileInfo(path=path, lines=(), code_blocks=[], syntax=syntax_for(path))
         else:
             for file in files:
                 if path.samefile(file.path):
@@ -167,7 +176,7 @@ def _stage_2(
         target_file = _find_or_insert_file(target_path)
         with target_path.open("a", encoding="utf-8") as f:
             f.write(
-                G.generate_ffi_api(
+                backend.generate_api_file(
                     target_file.code_blocks,
                     ty_map,
                     prefix,
@@ -181,7 +190,7 @@ def _stage_2(
         target_path = directory / "__init__.py"
         target_file = _find_or_insert_file(target_path)
         with target_path.open("a", encoding="utf-8") as f:
-            f.write(G.generate_init(target_file.code_blocks, prefix, submodule="_ffi_api"))
+            f.write(backend.generate_init_file(target_file.code_blocks, prefix, "_ffi_api"))
         target_file.reload()
 
 
@@ -190,7 +199,10 @@ def _stage_3(  # noqa: PLR0912
     opt: Options,
     ty_map: dict[str, str],
     global_funcs: dict[str, list[FuncInfo]],
+    backend: Backend | None = None,
 ) -> None:
+    if backend is None:
+        backend = get_backend("python")
     defined_funcs: set[str] = set()
     defined_types: set[str] = set()
     imports: list[ImportItem] = []
@@ -218,7 +230,7 @@ def _stage_3(  # noqa: PLR0912
             funcs = global_funcs.get(code.param[0], [])
             for func in funcs:
                 defined_funcs.add(func.schema.name)
-            G.generate_global_funcs(code, funcs, ty_map, imports, opt)
+            backend.generate_global_funcs_block(code, funcs, ty_map, imports, opt)
     # Stage 3. Process `tvm-ffi-stubgen(begin): object/...`
     for code in file.code_blocks:
         if code.kind == "object":
@@ -228,12 +240,12 @@ def _stage_3(  # noqa: PLR0912
             type_key = ty_map.get(type_key, type_key)
             full_name = ImportItem(type_key).full_name
             defined_types.add(full_name)
-            G.generate_object(code, ty_map, imports, opt, obj_info)
+            backend.generate_object_block(code, ty_map, imports, opt, obj_info)
     # Stage 4. Add imports for used types.
     imports = [i for i in imports if i.full_name not in defined_types]
     for code in file.code_blocks:
         if code.kind == "import-section":
-            G.generate_import_section(code, imports, opt)
+            backend.generate_import_section_block(code, imports, opt)
             break  # Only one import block per file is supported for now.
     # Stage 5. Add `__all__` for defined classes and functions.
     for code in file.code_blocks:
@@ -241,12 +253,12 @@ def _stage_3(  # noqa: PLR0912
             export_names = defined_funcs | defined_types
             if ffi_load_lib_imported:
                 export_names = export_names | {"LIB"}
-            G.generate_all(code, export_names, opt)
+            backend.generate_all_block(code, export_names, opt)
             break  # Only one __all__ block per file is supported for now.
     # Stage 6. Process `tvm-ffi-stubgen(begin): export/...`
     for code in file.code_blocks:
         if code.kind == "export":
-            G.generate_export(code)
+            backend.generate_export_block(code)
     # Finalize: write back to file
     file.update(verbose=opt.verbose, dry_run=opt.dry_run)
 
@@ -342,6 +354,13 @@ def _parse_args() -> Options:
         ),
     )
     parser.add_argument(
+        "--target",
+        type=str,
+        default="python",
+        choices=["python", "rust"],
+        help="Code-generation backend: 'python' (default) or 'rust'.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help=(
@@ -382,6 +401,7 @@ def _parse_args() -> Options:
         files=args.files,
         verbose=args.verbose,
         dry_run=args.dry_run,
+        target=args.target,
     )
 
 
