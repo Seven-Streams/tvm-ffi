@@ -24,13 +24,13 @@ from tvm_ffi.core import TypeSchema
 from tvm_ffi.stub import consts as C
 from tvm_ffi.stub.cli import _stage_2, _stage_3
 from tvm_ffi.stub.codegen import (
-    generate_all,
-    generate_export,
-    generate_ffi_api,
-    generate_global_funcs,
-    generate_import_section,
-    generate_init,
-    generate_object,
+    generate_python_all,
+    generate_python_export,
+    generate_python_ffi_api,
+    generate_python_global_funcs,
+    generate_python_import_section,
+    generate_python_init,
+    generate_python_object,
 )
 from tvm_ffi.stub.file_utils import CodeBlock, FileInfo
 from tvm_ffi.stub.utils import (
@@ -312,7 +312,7 @@ def test_generate_global_funcs_updates_block() -> None:
     ]
     opts = Options(indent=2)
     imports: list[ImportItem] = []
-    generate_global_funcs(code, funcs, _default_ty_map(), imports, opts)
+    generate_python_global_funcs(code, funcs, _default_ty_map(), imports, opts)
     assert imports == [
         ImportItem("mockpkg.init_ffi_api", alias="_FFI_INIT_FUNC"),
         ImportItem("typing.TYPE_CHECKING"),
@@ -337,7 +337,7 @@ def test_generate_global_funcs_noop_on_empty_list() -> None:
         lines=[f"{C.PYTHON_SYNTAX.begin} global/empty", C.PYTHON_SYNTAX.end],
     )
     imports: list[ImportItem] = []
-    generate_global_funcs(code, [], _default_ty_map(), imports, Options())
+    generate_python_global_funcs(code, [], _default_ty_map(), imports, Options())
     assert code.lines == [f"{C.PYTHON_SYNTAX.begin} global/empty", C.PYTHON_SYNTAX.end]
     assert imports == []
 
@@ -360,7 +360,7 @@ def test_generate_global_funcs_respects_custom_import_from() -> None:
         )
     ]
     imports: list[ImportItem] = []
-    generate_global_funcs(code, funcs, _default_ty_map(), imports, Options(indent=0))
+    generate_python_global_funcs(code, funcs, _default_ty_map(), imports, Options(indent=0))
     assert ImportItem("custom.mod.init_ffi_api", alias="_FFI_INIT_FUNC") in imports
 
 
@@ -386,7 +386,7 @@ def test_generate_global_funcs_aliases_colliding_type() -> None:
     ty_map = _default_ty_map()
     ty_map["demo.Foo"] = "somepkg.Foo"
     imports: list[ImportItem] = []
-    generate_global_funcs(code, funcs, ty_map, imports, Options(indent=4))
+    generate_python_global_funcs(code, funcs, ty_map, imports, Options(indent=4))
     # The type import should use an alias to avoid shadowing the function
     assert ImportItem("somepkg.Foo", type_checking_only=True, alias="_Foo") in imports
     # The function annotation should use the alias
@@ -412,7 +412,7 @@ def test_generate_object_fields_only_block() -> None:
         type_key="demo.TypeDerived",
         parent_type_key="demo.Parent",
     )
-    generate_object(
+    generate_python_object(
         code,
         _default_ty_map(),
         imports,
@@ -458,7 +458,7 @@ def test_generate_object_with_methods() -> None:
         type_key="demo.IntPair",
         parent_type_key="demo.Parent",
     )
-    generate_object(code, _default_ty_map(), imports, opts, info)
+    generate_python_object(code, _default_ty_map(), imports, opts, info)
     assert set(imports) == {ImportItem("typing.TYPE_CHECKING")}
 
     assert code.lines[0] == f"{C.PYTHON_SYNTAX.begin} object/demo.IntPair"
@@ -486,7 +486,7 @@ def test_generate_import_section_groups_modules() -> None:
         ImportItem("custom.mod.Type", type_checking_only=True),
     ]
     opts = Options(indent=4)
-    generate_import_section(code, imports, opts)
+    generate_python_import_section(code, imports, opts)
 
     expected_prefix = [
         f"{C.PYTHON_SYNTAX.begin} import",
@@ -513,7 +513,7 @@ def test_generate_import_section_no_imports_noop() -> None:
         lines=[f"{C.PYTHON_SYNTAX.begin} import", C.PYTHON_SYNTAX.end],
     )
     before = list(code.lines)
-    generate_import_section(code, [], Options())
+    generate_python_import_section(code, [], Options())
     assert code.lines == before
 
 
@@ -525,7 +525,7 @@ def test_generate_all_builds_sorted_and_deduped_list() -> None:
         lineno_end=2,
         lines=["    " + C.PYTHON_SYNTAX.begin + " global/all", C.PYTHON_SYNTAX.end],
     )
-    generate_all(
+    generate_python_all(
         code,
         names={"tvm_ffi.foo", "bar", "pkg.baz", "bar"},  # duplicates stripped
         opt=Options(indent=2),
@@ -548,7 +548,7 @@ def test_generate_all_noop_on_empty_names() -> None:
         lines=[C.PYTHON_SYNTAX.begin + " global/all-empty", C.PYTHON_SYNTAX.end],
     )
     before = list(code.lines)
-    generate_all(code, names=set(), opt=Options())
+    generate_python_all(code, names=set(), opt=Options())
     assert code.lines == before
 
 
@@ -561,7 +561,7 @@ def test_generate_all_uses_isort_style_ordering() -> None:
         lines=[C.PYTHON_SYNTAX.begin + " global/all-mixed", C.PYTHON_SYNTAX.end],
     )
     names = {"foo", "Bar", "LIB", "baz", "Alpha", "CONST"}
-    generate_all(code, names=names, opt=Options(indent=0))
+    generate_python_all(code, names=names, opt=Options(indent=0))
     assert code.lines == [
         C.PYTHON_SYNTAX.begin + " global/all-mixed",
         '"CONST",',
@@ -630,18 +630,18 @@ def test_generate_export_builds_all_extension() -> None:
         lineno_end=2,
         lines=[f"{C.PYTHON_SYNTAX.begin} export/ffi_api", C.PYTHON_SYNTAX.end],
     )
-    generate_export(code)
+    generate_python_export(code)
     full_text = "\n".join(code.lines)
     assert "from .ffi_api import *" in full_text
     assert "ffi_api__all__" in full_text
 
 
 def test_generate_init_with_and_without_existing_export_block() -> None:
-    code_no_blocks = generate_init([], "demo")
+    code_no_blocks = generate_python_init([], "demo")
     assert "Package demo." in code_no_blocks
     assert f"{C.PYTHON_SYNTAX.begin} export/_ffi_api" in code_no_blocks
 
-    code_with_export = generate_init(
+    code_with_export = generate_python_init(
         [
             CodeBlock(
                 kind="export",
@@ -658,7 +658,7 @@ def test_generate_init_with_and_without_existing_export_block() -> None:
 
 def test_generate_ffi_api_without_objects_includes_sections() -> None:
     init_cfg = InitConfig(pkg="pkg", shared_target="pkg_shared", prefix="pkg.")
-    code = generate_ffi_api(
+    code = generate_python_ffi_api(
         [],
         _default_ty_map(),
         "demo.mod",
@@ -681,7 +681,7 @@ def test_generate_ffi_api_with_objects_imports_parents() -> None:
         parent_type_key="demo.Parent",
     )
     parent_key = obj_info.parent_type_key
-    code = generate_ffi_api(
+    code = generate_python_ffi_api(
         [],
         _default_ty_map(),
         "demo",

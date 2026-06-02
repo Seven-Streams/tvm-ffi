@@ -175,7 +175,7 @@ class PythonBackend:
         opt: Options,
     ) -> None:
         """Emit Python free-function signatures for a ``global/<prefix>`` block."""
-        G.generate_global_funcs(code, global_funcs, ty_map, imports, opt, self.render_type)
+        G.generate_python_global_funcs(code, global_funcs, ty_map, imports, opt, self.render_type)
 
     def generate_object_block(
         self,
@@ -186,21 +186,21 @@ class PythonBackend:
         obj_info: ObjectInfo,
     ) -> None:
         """Emit a Python class definition for an ``object/<key>`` block."""
-        G.generate_object(code, ty_map, imports, opt, obj_info, self.render_type)
+        G.generate_python_object(code, ty_map, imports, opt, obj_info, self.render_type)
 
     def generate_import_section_block(
         self, code: CodeBlock, imports: list[ImportItem], opt: Options
     ) -> None:
         """Emit Python ``import`` statements for the collected imports."""
-        G.generate_import_section(code, imports, opt)
+        G.generate_python_import_section(code, imports, opt)
 
     def generate_all_block(self, code: CodeBlock, names: set[str], opt: Options) -> None:
         """Emit a Python ``__all__`` list."""
-        G.generate_all(code, names, opt)
+        G.generate_python_all(code, names, opt)
 
     def generate_export_block(self, code: CodeBlock) -> None:
         """Emit a Python submodule re-export for an ``export/<submodule>`` block."""
-        G.generate_export(code)
+        G.generate_python_export(code)
 
     def generate_api_file(
         self,
@@ -212,7 +212,7 @@ class PythonBackend:
         is_root: bool,
     ) -> str:
         """Return text appended to a scaffolded ``_ffi_api.py``."""
-        return G.generate_ffi_api(
+        return G.generate_python_ffi_api(
             code_blocks, ty_map, module_name, object_infos, init_cfg, is_root, self.syntax
         )
 
@@ -220,7 +220,7 @@ class PythonBackend:
         self, code_blocks: list[CodeBlock], module_name: str, submodule: str
     ) -> str:
         """Return text appended to a scaffolded ``__init__.py``."""
-        return G.generate_init(code_blocks, module_name, submodule, self.syntax)
+        return G.generate_python_init(code_blocks, module_name, submodule, self.syntax)
 
 
 class RustBackend:

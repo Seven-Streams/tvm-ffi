@@ -88,7 +88,7 @@ def _type_suffix_and_record(
     return _run
 
 
-def generate_global_funcs(
+def generate_python_global_funcs(
     code: CodeBlock,
     global_funcs: list[FuncInfo],
     ty_map: dict[str, str],
@@ -137,7 +137,7 @@ def generate_global_funcs(
     ]
 
 
-def generate_object(
+def generate_python_object(
     code: CodeBlock,
     ty_map: dict[str, str],
     imports: list[ImportItem],
@@ -188,7 +188,7 @@ def generate_object(
     ]
 
 
-def generate_import_section(
+def generate_python_import_section(
     code: CodeBlock,
     imports: list[ImportItem],
     opt: Options,
@@ -241,7 +241,7 @@ def generate_import_section(
         ]
 
 
-def generate_all(code: CodeBlock, names: set[str], opt: Options) -> None:
+def generate_python_all(code: CodeBlock, names: set[str], opt: Options) -> None:
     """Generate an `__all__` variable for the given names."""
     assert len(code.lines) >= 2
     if not names:
@@ -264,7 +264,7 @@ def generate_all(code: CodeBlock, names: set[str], opt: Options) -> None:
     ]
 
 
-def generate_export(code: CodeBlock) -> None:
+def generate_python_export(code: CodeBlock) -> None:
     """Generate an `__all__` variable for the given names."""
     assert len(code.lines) >= 2
 
@@ -284,7 +284,7 @@ def generate_export(code: CodeBlock) -> None:
     ]
 
 
-def generate_ffi_api(
+def generate_python_ffi_api(
     code_blocks: list[CodeBlock],
     ty_map: dict[str, str],
     module_name: str,
@@ -347,7 +347,7 @@ def generate_ffi_api(
     return append
 
 
-def generate_init(
+def generate_python_init(
     code_blocks: list[CodeBlock],
     module_name: str,
     submodule: str = "_ffi_api",
@@ -363,3 +363,13 @@ def generate_init(
     if not any(code.kind == "export" for code in code_blocks):
         return code
     return ""
+
+
+# Backward-compatible aliases while callers migrate to backend-specific names.
+generate_global_funcs = generate_python_global_funcs
+generate_object = generate_python_object
+generate_import_section = generate_python_import_section
+generate_all = generate_python_all
+generate_export = generate_python_export
+generate_ffi_api = generate_python_ffi_api
+generate_init = generate_python_init
