@@ -84,6 +84,8 @@ fn main() {
         .trim()
         .to_string();
     update_runtime_library_env(&lib_dir);
+    println!("cargo:rustc-link-search=native={lib_dir}");
+    println!("cargo:rustc-link-lib=dylib=tvm_ffi");
 
     let expr_lib = env::var("CPP_RUST_TEST_EXPR_LIB")
         .map(PathBuf::from)

@@ -22,7 +22,7 @@ under the License.
 Minimal C++/Rust interop demo for tvm-ffi:
 
 - `ExprObj`: `value: int64_t`
-- `AddObj`: `a: Expr`, `b: Expr`, `value: int64_t`
+- `AddObj`: `a: Expr`, `b: Expr`, `value: int64_t`, method `update()` (C++ recomputes `value`)
 - Globals: `cpp_rust_test.make_expr`, `cpp_rust_test.make_add`
 - Rust mirrors both with `#[repr(C)]` and mutates the same C++ heap objects
 

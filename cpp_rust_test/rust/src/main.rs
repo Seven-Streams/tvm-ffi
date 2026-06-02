@@ -24,8 +24,9 @@ use std::sync::OnceLock;
 
 use tvm_ffi::derive::ObjectRef as DeriveObjectRef;
 use tvm_ffi::object::{Object, ObjectArc, ObjectCore};
-use tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFIObject, TVMFFITypeKeyToIndex};
-use tvm_ffi::{ensure, into_typed_fn, AnyView, Function, Module, Result, VALUE_ERROR};
+use tvm_ffi::type_traits::AnyCompatible;
+use tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFIGetTypeInfo, TVMFFIObject, TVMFFITypeKeyToIndex};
+use tvm_ffi::{ensure, into_typed_fn, AnyView, Function, Module, Result, TYPE_ERROR, VALUE_ERROR};
 
 fn lookup_type_index(type_key: &'static str) -> i32 {
     static EXPR_INDEX: OnceLock<i32> = OnceLock::new();
@@ -127,10 +128,6 @@ impl Add {
         self.data.value
     }
 
-    fn set_value(&mut self, value: i64) {
-        self.data.value = value;
-    }
-
     fn a(&self) -> &Expr {
         &self.data.a
     }
@@ -142,6 +139,43 @@ impl Add {
     fn a_mut(&mut self) -> &mut Expr {
         &mut self.data.a
     }
+
+    /// Calls C++ `AddObj::Update()` via the reflected `update` method.
+    fn update(&mut self) -> Result<()> {
+        let update_fn = get_type_method(AddObj::TYPE_KEY, "update")?;
+        let call = into_typed_fn!(update_fn, Fn(&Add) -> Result<()>);
+        call(self)
+    }
+}
+
+/// Look up a reflected instance method on a registered object type.
+fn get_type_method(type_key: &'static str, method_name: &str) -> Result<Function> {
+    let type_index = lookup_type_index(type_key);
+    unsafe {
+        let info = TVMFFIGetTypeInfo(type_index);
+        ensure!(
+            !info.is_null(),
+            TYPE_ERROR,
+            "TVMFFIGetTypeInfo returned null for type `{type_key}`"
+        );
+        let info = &*info;
+        for i in 0..info.num_methods {
+            let method_info = &*info.methods.add(i as usize);
+            if method_info.name.as_str() == method_name {
+                ensure!(
+                    Function::check_any_strict(&method_info.method),
+                    TYPE_ERROR,
+                    "method `{method_name}` on `{type_key}` is not a Function"
+                );
+                return Ok(Function::copy_from_any_view_after_check(&method_info.method));
+            }
+        }
+    }
+    Err(tvm_ffi::Error::new(
+        TYPE_ERROR,
+        &format!("method `{method_name}` not found on type `{type_key}`"),
+        "",
+    ))
 }
 
 impl Deref for Add {
@@ -205,13 +239,13 @@ fn main() -> Result<()> {
         add.value()
     );
 
-    add.set_value(add.a().value() + add.b().value());
-    println!("after Rust sets Add.value = {}", add.value());
+    add.update()?;
+    println!("after C++ Add::Update(): value={}", add.value());
     ensure!(add.value() == 42, VALUE_ERROR, "expected 42, got {}", add.value());
 
     add.a_mut().set_value(100);
     println!(
-        "after Rust mutates Add.a: a={}, b={}, value={}",
+        "after Rust mutates Add.a only: a={}, b={}, value={} (value still stale)",
         add.a().value(),
         add.b().value(),
         add.value()
@@ -221,6 +255,15 @@ fn main() -> Result<()> {
         VALUE_ERROR,
         "expected a=100, got {}",
         add.a().value()
+    );
+
+    add.update()?;
+    println!("after second C++ Add::Update(): value={}", add.value());
+    ensure!(
+        add.value() == 132,
+        VALUE_ERROR,
+        "expected 132, got {}",
+        add.value()
     );
 
     println!("dropping Add; ~AddObj() then ~ExprObj for a and b");

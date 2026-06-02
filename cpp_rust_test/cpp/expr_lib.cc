@@ -58,6 +58,12 @@ class AddObj : public ffi::Object {
 
   AddObj(Expr a, Expr b, int64_t value) : a(std::move(a)), b(std::move(b)), value(value) {}
 
+  void Update() {
+    value = a->value + b->value;
+    std::cout << "[cpp_rust_test] AddObj::Update() value=" << value << " (a=" << a->value
+              << " + b=" << b->value << ")" << std::endl;
+  }
+
   ~AddObj() {
     std::cout << "[cpp_rust_test] ~AddObj() value=" << value << " a->value=" << a->value
               << " b->value=" << b->value << std::endl;
@@ -89,7 +95,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def(refl::init<Expr, Expr, int64_t>())
       .def_rw("a", &AddObj::a, "left Expr")
       .def_rw("b", &AddObj::b, "right Expr")
-      .def_rw("value", &AddObj::value, "combined scalar");
+      .def_rw("value", &AddObj::value, "combined scalar")
+      .def("update", &AddObj::Update, "set value to a.value + b.value");
 
   refl::TypeAttrDef<AddObj>().def(refl::type_attr::kConvert,
                                    &refl::details::FFIConvertFromAnyViewToObjectRef<Add>);
