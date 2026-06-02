@@ -21,35 +21,10 @@ under the License.
 
 Minimal C++/Rust interop demo for tvm-ffi:
 
-- C++ defines `ExprObj` with one field `value: int64_t`.
-- C++ exports `cpp_rust_test.make_expr`.
-- Rust loads the C++ shared library, receives `Expr`, and mutates `value` directly.
-
-## Build C++ shared library
-
-```bash
-cmake -S cpp_rust_test -B cpp_rust_test/build
-cmake --build cpp_rust_test/build
-```
-
-## Run Rust program
-
-```bash
-cd cpp_rust_test/rust
-cargo run
-```
-
-Expected output includes:
-
-```text
-created Expr.value = 42
-after Rust mutation Expr.value = 50
-cpp_rust_test demo OK
-```
-# cpp_rust_test
-
-Minimal C++ / Rust demo: C++ defines `Expr` with one `int64_t value` field; Rust loads the
-shared library, creates an `Expr` via a global function, and mutates `value` in place.
+- `ExprObj`: `value: int64_t`
+- `AddObj`: `a: Expr`, `b: Expr`, `value: int64_t`
+- Globals: `cpp_rust_test.make_expr`, `cpp_rust_test.make_add`
+- Rust mirrors both with `#[repr(C)]` and mutates the same C++ heap objects
 
 ## Prerequisites
 
@@ -63,18 +38,12 @@ export LD_LIBRARY_PATH="$(tvm-ffi-config --libdir):${LD_LIBRARY_PATH:-}"
 ## Build and run
 
 ```bash
-./cpp_rust_test/scripts/build_and_run.sh
-```
-
-Or step by step:
-
-```bash
 cmake -S cpp_rust_test -B cpp_rust_test/build
 cmake --build cpp_rust_test/build --parallel
 cd cpp_rust_test/rust && cargo run --release
 ```
 
-Override the Expr library path:
+Override the shared library path:
 
 ```bash
 export CPP_RUST_TEST_EXPR_LIB=/path/to/cpp_rust_test_expr.so
@@ -84,6 +53,6 @@ export CPP_RUST_TEST_EXPR_LIB=/path/to/cpp_rust_test_expr.so
 
 | Path | Role |
 |------|------|
-| `cpp/expr_lib.cc` | C++ `ExprObj` / `Expr` + reflection + `cpp_rust_test.make_expr` |
-| `rust/src/main.rs` | Matching `#[repr(C)]` type + field mutation |
+| `cpp/expr_lib.cc` | C++ `Expr` / `Add` + reflection + factories |
+| `rust/src/main.rs` | `Expr` / `Add` bindings + demo |
 | `CMakeLists.txt` | Builds `cpp_rust_test_expr.so` into `build/` |

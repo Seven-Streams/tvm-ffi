@@ -18,7 +18,7 @@
  */
 /*!
  * \file expr_lib.cc
- * \brief Minimal C++ Expr type for cpp_rust_test (single int64 value field).
+ * \brief C++ Expr / Add types for cpp_rust_test.
  */
 #include <tvm/ffi/tvm_ffi.h>
 
@@ -50,6 +50,32 @@ class Expr : public ffi::ObjectRef {
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(Expr, ffi::ObjectRef, ExprObj);
 };
 
+class AddObj : public ffi::Object {
+ public:
+  Expr a;
+  Expr b;
+  int64_t value;
+
+  AddObj(Expr a, Expr b, int64_t value) : a(std::move(a)), b(std::move(b)), value(value) {}
+
+  ~AddObj() {
+    std::cout << "[cpp_rust_test] ~AddObj() value=" << value << " a->value=" << a->value
+              << " b->value=" << b->value << std::endl;
+  }
+
+  static constexpr bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("cpp_rust_test.Add", AddObj, ffi::Object);
+};
+
+class Add : public ffi::ObjectRef {
+ public:
+  Add(Expr a, Expr b, int64_t value) {
+    data_ = ffi::make_object<AddObj>(std::move(a), std::move(b), value);
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(Add, ffi::ObjectRef, AddObj);
+};
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::ObjectDef<ExprObj>()
@@ -59,7 +85,19 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::TypeAttrDef<ExprObj>().def(refl::type_attr::kConvert,
                                    &refl::details::FFIConvertFromAnyViewToObjectRef<Expr>);
 
-  refl::GlobalDef().def("cpp_rust_test.make_expr", [](int64_t v) { return Expr(v); });
+  refl::ObjectDef<AddObj>()
+      .def(refl::init<Expr, Expr, int64_t>())
+      .def_rw("a", &AddObj::a, "left Expr")
+      .def_rw("b", &AddObj::b, "right Expr")
+      .def_rw("value", &AddObj::value, "combined scalar");
+
+  refl::TypeAttrDef<AddObj>().def(refl::type_attr::kConvert,
+                                   &refl::details::FFIConvertFromAnyViewToObjectRef<Add>);
+
+  refl::GlobalDef()
+      .def("cpp_rust_test.make_expr", [](int64_t v) { return Expr(v); })
+      .def("cpp_rust_test.make_add",
+           [](Expr a, Expr b, int64_t value) { return Add(std::move(a), std::move(b), value); });
 }
 
 }  // namespace cpp_rust_test
