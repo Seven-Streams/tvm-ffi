@@ -306,9 +306,7 @@ def generate_ffi_api(
 
     # Part 1. Library loading
     if is_root:
-        append += _prompt_import_object(
-            "tvm_ffi.libinfo.load_lib_module", "_FFI_LOAD_LIB", syntax
-        )
+        append += _prompt_import_object("tvm_ffi.libinfo.load_lib_module", "_FFI_LOAD_LIB", syntax)
         append += f"""LIB = _FFI_LOAD_LIB("{init_cfg.pkg}", "{init_cfg.shared_target}")\n"""
 
     # Part 2. Global functions

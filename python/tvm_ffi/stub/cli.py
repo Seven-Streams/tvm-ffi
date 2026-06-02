@@ -128,6 +128,7 @@ def _stage_2(
 ) -> None:
     if backend is None:
         backend = get_backend("python")
+
     def _find_or_insert_file(path: Path) -> FileInfo:
         ret: FileInfo | None
         if not path.exists():

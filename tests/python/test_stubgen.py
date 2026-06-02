@@ -588,7 +588,9 @@ def test_stage_3_adds_LIB_when_load_lib_imported(tmp_path: Path) -> None:
         param=("tvm_ffi.libinfo.load_lib_module", "False", "_FFI_LOAD_LIB"),
         lineno_start=1,
         lineno_end=1,
-        lines=[f"{C.PYTHON_SYNTAX.import_object} tvm_ffi.libinfo.load_lib_module;False;_FFI_LOAD_LIB"],
+        lines=[
+            f"{C.PYTHON_SYNTAX.import_object} tvm_ffi.libinfo.load_lib_module;False;_FFI_LOAD_LIB"
+        ],
     )
     all_block = CodeBlock(
         kind="__all__",
