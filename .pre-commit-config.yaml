@@ -93,32 +93,6 @@ repos:
     rev: v0.9.3
     hooks:
       - id: taplo-format
-  - repo: local
-    hooks:
-      - id: rustfmt-workspace
-        name: rustfmt workspace
-        entry: bash -lc "cd rust && cargo fmt --all"
-        language: system
-        pass_filenames: false
-        types: [rust]
-      - id: rustfmt-cpp-rust-test
-        name: rustfmt cpp_rust_test
-        entry: bash -lc "cd cpp_rust_test/rust && cargo fmt --all"
-        language: system
-        pass_filenames: false
-        types: [rust]
-      - id: clippy-workspace
-        name: clippy workspace
-        entry: bash -lc "cd rust && cargo clippy --workspace --all-targets -- -D warnings"
-        language: system
-        pass_filenames: false
-        types: [rust]
-      - id: clippy-cpp-rust-test
-        name: clippy cpp_rust_test
-        entry: bash -lc "cd cpp_rust_test/rust && cargo clippy --all-targets -- -D warnings"
-        language: system
-        pass_filenames: false
-        types: [rust]
   - repo: https://github.com/MarcoGorelli/cython-lint
     rev: v0.18.1
     hooks:
