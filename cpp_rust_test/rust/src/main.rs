@@ -92,7 +92,7 @@ impl DerefMut for Expr {
 /// Mirrors C++ `cpp_rust_test::AddObj` (`ExprObj` + `Expr a` + `Expr b`).
 #[repr(C)]
 struct AddObj {
-    pub base: ExprObj,
+    base: ExprObj,
     pub a: Expr,
     pub b: Expr,
 }
