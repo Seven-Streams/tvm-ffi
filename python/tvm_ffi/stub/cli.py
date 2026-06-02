@@ -55,6 +55,8 @@ def __main__() -> int:
     dlls = [ctypes.CDLL(lib) for lib in opt.dlls]
     files: list[FileInfo] = collect_files([Path(f) for f in opt.files])
     global_funcs: dict[str, list[FuncInfo]] = collect_global_funcs()
+    # Currently-registered type keys, used to prune stale object blocks on regen.
+    registered_type_keys: set[str] = {k for ks in collect_type_keys().values() for k in ks}
     init_path: Path | None = None
     if opt.files:
         init_path = Path(opt.files[0]).resolve()
@@ -100,6 +102,7 @@ def __main__() -> int:
                 ty_map,
                 global_funcs,
                 generator=generator,
+                registered_type_keys=registered_type_keys,
             )
         except Exception:
             print(
@@ -220,12 +223,19 @@ def _stage_3(  # noqa: PLR0912
     ty_map: dict[str, str],
     global_funcs: dict[str, list[FuncInfo]],
     generator: Generator | None = None,
+    registered_type_keys: set[str] | None = None,
 ) -> None:
     if generator is None:
         generator = get_generator("python")
+    registered_type_keys = registered_type_keys or set()
     defined_funcs: set[str] = set()
     defined_types: set[str] = set()
     imports = generator.new_imports()
+    # Stage 0. Fill `tvm-ffi-stubgen(begin): helpers` with per-file support code.
+    # Regenerated every run (no-op for backends that need no helpers, e.g. Python).
+    for code in file.code_blocks:
+        if code.kind == "helpers":
+            generator.generate_helpers_block(code, opt)
     # Stage 1. Collect `tvm-ffi-stubgen(import-object): ...`
     for code in file.code_blocks:
         if code.kind == "import-object":
@@ -243,6 +253,18 @@ def _stage_3(  # noqa: PLR0912
         if code.kind == "object":
             type_key = code.param
             assert isinstance(type_key, str)
+            # Prune a stale block whose type is no longer registered (only when the
+            # backend's object blocks are standalone, and we have a non-empty registry
+            # view to compare against -- so an unloaded library can't nuke everything).
+            if (
+                generator.standalone_object_blocks
+                and registered_type_keys
+                and type_key not in registered_type_keys
+                and type_key not in C.BUILTIN_TYPE_KEYS
+            ):
+                code.lines = []
+                print(f"{C.TERM_YELLOW}[Removed] stale object block {type_key}{C.TERM_RESET}")
+                continue
             obj_info = object_info_from_type_key(type_key)
             type_key = ty_map.get(type_key, type_key)
             defined_types.add(generator.canonical_type_name(type_key))
@@ -352,16 +374,16 @@ def _parse_args() -> Options:
         metavar="PATH",
         help=(
             "Files or directories to process. Directories are scanned recursively; "
-            "only .py and .pyi files are modified. Use tvm-ffi-stubgen directives to "
-            "select where stubs are generated."
+            "only .py, .pyi (Python) and .rs (Rust) files are modified. Use "
+            "tvm-ffi-stubgen directives to select where stubs are generated."
         ),
     )
     parser.add_argument(
         "--target",
         type=str,
         default="python",
-        choices=["python"],
-        help="Code generator target.",
+        choices=["python", "rust"],
+        help="Code generator target: 'python' (default) or 'rust'.",
     )
     parser.add_argument(
         "--verbose",

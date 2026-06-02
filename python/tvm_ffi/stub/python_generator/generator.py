@@ -45,6 +45,8 @@ class PythonGenerator:
 
     name = "python"
     syntax = C.PYTHON_SYNTAX
+    #: Object blocks live inside a `class` body -> not safely removable wholesale.
+    standalone_object_blocks = False
 
     def default_ty_map(self) -> dict[str, str]:
         """Return the default FFI-origin -> Python-type name map."""
