@@ -81,15 +81,6 @@ SYNTAX_BY_EXT: dict[str, MarkerSyntax] = {
     ".rs": RUST_SYNTAX,
 }
 
-# Legacy module-level aliases for the Python markers. The Python code-generation
-# templates below and in `codegen.py` still hard-code these; new, language-aware
-# code should go through a `MarkerSyntax` instance instead.
-STUB_PREFIX = PYTHON_SYNTAX.prefix
-STUB_BEGIN = PYTHON_SYNTAX.begin
-STUB_END = PYTHON_SYNTAX.end
-STUB_TY_MAP = PYTHON_SYNTAX.ty_map
-STUB_IMPORT_OBJECT = PYTHON_SYNTAX.import_object
-STUB_SKIP_FILE = PYTHON_SYNTAX.skip_file
 STUB_BLOCK_KINDS: TypeAlias = Literal[
     "global",
     "object",
@@ -146,35 +137,3 @@ BUILTIN_TYPE_KEYS = {
     "ffi.String",
     "ffi.Tensor",
 }
-
-
-def _prompt_globals(mod: str) -> str:
-    return f"""{STUB_BEGIN} global/{mod}
-{STUB_END}
-"""
-
-
-def _prompt_class_def(type_name: str, type_key: str, parent_type_name: str) -> str:
-    return f'''@_FFI_REG_OBJ("{type_key}")
-class {type_name}({parent_type_name}):
-    """FFI binding for `{type_key}`."""
-
-    {STUB_BEGIN} object/{type_key}
-    {STUB_END}\n\n'''
-
-
-def _prompt_import_object(type_key: str, type_name: str) -> str:
-    return f"""{STUB_IMPORT_OBJECT} {type_key};False;{type_name}\n"""
-
-
-PROMPT_IMPORT_SECTION = f"""
-{STUB_BEGIN} import-section
-{STUB_END}
-"""
-
-PROMPT_ALL_SECTION = f"""
-__all__ = [
-    {STUB_BEGIN} __all__
-    {STUB_END}
-]
-"""

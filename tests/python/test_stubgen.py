@@ -57,11 +57,11 @@ def _type_suffix(name: str) -> str:
 
 def test_codeblock_from_begin_line_variants() -> None:
     cases = [
-        (f"{C.STUB_BEGIN} global/demo", "global", ("demo", "")),
-        (f"{C.STUB_BEGIN} global/demo@.registry", "global", ("demo", ".registry")),
-        (f"{C.STUB_BEGIN} object/demo.TypeBase", "object", "demo.TypeBase"),
-        (f"{C.STUB_BEGIN} ty-map/custom", "ty-map", "custom"),
-        (f"{C.STUB_BEGIN} import-section", "import-section", ""),
+        (f"{C.PYTHON_SYNTAX.begin} global/demo", "global", ("demo", "")),
+        (f"{C.PYTHON_SYNTAX.begin} global/demo@.registry", "global", ("demo", ".registry")),
+        (f"{C.PYTHON_SYNTAX.begin} object/demo.TypeBase", "object", "demo.TypeBase"),
+        (f"{C.PYTHON_SYNTAX.begin} ty-map/custom", "ty-map", "custom"),
+        (f"{C.PYTHON_SYNTAX.begin} import-section", "import-section", ""),
     ]
     for lineno, (line, kind, param) in enumerate(cases, start=1):
         block = CodeBlock.from_begin_line(lineno, line)
@@ -73,7 +73,7 @@ def test_codeblock_from_begin_line_variants() -> None:
 
 
 def test_codeblock_from_begin_line_ty_map_and_unknown() -> None:
-    line = f"{C.STUB_TY_MAP} custom -> mapped"
+    line = f"{C.PYTHON_SYNTAX.ty_map} custom -> mapped"
     block = CodeBlock.from_begin_line(5, line)
     assert block.kind == "ty-map"
     assert block.param == "custom -> mapped"
@@ -81,12 +81,12 @@ def test_codeblock_from_begin_line_ty_map_and_unknown() -> None:
     assert block.lineno_end == 5
 
     with pytest.raises(ValueError):
-        CodeBlock.from_begin_line(1, f"{C.STUB_BEGIN} unsupported/kind")
+        CodeBlock.from_begin_line(1, f"{C.PYTHON_SYNTAX.begin} unsupported/kind")
 
 
 def test_fileinfo_from_file_skip_and_missing_markers(tmp_path: Path) -> None:
     skip = tmp_path / "skip.py"
-    skip.write_text(f"print('hi')\n{C.STUB_SKIP_FILE}\n", encoding="utf-8")
+    skip.write_text(f"print('hi')\n{C.PYTHON_SYNTAX.skip_file}\n", encoding="utf-8")
     assert FileInfo.from_file(skip) is None
 
     plain = tmp_path / "plain.py"
@@ -98,10 +98,10 @@ def test_fileinfo_from_file_parses_blocks(tmp_path: Path) -> None:
     content = "\n".join(
         [
             "first = 1",
-            f"{C.STUB_BEGIN} global/demo.func",
+            f"{C.PYTHON_SYNTAX.begin} global/demo.func",
             "in_stub = True",
-            C.STUB_END,
-            f"{C.STUB_TY_MAP} x -> y",
+            C.PYTHON_SYNTAX.end,
+            f"{C.PYTHON_SYNTAX.ty_map} x -> y",
         ]
     )
     path = tmp_path / "demo.py"
@@ -120,15 +120,15 @@ def test_fileinfo_from_file_parses_blocks(tmp_path: Path) -> None:
     assert stub.lineno_start == 2
     assert stub.lineno_end == 4
     assert stub.lines == [
-        f"{C.STUB_BEGIN} global/demo.func",
+        f"{C.PYTHON_SYNTAX.begin} global/demo.func",
         "in_stub = True",
-        C.STUB_END,
+        C.PYTHON_SYNTAX.end,
     ]
 
     assert ty_map.kind == "ty-map"
     assert ty_map.param == "x -> y"
     assert ty_map.lineno_start == ty_map.lineno_end == 5
-    assert ty_map.lines == [f"{C.STUB_TY_MAP} x -> y"]
+    assert ty_map.lines == [f"{C.PYTHON_SYNTAX.ty_map} x -> y"]
 
 
 def test_fileinfo_from_file_error_paths(tmp_path: Path) -> None:
@@ -136,8 +136,8 @@ def test_fileinfo_from_file_error_paths(tmp_path: Path) -> None:
     nested.write_text(
         "\n".join(
             [
-                f"{C.STUB_BEGIN} global/outer",
-                f"{C.STUB_BEGIN} global/inner",
+                f"{C.PYTHON_SYNTAX.begin} global/outer",
+                f"{C.PYTHON_SYNTAX.begin} global/inner",
             ]
         ),
         encoding="utf-8",
@@ -146,12 +146,12 @@ def test_fileinfo_from_file_error_paths(tmp_path: Path) -> None:
         FileInfo.from_file(nested)
 
     unmatched_end = tmp_path / "unmatched.py"
-    unmatched_end.write_text(C.STUB_END + "\n", encoding="utf-8")
+    unmatched_end.write_text(C.PYTHON_SYNTAX.end + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Unmatched"):
         FileInfo.from_file(unmatched_end)
 
     unclosed = tmp_path / "unclosed.py"
-    unclosed.write_text(f"{C.STUB_BEGIN} global/method\n", encoding="utf-8")
+    unclosed.write_text(f"{C.PYTHON_SYNTAX.begin} global/method\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Unclosed stub block"):
         FileInfo.from_file(unclosed)
 
@@ -299,7 +299,7 @@ def test_generate_global_funcs_updates_block() -> None:
         param=("demo", "mockpkg"),
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} global/demo@mockpkg", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} global/demo@mockpkg", C.PYTHON_SYNTAX.end],
     )
     funcs = [
         FuncInfo(
@@ -318,13 +318,13 @@ def test_generate_global_funcs_updates_block() -> None:
         ImportItem("typing.TYPE_CHECKING"),
     ]
     assert code.lines == [
-        f"{C.STUB_BEGIN} global/demo@mockpkg",
+        f"{C.PYTHON_SYNTAX.begin} global/demo@mockpkg",
         "# fmt: off",
         '_FFI_INIT_FUNC("demo", __name__)',
         "if TYPE_CHECKING:",
         "  def add_one(_0: int, /) -> int: ...",
         "# fmt: on",
-        C.STUB_END,
+        C.PYTHON_SYNTAX.end,
     ]
 
 
@@ -334,11 +334,11 @@ def test_generate_global_funcs_noop_on_empty_list() -> None:
         param=("empty", ""),
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} global/empty", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} global/empty", C.PYTHON_SYNTAX.end],
     )
     imports: list[ImportItem] = []
     generate_global_funcs(code, [], _default_ty_map(), imports, Options())
-    assert code.lines == [f"{C.STUB_BEGIN} global/empty", C.STUB_END]
+    assert code.lines == [f"{C.PYTHON_SYNTAX.begin} global/empty", C.PYTHON_SYNTAX.end]
     assert imports == []
 
 
@@ -348,7 +348,7 @@ def test_generate_global_funcs_respects_custom_import_from() -> None:
         param=("demo", "custom.mod"),
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} global/demo@custom.mod", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} global/demo@custom.mod", C.PYTHON_SYNTAX.end],
     )
     funcs = [
         FuncInfo(
@@ -371,7 +371,7 @@ def test_generate_global_funcs_aliases_colliding_type() -> None:
         param=("demo", "mockpkg"),
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} global/demo@mockpkg", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} global/demo@mockpkg", C.PYTHON_SYNTAX.end],
     )
     # Function "demo.Foo" returns type "demo.Foo" — name collision
     funcs = [
@@ -399,7 +399,7 @@ def test_generate_object_fields_only_block() -> None:
         param="demo.TypeDerived",
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} object/demo.TypeDerived", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} object/demo.TypeDerived", C.PYTHON_SYNTAX.end],
     )
     opts = Options(indent=4)
     imports: list[ImportItem] = []
@@ -422,11 +422,11 @@ def test_generate_object_fields_only_block() -> None:
     assert imports == []
 
     expected = [
-        f"{C.STUB_BEGIN} object/demo.TypeDerived",
+        f"{C.PYTHON_SYNTAX.begin} object/demo.TypeDerived",
         " " * code.indent + "# fmt: off",
         *[(" " * code.indent) + line for line in info.gen_fields(_type_suffix, indent=0)],
         " " * code.indent + "# fmt: on",
-        C.STUB_END,
+        C.PYTHON_SYNTAX.end,
     ]
     assert code.lines == expected
 
@@ -437,7 +437,7 @@ def test_generate_object_with_methods() -> None:
         param="demo.IntPair",
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} object/demo.IntPair", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} object/demo.IntPair", C.PYTHON_SYNTAX.end],
     )
     opts = Options(indent=4)
     imports: list[ImportItem] = []
@@ -461,8 +461,8 @@ def test_generate_object_with_methods() -> None:
     generate_object(code, _default_ty_map(), imports, opts, info)
     assert set(imports) == {ImportItem("typing.TYPE_CHECKING")}
 
-    assert code.lines[0] == f"{C.STUB_BEGIN} object/demo.IntPair"
-    assert code.lines[-1] == C.STUB_END
+    assert code.lines[0] == f"{C.PYTHON_SYNTAX.begin} object/demo.IntPair"
+    assert code.lines[-1] == C.PYTHON_SYNTAX.end
     assert "# fmt: off" in code.lines[1]
     assert any("if TYPE_CHECKING:" in line for line in code.lines)
     method_lines = [line for line in code.lines if "def __ffi_init__" in line or "def sum" in line]
@@ -477,7 +477,7 @@ def test_generate_import_section_groups_modules() -> None:
         param="",
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} import", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} import", C.PYTHON_SYNTAX.end],
     )
     imports = [
         ImportItem("typing.Any", type_checking_only=True),
@@ -489,7 +489,7 @@ def test_generate_import_section_groups_modules() -> None:
     generate_import_section(code, imports, opts)
 
     expected_prefix = [
-        f"{C.STUB_BEGIN} import",
+        f"{C.PYTHON_SYNTAX.begin} import",
         "# fmt: off",
         "# isort: off",
         "from __future__ import annotations",
@@ -501,7 +501,7 @@ def test_generate_import_section_groups_modules() -> None:
     assert "    from demo_pkg import Tensor" in code.lines
     assert "    from custom.mod import Type" in code.lines
     assert "    from typing import Any" in code.lines
-    assert code.lines[-2:] == ["# fmt: on", C.STUB_END]
+    assert code.lines[-2:] == ["# fmt: on", C.PYTHON_SYNTAX.end]
 
 
 def test_generate_import_section_no_imports_noop() -> None:
@@ -510,7 +510,7 @@ def test_generate_import_section_no_imports_noop() -> None:
         param="",
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} import", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} import", C.PYTHON_SYNTAX.end],
     )
     before = list(code.lines)
     generate_import_section(code, [], Options())
@@ -523,7 +523,7 @@ def test_generate_all_builds_sorted_and_deduped_list() -> None:
         param="all",
         lineno_start=1,
         lineno_end=2,
-        lines=["    " + C.STUB_BEGIN + " global/all", C.STUB_END],
+        lines=["    " + C.PYTHON_SYNTAX.begin + " global/all", C.PYTHON_SYNTAX.end],
     )
     generate_all(
         code,
@@ -531,11 +531,11 @@ def test_generate_all_builds_sorted_and_deduped_list() -> None:
         opt=Options(indent=2),
     )
     assert code.lines == [
-        "    " + C.STUB_BEGIN + " global/all",
+        "    " + C.PYTHON_SYNTAX.begin + " global/all",
         '    "bar",',
         '    "baz",',
         '    "foo",',
-        C.STUB_END,
+        C.PYTHON_SYNTAX.end,
     ]
 
 
@@ -545,7 +545,7 @@ def test_generate_all_noop_on_empty_names() -> None:
         param="all-empty",
         lineno_start=1,
         lineno_end=2,
-        lines=[C.STUB_BEGIN + " global/all-empty", C.STUB_END],
+        lines=[C.PYTHON_SYNTAX.begin + " global/all-empty", C.PYTHON_SYNTAX.end],
     )
     before = list(code.lines)
     generate_all(code, names=set(), opt=Options())
@@ -558,19 +558,19 @@ def test_generate_all_uses_isort_style_ordering() -> None:
         param="all-mixed",
         lineno_start=1,
         lineno_end=2,
-        lines=[C.STUB_BEGIN + " global/all-mixed", C.STUB_END],
+        lines=[C.PYTHON_SYNTAX.begin + " global/all-mixed", C.PYTHON_SYNTAX.end],
     )
     names = {"foo", "Bar", "LIB", "baz", "Alpha", "CONST"}
     generate_all(code, names=names, opt=Options(indent=0))
     assert code.lines == [
-        C.STUB_BEGIN + " global/all-mixed",
+        C.PYTHON_SYNTAX.begin + " global/all-mixed",
         '"CONST",',
         '"LIB",',
         '"Alpha",',
         '"Bar",',
         '"baz",',
         '"foo",',
-        C.STUB_END,
+        C.PYTHON_SYNTAX.end,
     ]
 
 
@@ -581,21 +581,21 @@ def test_stage_3_adds_LIB_when_load_lib_imported(tmp_path: Path) -> None:
         param=("testing", ""),
         lineno_start=2,
         lineno_end=3,
-        lines=[f"{C.STUB_BEGIN} global/testing", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} global/testing", C.PYTHON_SYNTAX.end],
     )
     import_obj_block = CodeBlock(
         kind="import-object",
         param=("tvm_ffi.libinfo.load_lib_module", "False", "_FFI_LOAD_LIB"),
         lineno_start=1,
         lineno_end=1,
-        lines=[f"{C.STUB_IMPORT_OBJECT} tvm_ffi.libinfo.load_lib_module;False;_FFI_LOAD_LIB"],
+        lines=[f"{C.PYTHON_SYNTAX.import_object} tvm_ffi.libinfo.load_lib_module;False;_FFI_LOAD_LIB"],
     )
     all_block = CodeBlock(
         kind="__all__",
         param="",
         lineno_start=4,
         lineno_end=5,
-        lines=[f"{C.STUB_BEGIN} __all__", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} __all__", C.PYTHON_SYNTAX.end],
     )
     file_info = FileInfo(
         path=path,
@@ -626,7 +626,7 @@ def test_generate_export_builds_all_extension() -> None:
         param="ffi_api",
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} export/ffi_api", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} export/ffi_api", C.PYTHON_SYNTAX.end],
     )
     generate_export(code)
     full_text = "\n".join(code.lines)
@@ -637,7 +637,7 @@ def test_generate_export_builds_all_extension() -> None:
 def test_generate_init_with_and_without_existing_export_block() -> None:
     code_no_blocks = generate_init([], "demo")
     assert "Package demo." in code_no_blocks
-    assert f"{C.STUB_BEGIN} export/_ffi_api" in code_no_blocks
+    assert f"{C.PYTHON_SYNTAX.begin} export/_ffi_api" in code_no_blocks
 
     code_with_export = generate_init(
         [
@@ -664,9 +664,9 @@ def test_generate_ffi_api_without_objects_includes_sections() -> None:
         init_cfg,
         is_root=False,
     )
-    assert f"{C.STUB_BEGIN} import-section" in code
-    assert f"{C.STUB_BEGIN} global/demo.mod" in code
-    assert C.STUB_BEGIN + " __all__" in code
+    assert f"{C.PYTHON_SYNTAX.begin} import-section" in code
+    assert f"{C.PYTHON_SYNTAX.begin} global/demo.mod" in code
+    assert C.PYTHON_SYNTAX.begin + " __all__" in code
     assert "LIB =" not in code
 
 
@@ -687,11 +687,11 @@ def test_generate_ffi_api_with_objects_imports_parents() -> None:
         init_cfg,
         is_root=False,
     )
-    assert C.STUB_IMPORT_OBJECT in code  # register_object prompt
-    assert f"{C.STUB_BEGIN} object/{obj_info.type_key}" in code
+    assert C.PYTHON_SYNTAX.import_object in code  # register_object prompt
+    assert f"{C.PYTHON_SYNTAX.begin} object/{obj_info.type_key}" in code
     assert parent_key is not None
     parent_import_prompt = (
-        f"{C.STUB_IMPORT_OBJECT} {parent_key};False;_{parent_key.replace('.', '_')}"
+        f"{C.PYTHON_SYNTAX.import_object} {parent_key};False;_{parent_key.replace('.', '_')}"
     )
     assert parent_import_prompt in code
 

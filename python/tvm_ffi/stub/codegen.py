@@ -24,6 +24,48 @@ from . import consts as C
 from .file_utils import CodeBlock
 from .utils import FuncInfo, ImportItem, InitConfig, ObjectInfo, Options, RenderType
 
+# --- Python scaffolding templates (init mode) -------------------------------
+# These emit Python source plus stub-directive markers. The marker comment token
+# comes from the supplied `MarkerSyntax`, so the directive structure stays
+# language-aware even though the surrounding code is Python-specific.
+
+
+def _prompt_globals(mod: str, syntax: C.MarkerSyntax) -> str:
+    return f"""{syntax.begin} global/{mod}
+{syntax.end}
+"""
+
+
+def _prompt_class_def(
+    type_name: str, type_key: str, parent_type_name: str, syntax: C.MarkerSyntax
+) -> str:
+    return f'''@_FFI_REG_OBJ("{type_key}")
+class {type_name}({parent_type_name}):
+    """FFI binding for `{type_key}`."""
+
+    {syntax.begin} object/{type_key}
+    {syntax.end}\n\n'''
+
+
+def _prompt_import_object(type_key: str, type_name: str, syntax: C.MarkerSyntax) -> str:
+    return f"""{syntax.import_object} {type_key};False;{type_name}\n"""
+
+
+def _prompt_import_section(syntax: C.MarkerSyntax) -> str:
+    return f"""
+{syntax.begin} import-section
+{syntax.end}
+"""
+
+
+def _prompt_all_section(syntax: C.MarkerSyntax) -> str:
+    return f"""
+__all__ = [
+    {syntax.begin} __all__
+    {syntax.end}
+]
+"""
+
 
 def _type_suffix_and_record(
     ty_map: dict[str, str],
@@ -249,6 +291,7 @@ def generate_ffi_api(
     object_infos: list[ObjectInfo],
     init_cfg: InitConfig,
     is_root: bool,
+    syntax: C.MarkerSyntax = C.PYTHON_SYNTAX,
 ) -> str:
     """Generate the initial FFI API stub code for a given module."""
     # TODO(@junrus): New code is appended to the end of the file.
@@ -259,20 +302,22 @@ def generate_ffi_api(
     if not code_blocks:
         append += f"""\"\"\"FFI API bindings for {module_name}.\"\"\"\n"""
     if not any(code.kind == "import-section" for code in code_blocks):
-        append += C.PROMPT_IMPORT_SECTION
+        append += _prompt_import_section(syntax)
 
     # Part 1. Library loading
     if is_root:
-        append += C._prompt_import_object("tvm_ffi.libinfo.load_lib_module", "_FFI_LOAD_LIB")
+        append += _prompt_import_object(
+            "tvm_ffi.libinfo.load_lib_module", "_FFI_LOAD_LIB", syntax
+        )
         append += f"""LIB = _FFI_LOAD_LIB("{init_cfg.pkg}", "{init_cfg.shared_target}")\n"""
 
     # Part 2. Global functions
     if not any(code.kind == "global" for code in code_blocks):
-        append += C._prompt_globals(module_name)
+        append += _prompt_globals(module_name, syntax)
 
     # Part 3. Object types
     if object_infos:
-        append += C._prompt_import_object("tvm_ffi.register_object", "_FFI_REG_OBJ")
+        append += _prompt_import_object("tvm_ffi.register_object", "_FFI_REG_OBJ", syntax)
 
     defined_type_keys = {info.type_key for info in object_infos if info.type_key}
     for info in object_infos:
@@ -290,16 +335,17 @@ def generate_ffi_api(
         # Import parent type keys if they are not defined in the current module
         if parent_type_key and parent_type_key not in defined_type_keys:
             parent_type_name = "_" + parent_type_key.replace(".", "_")
-            append += C._prompt_import_object(parent_type_key, parent_type_name)
+            append += _prompt_import_object(parent_type_key, parent_type_name, syntax)
         # Generate class definition
-        append += C._prompt_class_def(
+        append += _prompt_class_def(
             type_name,
             type_key,
             parent_type_name,
+            syntax,
         )
     # Part 4. __all__
     if not any(code.kind == "__all__" for code in code_blocks):
-        append += C.PROMPT_ALL_SECTION
+        append += _prompt_all_section(syntax)
     return append
 
 
@@ -307,11 +353,12 @@ def generate_init(
     code_blocks: list[CodeBlock],
     module_name: str,
     submodule: str = "_ffi_api",
+    syntax: C.MarkerSyntax = C.PYTHON_SYNTAX,
 ) -> str:
     """Generate the `__init__.py` file for the `tvm_ffi` package."""
     code = f"""
-{C.STUB_BEGIN} export/{submodule}
-{C.STUB_END}
+{syntax.begin} export/{submodule}
+{syntax.end}
 """
     if not code_blocks:
         return f"""\"\"\"Package {module_name}.\"\"\"\n""" + code

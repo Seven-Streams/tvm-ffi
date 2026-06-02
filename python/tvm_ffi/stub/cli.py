@@ -65,7 +65,7 @@ def __main__() -> int:
     # - type maps: `tvm-ffi-stubgen(ty-map)`
     # - defined global functions: `tvm-ffi-stubgen(begin): global/...`
     # - defined object types: `tvm-ffi-stubgen(begin): object/...`
-    ty_map: dict[str, str] = C.TY_MAP_DEFAULTS.copy()
+    ty_map: dict[str, str] = backend.default_ty_map()
     for file in files:
         try:
             _stage_1(file, ty_map)
@@ -340,7 +340,7 @@ def _parse_args() -> Options:
         default=4,
         help=(
             "Extra spaces added inside each generated block, relative to the "
-            f"indentation of the corresponding '{C.STUB_BEGIN}' line."
+            "indentation of the corresponding stub 'begin' marker line."
         ),
     )
     parser.add_argument(

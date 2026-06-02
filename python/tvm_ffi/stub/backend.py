@@ -212,13 +212,15 @@ class PythonBackend:
         is_root: bool,
     ) -> str:
         """Return text appended to a scaffolded ``_ffi_api.py``."""
-        return G.generate_ffi_api(code_blocks, ty_map, module_name, object_infos, init_cfg, is_root)
+        return G.generate_ffi_api(
+            code_blocks, ty_map, module_name, object_infos, init_cfg, is_root, self.syntax
+        )
 
     def generate_init_file(
         self, code_blocks: list[CodeBlock], module_name: str, submodule: str
     ) -> str:
         """Return text appended to a scaffolded ``__init__.py``."""
-        return G.generate_init(code_blocks, module_name, submodule)
+        return G.generate_init(code_blocks, module_name, submodule, self.syntax)
 
 
 class RustBackend:
