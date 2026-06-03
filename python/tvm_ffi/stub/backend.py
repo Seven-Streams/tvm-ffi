@@ -181,15 +181,8 @@ class Backend(Protocol):
         ...
 
 
-def _make_python_backend() -> Backend:
-    # Imported lazily to keep the language-agnostic core import-light and to
-    # avoid a hard dependency cycle with the Python backend package.
-
-    return PythonBackend()
-
-
 _BACKENDS: dict[str, Callable[[], Backend]] = {
-    "python": _make_python_backend,
+    "python": PythonBackend,
     "rust": RustBackend,
 }
 
