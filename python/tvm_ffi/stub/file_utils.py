@@ -53,6 +53,7 @@ class CodeBlock:
             "import-object",
             "export",
             "__all__",
+            "helpers",
             None,
         }
 
@@ -96,10 +97,7 @@ class CodeBlock:
         if stub.startswith("global/"):
             kind = "global"
             param = stub[len("global/") :].strip()
-            if "@" in param:
-                param = tuple(param.split("@"))
-            else:
-                param = (param, "")
+            param = tuple(param.split("@")) if "@" in param else (param, "")
         elif stub.startswith("object/"):
             kind = "object"
             param = stub[len("object/") :].strip()
@@ -114,6 +112,9 @@ class CodeBlock:
             param = stub[len("export/") :].strip()
         elif stub == "__all__":
             kind = "__all__"
+            param = ""
+        elif stub == "helpers":
+            kind = "helpers"
             param = ""
         else:
             raise ValueError(f"Unknown stub type `{stub}` at line {lineo}")

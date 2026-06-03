@@ -32,6 +32,8 @@ from . import consts as PC
 from .imports import ImportItem, PythonImports
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from tvm_ffi.core import TypeSchema
 
     from ..file_utils import CodeBlock
@@ -43,6 +45,8 @@ class PythonBackend:
 
     name = "python"
     syntax = C.PYTHON_SYNTAX
+    #: Object blocks live inside a `class` body -> not safely removable wholesale.
+    standalone_object_blocks = False
 
     def default_ty_map(self) -> dict[str, str]:
         """Return the default FFI-origin -> Python-type name map."""
@@ -128,6 +132,9 @@ class PythonBackend:
         """Emit a Python submodule re-export for an ``export/<submodule>`` block."""
         G.generate_python_export(code)
 
+    def generate_helpers_block(self, code: CodeBlock, opt: Options) -> None:
+        """No-op: Python needs no per-file support code (Python files have no helpers block)."""
+
     # --- whole-file scaffolding (used by `--init` mode) ---------------------
 
     def api_filename(self) -> str:
@@ -157,3 +164,6 @@ class PythonBackend:
     ) -> str:
         """Return text appended to a scaffolded ``__init__.py``."""
         return G.generate_python_init(code_blocks, module_name, submodule, self.syntax)
+
+    def finalize_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
+        """No-op: Python packages need no parent-declares-child wiring."""

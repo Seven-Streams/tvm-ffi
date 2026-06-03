@@ -32,7 +32,9 @@ from typing import TYPE_CHECKING
 
 from .. import consts as C
 from .codegen import (
+    finalize_rust_module_tree,
     generate_rust_api_file,
+    generate_rust_helpers,
     generate_rust_import_section,
     generate_rust_init,
     generate_rust_object,
@@ -42,6 +44,8 @@ from .consts import RUST_TY_MAP_DEFAULTS
 from .imports import RustImports, RustUse
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from tvm_ffi.core import TypeSchema
 
     from ..backend import TyRenderer
@@ -62,6 +66,9 @@ class RustBackend:
 
     name = "rust"
     syntax = C.RUST_SYNTAX
+    #: A Rust object block is a self-contained `struct`+`impl` -> safe to delete
+    #: wholesale when its type is no longer registered.
+    standalone_object_blocks = True
 
     def default_ty_map(self) -> dict[str, str]:
         """Return the default FFI-origin -> Rust-type name map."""
@@ -144,6 +151,10 @@ class RustBackend:
     def generate_export_block(self, code: CodeBlock) -> None:
         """No-op for now: submodule re-export is deferred (plan step 7b / layout step 9)."""
 
+    def generate_helpers_block(self, code: CodeBlock, opt: Options) -> None:
+        """Fill the ``helpers`` block with the shared `lookup_type_index`/`get_type_method`."""
+        generate_rust_helpers(code, opt)
+
     def api_filename(self) -> str:
         """One Rust file per module prefix (option A)."""
         return "mod.rs"
@@ -171,3 +182,7 @@ class RustBackend:
     ) -> str:
         """No-op: Rust has no separate package-entry file (option A)."""
         return generate_rust_init(code_blocks, module_name, submodule, self.syntax)
+
+    def finalize_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
+        """Auto-form the module tree: write ``pub mod <child>;`` declarations."""
+        finalize_rust_module_tree(init_path, generated_prefixes)

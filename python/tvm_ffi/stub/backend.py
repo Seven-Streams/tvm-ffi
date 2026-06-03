@@ -48,6 +48,8 @@ from .python_backend import PythonBackend
 from .rust_backend import RustBackend
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from tvm_ffi.core import TypeSchema
 
     from .file_utils import CodeBlock
@@ -79,6 +81,13 @@ class Backend(Protocol):
 
     #: Comment-marker syntax for the files this backend emits.
     syntax: C.MarkerSyntax
+
+    #: Whether an ``object/<key>`` block is a self-contained top-level item that
+    #: can be deleted wholesale (markers included) when its type is no longer
+    #: registered. True for Rust (a ``struct``+``impl`` stands alone); False for
+    #: Python (the block lives inside a ``class`` body, so removing it would leave
+    #: a broken empty class).
+    standalone_object_blocks: bool
 
     def default_ty_map(self) -> dict[str, str]:
         """Return the default FFI-origin -> target-type name map for this language."""
@@ -160,6 +169,14 @@ class Backend(Protocol):
         """Emit a submodule re-export for an ``export/<submodule>`` block."""
         ...
 
+    def generate_helpers_block(self, code: CodeBlock, opt: Options) -> None:
+        """Emit shared per-file support code for a ``helpers`` block.
+
+        Python is a no-op (no support code needed); Rust fills it with the
+        ``lookup_type_index`` / ``get_type_method`` helpers.
+        """
+        ...
+
     # --- whole-file scaffolding (used by `--init` mode) ---------------------
 
     def api_filename(self) -> str:
@@ -186,6 +203,14 @@ class Backend(Protocol):
         self, code_blocks: list[CodeBlock], module_name: str, submodule: str
     ) -> str:
         """Return text appended to a freshly scaffolded package entry (Python ``__init__.py``)."""
+        ...
+
+    def finalize_init(self, init_path: Path, generated_prefixes: set[str]) -> None:
+        """Post-``--init`` hook to stitch the generated tree (after all files exist).
+
+        Python is a no-op (packages need no parent declarations). Rust writes the
+        ``pub mod <child>;`` declarations that wire the module tree together.
+        """
         ...
 
 

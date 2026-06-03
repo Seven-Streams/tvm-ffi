@@ -89,6 +89,7 @@ STUB_BLOCK_KINDS: TypeAlias = Literal[
     "import-object",
     "export",
     "__all__",
+    "helpers",
     None,
 ]
 

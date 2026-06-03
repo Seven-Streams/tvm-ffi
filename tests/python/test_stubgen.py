@@ -25,6 +25,7 @@ from tvm_ffi.stub import consts as C
 from tvm_ffi.stub.backend import Backend, get_backend
 from tvm_ffi.stub.cli import _stage_2, _stage_3
 from tvm_ffi.stub.file_utils import CodeBlock, FileInfo
+from tvm_ffi.stub.python_backend import PythonBackend
 from tvm_ffi.stub.python_backend import consts as PC
 from tvm_ffi.stub.python_backend.codegen import (
     generate_python_all,
@@ -44,6 +45,7 @@ from tvm_ffi.stub.rust_backend.backend import RustBackend
 from tvm_ffi.stub.rust_backend.codegen import (
     UnsupportedTypeError,
     build_ty_render,
+    finalize_rust_module_tree,
     generate_rust_import_section,
     generate_rust_object,
     render_rust_type,
@@ -1096,6 +1098,11 @@ def test_rust_object_root_struct_and_impl() -> None:
     assert "impl Deref for Expr {" in text
     assert "impl DerefMut for Expr {" in text
     # new via __ffi_init__
+    # generated types/functions are `pub` (decision Q2)
+    assert "pub struct ExprObj {" in text
+    assert "pub struct Expr {" in text
+    assert "pub fn new(value: i64) -> Result<Self> {" in text
+    assert "pub fn test() -> Result<i64> {" in text
     assert "fn new(value: i64) -> Result<Self> {" in text
     assert 'let ctor = get_type_method(ExprObj::TYPE_KEY, "__ffi_init__")?;' in text
     assert "let call = into_typed_fn!(ctor, Fn(i64) -> Result<Expr>);" in text
@@ -1338,14 +1345,108 @@ def test_rust_api_file_scaffold() -> None:
         [], {}, "demo", [_expr_info()], InitConfig("p", "l", "demo."), is_root=True
     )
     assert "#![allow(dead_code, unused_imports)]" in text
-    assert "fn lookup_type_index(" in text
-    assert "fn get_type_method(" in text
+    # helpers now live in a marker block (filled by stage_3), not inline
+    assert f"{C.RUST_SYNTAX.begin} helpers" in text
+    assert "fn lookup_type_index(" not in text  # the scaffold only emits the marker
     assert f"{C.RUST_SYNTAX.begin} import-section" in text
     assert f"{C.RUST_SYNTAX.begin} object/cpp_rust_test.Expr" in text
     # no global / __all__ / export markers for Rust
     assert "global/" not in text
     assert "__all__" not in text
     assert "export/" not in text
+
+
+def test_rust_helpers_block_filled() -> None:
+    block = CodeBlock(
+        kind="helpers",
+        param="",
+        lineno_start=1,
+        lineno_end=2,
+        lines=[f"{C.RUST_SYNTAX.begin} helpers", C.RUST_SYNTAX.end],
+    )
+    RustBackend().generate_helpers_block(block, Options())
+    text = "\n".join(block.lines)
+    assert "fn lookup_type_index(type_key: &'static str) -> i32 {" in text
+    assert "fn get_type_method(" in text
+    # idempotent re-fill keeps a single copy
+    RustBackend().generate_helpers_block(block, Options())
+    assert "\n".join(block.lines).count("fn lookup_type_index(") == 1
+
+
+def test_rust_helpers_block_scaffold_added_to_existing_file() -> None:
+    # Regression for #3: a pre-existing (non-empty) file without helpers still
+    # gets a helpers marker appended on --init (not only when brand-new).
+    existing = [
+        CodeBlock(kind=None, param="", lineno_start=1, lineno_end=1, lines=["// hand-written"]),
+    ]
+    text = RustBackend().generate_api_file(
+        existing, {}, "demo", [], InitConfig("p", "l", "demo."), is_root=True
+    )
+    assert f"{C.RUST_SYNTAX.begin} helpers" in text
+    assert "#![allow" not in text  # header only for a brand-new file
+
+
+def test_rust_finalize_module_tree(tmp_path: Path) -> None:
+    # Two sibling binding modules under `a`, plus an intermediate `a` with no types.
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    (tmp_path / "a" / "b" / "mod.rs").write_text("// bindings b\n", encoding="utf-8")
+    (tmp_path / "a" / "c").mkdir(parents=True)
+    (tmp_path / "a" / "c" / "mod.rs").write_text("// bindings c\n", encoding="utf-8")
+
+    finalize_rust_module_tree(tmp_path, {"a.b", "a.c"})
+
+    # root declares the top-level module; `a/mod.rs` (created) declares its children
+    assert "pub mod a;" in (tmp_path / "mod.rs").read_text(encoding="utf-8")
+    a_mod = (tmp_path / "a" / "mod.rs").read_text(encoding="utf-8")
+    assert "pub mod b;" in a_mod and "pub mod c;" in a_mod
+    # leaf binding files are untouched
+    assert "// bindings b" in (tmp_path / "a" / "b" / "mod.rs").read_text(encoding="utf-8")
+
+    # idempotent: re-running adds no duplicates
+    finalize_rust_module_tree(tmp_path, {"a.b", "a.c"})
+    assert (tmp_path / "a" / "mod.rs").read_text(encoding="utf-8").count("pub mod b;") == 1
+
+
+def test_rust_stage3_prunes_stale_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Regression for #5: a block whose type is no longer registered is deleted.
+    rs = tmp_path / "demo.rs"
+    rs.write_text(
+        "\n".join(
+            [
+                f"{C.RUST_SYNTAX.begin} object/demo.Gone",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} object/demo.Kept",
+                C.RUST_SYNTAX.end,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    info = FileInfo.from_file(rs)
+    assert info is not None
+    monkeypatch.setattr(stub_cli, "object_info_from_type_key", lambda key: _expr_info())
+    _stage_3(
+        info,
+        Options(dry_run=True),
+        RC.RUST_TY_MAP_DEFAULTS.copy(),
+        {},
+        backend=RustBackend(),
+        registered_type_keys={"demo.Kept"},  # demo.Gone is stale
+    )
+    text = "\n".join(info.lines)
+    assert "object/demo.Gone" not in text  # stale block removed entirely
+    assert "object/demo.Kept" in text  # surviving block kept + filled
+    assert "struct ExprObj {" in text
+    assert "[Removed] stale object block demo.Gone" in capsys.readouterr().out
+
+
+def test_python_backend_does_not_prune_objects() -> None:
+    # Python object blocks live inside a class body -> must NOT be pruned.
+    assert PythonBackend().standalone_object_blocks is False
+    assert RustBackend().standalone_object_blocks is True
 
 
 def test_rust_global_funcs_block_is_noop() -> None:
