@@ -38,6 +38,7 @@ from tvm_ffi.stub.python_backend.codegen import (
     render_object_methods,
 )
 from tvm_ffi.stub.python_backend.imports import ImportItem
+from tvm_ffi.stub.rust_backend import consts as RC
 from tvm_ffi.stub.utils import (
     FuncInfo,
     InitConfig,
@@ -753,3 +754,68 @@ def test_stage_2_filters_prefix_and_marks_root(
     sub_text = sub_api.read_text(encoding="utf-8")
     assert 'LIB = _FFI_LOAD_LIB("demo-pkg", "demo_shared")' in root_text
     assert "LIB =" not in sub_text
+
+
+# ---------------------------------------------------------------------------
+# Rust backend: constant tables (rust_backend/consts.py)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("origin", "rust"),
+    [
+        # scalars / primitives (type_traits.rs) -- bare, no import
+        ("int", "i64"),
+        ("float", "f64"),
+        ("bool", "bool"),
+        ("None", "()"),
+        ("Optional", "Option"),  # std prelude, no import
+        # core / containers -- fully qualified so `use` can be derived
+        ("str", "tvm_ffi::String"),  # NOT std::string::String
+        ("Any", "tvm_ffi::Any"),
+        ("Callable", "tvm_ffi::Function"),
+        ("Array", "tvm_ffi::Array"),  # crate's own Array<T>, NOT Vec
+        ("Object", "tvm_ffi::Object"),
+        ("Tensor", "tvm_ffi::Tensor"),
+        ("Shape", "tvm_ffi::Shape"),
+        ("Device", "tvm_ffi::DLDevice"),  # dlpack DLDevice, NOT a `Device` type
+        ("dtype", "tvm_ffi::DLDataType"),  # dlpack DLDataType, NOT a `DataType` type
+        ("DataType", "tvm_ffi::DLDataType"),
+        # builtin object type keys
+        ("ffi.String", "tvm_ffi::String"),
+        ("ffi.Bytes", "tvm_ffi::Bytes"),
+        ("ffi.Module", "tvm_ffi::Module"),
+        ("ffi.Error", "tvm_ffi::Error"),
+        ("ffi.Function", "tvm_ffi::Function"),
+    ],
+)
+def test_rust_ty_map_defaults(origin: str, rust: str) -> None:
+    assert RC.RUST_TY_MAP_DEFAULTS[origin] == rust
+
+
+def test_rust_array_is_not_vec() -> None:
+    # Guard against regressing to the (wrong) Vec/HashMap assumption.
+    assert not any("Vec" in v for v in RC.RUST_TY_MAP_DEFAULTS.values())
+    assert not any("HashMap" in v for v in RC.RUST_TY_MAP_DEFAULTS.values())
+
+
+def test_rust_crate_types_are_fully_qualified() -> None:
+    # Non-primitive crate types must carry the `tvm_ffi::` path so the import
+    # collector can emit `use tvm_ffi::...`. Primitives/prelude stay bare.
+    bare_ok = {"i64", "f64", "bool", "()", "Option"}
+    for origin, rust in RC.RUST_TY_MAP_DEFAULTS.items():
+        if rust in bare_ok:
+            assert "::" not in rust, origin
+        else:
+            assert rust.startswith("tvm_ffi::"), (origin, rust)
+
+
+@pytest.mark.parametrize("origin", ["Map", "Dict", "List", "Union"])
+def test_rust_unsupported_origins(origin: str) -> None:
+    assert origin in RC.RUST_UNSUPPORTED_ORIGINS
+    # An unsupported origin must never also have a (bogus) default mapping.
+    assert origin not in RC.RUST_TY_MAP_DEFAULTS
+
+
+def test_rust_mod_map_ffi_to_crate_root() -> None:
+    assert RC.RUST_MOD_MAP["ffi"] == "tvm_ffi"

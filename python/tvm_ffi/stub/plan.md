@@ -48,7 +48,7 @@
 | 结构拆分 | Python 内容 → `python_backend/` | ✅ 已完成 |
 | 结构拆分 | Rust 骨架 → `rust_backend/` | ✅ 已完成（仅骨架） |
 | 测试适配 | `test_stubgen.py` 迁移到新结构 | ✅ 26 passed |
-| §4⑤ | `rust_backend` 常量表（类型/路径/builtin） | ⬜ 待做（P1） |
+| §4⑤ | `rust_backend` 常量表（类型/路径/builtin） | ✅ 已完成（步骤 1） |
 | §4④(Rust) | Rust import 表示（`use` 收集器） | ⬜ 待做（P1） |
 | §4② | `RustBackend.render_type` 类型遍历 + 不支持类型抛异常 | ⬜ 待做（P2） |
 | §4① | `rust_backend/codegen.py`：object 生成（struct+impl）；**global 函数不生成**（决策 5） | ⬜ 待做（P2） |
@@ -104,27 +104,29 @@ stub/                       # 语言无关
   **不能凭空假设**。Rust crate 用自己的 `Array<T>`，且**没有 `Map`/`Dict`/`List`/
   `HashMap`/`Vec` 作为 FFI 类型**。
 - 内容：
-  - `RUST_TY_MAP_DEFAULTS`：FFI origin → Rust 类型名，按下表（已核对 crate）：
+  - `RUST_TY_MAP_DEFAULTS`：FFI origin → Rust 类型，**值带完整 `tvm_ffi::` 路径**
+    （仿 Python map：值=完整路径，便于 `TyRenderer` 按 `::` 拆出 leaf + 推导 `use`）。
+    primitives/`()`/`Option` 无 `::`、无需 import。按下表（已核对 crate）：
 
-    | FFI origin | Rust | 备注 |
+    | FFI origin | Rust 值 | 备注 |
     | --- | --- | --- |
-    | `int` | `i64` | crate 中所有整型都映射到 FFI `int`，默认回填 `i64` |
-    | `float` | `f64` | `f32/f64` → FFI `float`，默认 `f64` |
-    | `bool` | `bool` | |
+    | `int` | `i64` | 所有整型→FFI `int`，默认回填 `i64`；无 import |
+    | `float` | `f64` | `f32/f64`→FFI `float`，默认 `f64`；无 import |
+    | `bool` | `bool` | 无 import |
     | `None` | `()` | crate 用 `()` 表示 None/void |
-    | `Optional` | `Option` | `Option<T>` |
-    | `Any` | `Any` | 另有 `AnyView`（非拥有），按位置可能用引用 |
-    | `Callable` | `Function` | `ffi.Function` |
-    | `Array` | `Array` | **`Array<T>`，不是 `Vec`** |
-    | `Object` | `Object` | |
-    | `Tensor` | `Tensor` | `ffi.Tensor` |
-    | `Shape` | `Shape` | `ffi.Shape` |
-    | `Device` | `Device` | type_str = `"Device"` |
-    | `dtype` / `DataType` | `DataType` | dtype.rs，type_str = `"DataType"` |
-    | `ffi.String` | `String` | `tvm_ffi::String`（注意与 std 区分） |
-    | `ffi.Bytes` | `Bytes` | |
-    | `ffi.Module` | `Module` | |
-    | `ffi.Error` | `Error` | |
+    | `Optional` | `Option` | std prelude，`Option<T>`，无 import |
+    | `Any` | `tvm_ffi::Any` | 另有 `AnyView`（非拥有），按位置可能用引用 |
+    | `Callable` | `tvm_ffi::Function` | |
+    | `Array` | `tvm_ffi::Array` | **`Array<T>`，不是 `Vec`** |
+    | `Object` | `tvm_ffi::Object` | |
+    | `Tensor` | `tvm_ffi::Tensor` | |
+    | `Shape` | `tvm_ffi::Shape` | |
+    | `Device` | `tvm_ffi::DLDevice` | dlpack `DLDevice`（crate 根再导出）；FFI type_str = `"Device"` |
+    | `dtype` / `DataType` | `tvm_ffi::DLDataType` | dlpack `DLDataType` + `DLDataTypeExt` |
+    | `str` / `ffi.String` | `tvm_ffi::String` | 避免撞 `std::string::String` |
+    | `ffi.Bytes` | `tvm_ffi::Bytes` | |
+    | `ffi.Module` | `tvm_ffi::Module` | |
+    | `ffi.Error` | `tvm_ffi::Error` | |
 
   - `RUST_UNSUPPORTED_ORIGINS`：**crate 不支持**的 origin 集合 —— `Map`、`Dict`、
     `List`、`Union`。`render_type` 命中即抛**哨兵异常 `UnsupportedTypeError`**
