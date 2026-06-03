@@ -35,16 +35,17 @@ asks the backend to create one, seed it from ``import-object`` directives, and
 later render it, but never reaches inside. Adding a language is therefore
 "implement one more :class:`Backend`" rather than forking the pipeline.
 
-The Python backend lives in :mod:`.python_backend`. :class:`RustBackend` is a
-skeleton marking the work still to be done.
+The Python backend lives in :mod:`.python_backend`; the Rust backend lives in
+:mod:`.rust_backend` (currently a skeleton marking the work still to be done).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
 from . import consts as C
 from .python_backend import PythonBackend
+from .rust_backend import RustBackend
 
 if TYPE_CHECKING:
     from tvm_ffi.core import TypeSchema
@@ -178,103 +179,6 @@ class Backend(Protocol):
     ) -> str:
         """Return text appended to a freshly scaffolded package entry (Python ``__init__.py``)."""
         ...
-
-
-class RustBackend:
-    """Backend that emits Rust binding stubs.
-
-    Skeleton only — the method bodies that need a Rust implementation raise
-    :class:`NotImplementedError`. Per the design decisions on this branch:
-
-    * ``Union[...]`` rendering is *not* supported and must raise a clear error.
-    * imports are modelled separately from Python (a Rust ``use`` collector).
-    """
-
-    name = "rust"
-    syntax = C.RUST_SYNTAX
-
-    #: TODO(rust): replace with the real FFI-origin -> Rust-type name map.
-    _DEFAULT_TY_MAP: ClassVar[dict[str, str]] = {}
-
-    def default_ty_map(self) -> dict[str, str]:
-        """Return the default FFI-origin -> Rust-type name map."""
-        return dict(self._DEFAULT_TY_MAP)
-
-    def render_type(self, schema: TypeSchema, ty_render: TyRenderer) -> str:
-        """Render a type schema as a Rust type expression. TODO(rust)."""
-        raise NotImplementedError("RustBackend.render_type: implement Rust type rendering")
-
-    def new_imports(self) -> Any:
-        """Create a Rust ``use`` collector. TODO(rust)."""
-        raise NotImplementedError("RustBackend.new_imports")
-
-    def add_imported_object(
-        self, imports: Any, name: str, type_checking_only: str, alias: str
-    ) -> None:
-        """Record an ``import-object`` directive into the Rust collector. TODO(rust)."""
-        raise NotImplementedError("RustBackend.add_imported_object")
-
-    def canonical_type_name(self, type_key: str) -> str:
-        """Return the canonical Rust path for a defined type key. TODO(rust)."""
-        raise NotImplementedError("RustBackend.canonical_type_name")
-
-    def extra_export_names(self, imports: Any) -> set[str]:
-        """Return extra Rust re-export names implied by the imports. TODO(rust)."""
-        raise NotImplementedError("RustBackend.extra_export_names")
-
-    def generate_global_funcs_block(
-        self,
-        code: CodeBlock,
-        global_funcs: list[FuncInfo],
-        ty_map: dict[str, str],
-        imports: Any,
-        opt: Options,
-    ) -> None:
-        """Emit Rust function signatures for a ``global/<prefix>`` block. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_global_funcs_block")
-
-    def generate_object_block(
-        self,
-        code: CodeBlock,
-        ty_map: dict[str, str],
-        imports: Any,
-        opt: Options,
-        obj_info: ObjectInfo,
-    ) -> None:
-        """Emit a Rust ``struct``/``impl`` for an ``object/<key>`` block. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_object_block")
-
-    def generate_import_section_block(
-        self, code: CodeBlock, imports: Any, opt: Options, defined_types: set[str]
-    ) -> None:
-        """Emit Rust ``use`` statements for the collected imports. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_import_section_block")
-
-    def generate_all_block(self, code: CodeBlock, names: set[str], opt: Options) -> None:
-        """Emit Rust public re-exports. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_all_block")
-
-    def generate_export_block(self, code: CodeBlock) -> None:
-        """Emit a Rust submodule re-export for an ``export/<submodule>`` block. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_export_block")
-
-    def generate_api_file(
-        self,
-        code_blocks: list[CodeBlock],
-        ty_map: dict[str, str],
-        module_name: str,
-        object_infos: list[ObjectInfo],
-        init_cfg: InitConfig,
-        is_root: bool,
-    ) -> str:
-        """Return text appended to a scaffolded Rust API module. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_api_file")
-
-    def generate_init_file(
-        self, code_blocks: list[CodeBlock], module_name: str, submodule: str
-    ) -> str:
-        """Return text appended to a scaffolded Rust module entry. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_init_file")
 
 
 def _make_python_backend() -> Backend:
