@@ -23,7 +23,8 @@ import tvm_ffi.stub.cli as stub_cli
 from tvm_ffi.core import TypeSchema
 from tvm_ffi.stub import consts as C
 from tvm_ffi.stub.cli import _stage_2, _stage_3
-from tvm_ffi.stub.codegen import (
+from tvm_ffi.stub.file_utils import CodeBlock, FileInfo
+from tvm_ffi.stub.python.codegen import (
     generate_python_all,
     generate_python_export,
     generate_python_ffi_api,
@@ -32,7 +33,6 @@ from tvm_ffi.stub.codegen import (
     generate_python_init,
     generate_python_object,
 )
-from tvm_ffi.stub.file_utils import CodeBlock, FileInfo
 from tvm_ffi.stub.utils import (
     FuncInfo,
     ImportItem,
