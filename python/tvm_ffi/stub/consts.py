@@ -105,25 +105,9 @@ TERM_WHITE = "\033[37m"
 DOC_URL = "https://tvm.apache.org/ffi/packaging/stubgen.html"
 
 DEFAULT_SOURCE_EXTS = set(SYNTAX_BY_EXT)
-TY_MAP_DEFAULTS = {
-    "Any": "typing.Any",
-    "Callable": "typing.Callable",
-    "Array": "collections.abc.Sequence",
-    "List": "collections.abc.MutableSequence",
-    "Map": "collections.abc.Mapping",
-    "Dict": "collections.abc.MutableMapping",
-    "Object": "ffi.Object",
-    "Tensor": "ffi.Tensor",
-    "dtype": "ffi.dtype",
-    "Device": "ffi.Device",
-}
 
-# TODO(@junrushao): Make it configurable
-MOD_MAP = {
-    "testing": "tvm_ffi.testing",
-    "ffi": "tvm_ffi",
-}
-
+# Language-neutral metadata transform applied while building `ObjectInfo` from
+# the FFI reflection registry (see `utils.ObjectInfo.from_type_info`).
 FN_NAME_MAP: dict[str, str] = {}
 
 BUILTIN_TYPE_KEYS = {

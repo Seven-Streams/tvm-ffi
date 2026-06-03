@@ -24,38 +24,37 @@ The stub generator separates two concerns:
    :class:`.utils.FuncInfo`). None of this knows or cares about the target
    language.
 2. *Language-specific* rendering — turning that metadata into concrete source
-   text (Python ``def``/``class`` vs Rust ``fn``/``struct``/``impl``) and
-   rendering a :class:`~tvm_ffi.core.TypeSchema` into a target-language type
-   expression (``T | None`` vs ``Option<T>``).
+   text (Python ``def``/``class`` vs Rust ``fn``/``struct``/``impl``), rendering
+   a :class:`~tvm_ffi.core.TypeSchema` into a target-language type expression
+   (``T | None`` vs ``Option<T>``), and modelling that language's imports.
 
-A :class:`Backend` encapsulates concern (2). ``cli.py`` drives concern (1) and
-delegates every act of emitting text to the active backend. Adding Rust support
-is therefore "implement one more :class:`Backend`" rather than forking the
-pipeline.
+A :class:`Backend` encapsulates concern (2); ``cli.py`` drives concern (1) and
+delegates every act of emitting text — and every act of collecting imports — to
+the active backend. The import collector is opaque to the pipeline: ``cli.py``
+asks the backend to create one, seed it from ``import-object`` directives, and
+later render it, but never reaches inside. Adding a language is therefore
+"implement one more :class:`Backend`" rather than forking the pipeline.
 
-Status: this is a *draft* seam. The Python path still calls :mod:`.codegen`
-directly; :class:`PythonBackend` wraps those functions so the interface is
-exercised and verifiable, but ``cli.py`` is not yet rewired to go through a
-backend. :class:`RustBackend` is a skeleton marking the work to be done.
+The Python backend lives in :mod:`.python_backend`. :class:`RustBackend` is a
+skeleton marking the work still to be done.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, ClassVar, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Protocol, runtime_checkable
 
-from . import codegen as G
 from . import consts as C
+from .python_backend import PythonBackend
 
 if TYPE_CHECKING:
     from tvm_ffi.core import TypeSchema
 
     from .file_utils import CodeBlock
-    from .utils import FuncInfo, ImportItem, InitConfig, ObjectInfo, Options
+    from .utils import FuncInfo, InitConfig, ObjectInfo, Options
 
 #: A per-render type mapper: given an FFI origin name (e.g. ``"Array"``), return
 #: the rendered target-language name and, as a side effect, record any import it
-#: requires. Backends build one of these per block (see
-#: ``codegen._type_suffix_and_record`` for the Python implementation).
+#: requires. Backends build one of these per block.
 TyRenderer = Callable[[str], str]
 
 
@@ -68,6 +67,10 @@ class Backend(Protocol):
     ``*_file`` methods return whole-file scaffolding text used by ``--init``
     mode. Implementations must be stateless with respect to a single file so the
     pipeline can process files in any order.
+
+    The ``imports`` parameter threaded through the ``_block`` methods is an
+    opaque import collector created by :meth:`new_imports`; only the backend
+    that created it understands its contents.
     """
 
     #: Short identifier, e.g. ``"python"`` or ``"rust"``.
@@ -89,6 +92,31 @@ class Backend(Protocol):
         """
         ...
 
+    # --- import collection (representation is backend-private) --------------
+
+    def new_imports(self) -> Any:
+        """Create a fresh, empty import collector for one file."""
+        ...
+
+    def add_imported_object(
+        self, imports: Any, name: str, type_checking_only: str, alias: str
+    ) -> None:
+        """Record an ``import-object`` directive (raw directive fields) into ``imports``."""
+        ...
+
+    def canonical_type_name(self, type_key: str) -> str:
+        """Return the canonical identifier for a locally-defined type key.
+
+        Used to suppress importing a type the file itself defines, and to feed
+        the public-export list. Must be comparable to the names produced while
+        collecting imports.
+        """
+        ...
+
+    def extra_export_names(self, imports: Any) -> set[str]:
+        """Return extra public-export names implied by the collected imports."""
+        ...
+
     # --- per-block generation (mutates `code.lines`) ------------------------
 
     def generate_global_funcs_block(
@@ -96,7 +124,7 @@ class Backend(Protocol):
         code: CodeBlock,
         global_funcs: list[FuncInfo],
         ty_map: dict[str, str],
-        imports: list[ImportItem],
+        imports: Any,
         opt: Options,
     ) -> None:
         """Emit free function signatures for a ``global/<prefix>`` block."""
@@ -106,7 +134,7 @@ class Backend(Protocol):
         self,
         code: CodeBlock,
         ty_map: dict[str, str],
-        imports: list[ImportItem],
+        imports: Any,
         opt: Options,
         obj_info: ObjectInfo,
     ) -> None:
@@ -114,9 +142,13 @@ class Backend(Protocol):
         ...
 
     def generate_import_section_block(
-        self, code: CodeBlock, imports: list[ImportItem], opt: Options
+        self, code: CodeBlock, imports: Any, opt: Options, defined_types: set[str]
     ) -> None:
-        """Emit the import/`use` statements collected while rendering other blocks."""
+        """Emit the import/`use` statements collected while rendering other blocks.
+
+        ``defined_types`` holds the canonical names defined in this file so the
+        backend can drop imports that would shadow a local definition.
+        """
         ...
 
     def generate_all_block(self, code: CodeBlock, names: set[str], opt: Options) -> None:
@@ -148,96 +180,14 @@ class Backend(Protocol):
         ...
 
 
-class PythonBackend:
-    """Backend that emits Python type stubs by delegating to :mod:`.codegen`.
-
-    This is a thin adapter over the existing functions so the new interface is
-    backed by the proven Python implementation. Behaviour is unchanged.
-    """
-
-    name = "python"
-    syntax = C.PYTHON_SYNTAX
-
-    def default_ty_map(self) -> dict[str, str]:
-        """Return the default FFI-origin -> Python-type name map."""
-        return C.TY_MAP_DEFAULTS.copy()
-
-    def render_type(self, schema: TypeSchema, ty_render: TyRenderer) -> str:
-        """Render a type schema using Python typing syntax (delegates to `TypeSchema.repr`)."""
-        return schema.repr(ty_render)
-
-    def generate_global_funcs_block(
-        self,
-        code: CodeBlock,
-        global_funcs: list[FuncInfo],
-        ty_map: dict[str, str],
-        imports: list[ImportItem],
-        opt: Options,
-    ) -> None:
-        """Emit Python free-function signatures for a ``global/<prefix>`` block."""
-        G.generate_python_global_funcs(code, global_funcs, ty_map, imports, opt, self.render_type)
-
-    def generate_object_block(
-        self,
-        code: CodeBlock,
-        ty_map: dict[str, str],
-        imports: list[ImportItem],
-        opt: Options,
-        obj_info: ObjectInfo,
-    ) -> None:
-        """Emit a Python class definition for an ``object/<key>`` block."""
-        G.generate_python_object(code, ty_map, imports, opt, obj_info, self.render_type)
-
-    def generate_import_section_block(
-        self, code: CodeBlock, imports: list[ImportItem], opt: Options
-    ) -> None:
-        """Emit Python ``import`` statements for the collected imports."""
-        G.generate_python_import_section(code, imports, opt)
-
-    def generate_all_block(self, code: CodeBlock, names: set[str], opt: Options) -> None:
-        """Emit a Python ``__all__`` list."""
-        G.generate_python_all(code, names, opt)
-
-    def generate_export_block(self, code: CodeBlock) -> None:
-        """Emit a Python submodule re-export for an ``export/<submodule>`` block."""
-        G.generate_python_export(code)
-
-    def generate_api_file(
-        self,
-        code_blocks: list[CodeBlock],
-        ty_map: dict[str, str],
-        module_name: str,
-        object_infos: list[ObjectInfo],
-        init_cfg: InitConfig,
-        is_root: bool,
-    ) -> str:
-        """Return text appended to a scaffolded ``_ffi_api.py``."""
-        return G.generate_python_ffi_api(
-            code_blocks, ty_map, module_name, object_infos, init_cfg, is_root, self.syntax
-        )
-
-    def generate_init_file(
-        self, code_blocks: list[CodeBlock], module_name: str, submodule: str
-    ) -> str:
-        """Return text appended to a scaffolded ``__init__.py``."""
-        return G.generate_python_init(code_blocks, module_name, submodule, self.syntax)
-
-
 class RustBackend:
     """Backend that emits Rust binding stubs.
 
-    Skeleton only. The seams that need a Rust implementation are marked below.
-    A reasonable starting point for :meth:`render_type` is a recursive walk that
-    maps well-known FFI origins to Rust constructs::
+    Skeleton only — the method bodies that need a Rust implementation raise
+    :class:`NotImplementedError`. Per the design decisions on this branch:
 
-        Optional[T]   -> Option<T>
-        Array[T]      -> Vec<T>            (or &[T])
-        Map[K, V]     -> HashMap<K, V>
-        Callable[A]R  -> Function          (no direct generic-fn stub)
-        Union[...]    -> (needs a policy: enum / Any-equivalent)
-
-    and falls back to ``ty_render(origin)`` for leaf/object types so imports
-    (``use`` paths) are recorded the same way the Python backend records them.
+    * ``Union[...]`` rendering is *not* supported and must raise a clear error.
+    * imports are modelled separately from Python (a Rust ``use`` collector).
     """
 
     name = "rust"
@@ -254,12 +204,30 @@ class RustBackend:
         """Render a type schema as a Rust type expression. TODO(rust)."""
         raise NotImplementedError("RustBackend.render_type: implement Rust type rendering")
 
+    def new_imports(self) -> Any:
+        """Create a Rust ``use`` collector. TODO(rust)."""
+        raise NotImplementedError("RustBackend.new_imports")
+
+    def add_imported_object(
+        self, imports: Any, name: str, type_checking_only: str, alias: str
+    ) -> None:
+        """Record an ``import-object`` directive into the Rust collector. TODO(rust)."""
+        raise NotImplementedError("RustBackend.add_imported_object")
+
+    def canonical_type_name(self, type_key: str) -> str:
+        """Return the canonical Rust path for a defined type key. TODO(rust)."""
+        raise NotImplementedError("RustBackend.canonical_type_name")
+
+    def extra_export_names(self, imports: Any) -> set[str]:
+        """Return extra Rust re-export names implied by the imports. TODO(rust)."""
+        raise NotImplementedError("RustBackend.extra_export_names")
+
     def generate_global_funcs_block(
         self,
         code: CodeBlock,
         global_funcs: list[FuncInfo],
         ty_map: dict[str, str],
-        imports: list[ImportItem],
+        imports: Any,
         opt: Options,
     ) -> None:
         """Emit Rust function signatures for a ``global/<prefix>`` block. TODO(rust)."""
@@ -269,7 +237,7 @@ class RustBackend:
         self,
         code: CodeBlock,
         ty_map: dict[str, str],
-        imports: list[ImportItem],
+        imports: Any,
         opt: Options,
         obj_info: ObjectInfo,
     ) -> None:
@@ -277,7 +245,7 @@ class RustBackend:
         raise NotImplementedError("RustBackend.generate_object_block")
 
     def generate_import_section_block(
-        self, code: CodeBlock, imports: list[ImportItem], opt: Options
+        self, code: CodeBlock, imports: Any, opt: Options, defined_types: set[str]
     ) -> None:
         """Emit Rust ``use`` statements for the collected imports. TODO(rust)."""
         raise NotImplementedError("RustBackend.generate_import_section_block")
@@ -309,8 +277,15 @@ class RustBackend:
         raise NotImplementedError("RustBackend.generate_init_file")
 
 
+def _make_python_backend() -> Backend:
+    # Imported lazily to keep the language-agnostic core import-light and to
+    # avoid a hard dependency cycle with the Python backend package.
+
+    return PythonBackend()
+
+
 _BACKENDS: dict[str, Callable[[], Backend]] = {
-    "python": PythonBackend,
+    "python": _make_python_backend,
     "rust": RustBackend,
 }
 

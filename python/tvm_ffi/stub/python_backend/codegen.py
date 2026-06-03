@@ -14,15 +14,237 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Code generation logic for the `tvm-ffi-stubgen` tool."""
+"""Python code generation for the ``tvm-ffi-stubgen`` tool.
+
+This module owns every act of turning language-agnostic FFI metadata
+(:class:`tvm_ffi.stub.utils.FuncInfo` / :class:`~tvm_ffi.stub.utils.ObjectInfo`)
+into concrete Python source text. The metadata dataclasses themselves carry no
+rendering logic; the ``render_*`` helpers below do, so a different backend can
+render the same data into a different language.
+"""
 
 from __future__ import annotations
 
+from io import StringIO
 from typing import Callable
 
-from . import consts as C
-from .file_utils import CodeBlock
-from .utils import FuncInfo, ImportItem, InitConfig, ObjectInfo, Options, RenderType
+from .. import consts as C
+from ..file_utils import CodeBlock
+from ..utils import FuncInfo, InitConfig, ObjectInfo, Options
+from .imports import ImportItem
+
+#: Renders a :class:`~tvm_ffi.core.TypeSchema` into a Python type expression.
+#: The second argument is the per-block leaf-name mapper (records imports as a
+#: side effect). ``None`` means "use the built-in Python rendering"
+#: (:meth:`TypeSchema.repr`).
+RenderType = Callable[..., str]
+
+
+def _bind_render(
+    render_type: RenderType | None, ty_map: Callable[[str], str]
+) -> Callable[..., str]:
+    """Bind a `RenderType` (or the Python default) to a leaf-name mapper."""
+    if render_type is None:
+        return lambda schema: schema.repr(ty_map)
+    return lambda schema: render_type(schema, ty_map)
+
+
+# --- metadata -> Python text rendering --------------------------------------
+# These were previously methods on FuncInfo/ObjectInfo. They live here so the
+# data classes stay language-agnostic (plan "a").
+
+
+def render_func_signature(
+    func: FuncInfo,
+    ty_map: Callable[[str], str],
+    indent: int,
+    render_type: RenderType | None = None,
+) -> str:
+    """Render a function signature string for ``func``."""
+    render = _bind_render(render_type, ty_map)
+    try:
+        _, func_name = func.schema.name.rsplit(".", 1)
+    except ValueError:
+        func_name = func.schema.name
+    buf = StringIO()
+    buf.write(" " * indent)
+    buf.write(f"def {func_name}(")
+    if func.schema.origin != "Callable":
+        raise ValueError(f"Expected Callable type schema, but got: {func.schema}")
+    if not func.schema.args:
+        ty_map("Any")
+        buf.write("*args: Any) -> Any: ...")
+        return buf.getvalue()
+    arg_ret = func.schema.args[0]
+    arg_args = func.schema.args[1:]
+    for i, arg in enumerate(arg_args):
+        if func.is_member and i == 0:
+            buf.write("self, ")
+        else:
+            buf.write(f"_{i}: ")
+            buf.write(render(arg))
+            buf.write(", ")
+    if arg_args:
+        buf.write("/")
+    buf.write(") -> ")
+    buf.write(render(arg_ret))
+    buf.write(": ...")
+    return buf.getvalue()
+
+
+def render_object_fields(
+    info: ObjectInfo,
+    ty_map: Callable[[str], str],
+    indent: int,
+    render_type: RenderType | None = None,
+) -> list[str]:
+    """Render field definitions for ``info``."""
+    indent_str = " " * indent
+    render = _bind_render(render_type, ty_map)
+    return [f"{indent_str}{field.name}: {render(field)}" for field in info.fields]
+
+
+def render_object_methods(
+    info: ObjectInfo,
+    ty_map: Callable[[str], str],
+    indent: int,
+    render_type: RenderType | None = None,
+) -> list[str]:
+    """Render method definitions for ``info``."""
+    indent_str = " " * indent
+    ret = []
+    for method in info.methods:
+        func_name = method.schema.name.rsplit(".", 1)[-1]
+        if func_name == "__ffi_init__":
+            # __ffi_init__ is installed as an instance method (self, *args, **kwargs) -> None
+            # by _install_ffi_init_attr, regardless of the C++ static registration.
+            ret.append(_render_ffi_init_from_method(method, ty_map, indent, render_type))
+            continue
+        if not method.is_member:
+            ret.append(f"{indent_str}@staticmethod")
+        ret.append(render_func_signature(method, ty_map, indent, render_type))
+    return ret
+
+
+def _render_ffi_init_from_method(
+    method: FuncInfo,
+    ty_map: Callable[[str], str],
+    indent: int,
+    render_type: RenderType | None = None,
+) -> str:
+    """Render ``__ffi_init__`` TypeMethod as an instance method returning None."""
+    indent_str = " " * indent
+    render = _bind_render(render_type, ty_map)
+    schema = method.schema
+    # Subclass __ffi_init__ signatures legitimately differ from the parent
+    # (different fields → different constructor params), so suppress LSP.
+    ignore = "  # ty: ignore[invalid-method-override]"
+    if schema.origin != "Callable" or not schema.args:
+        ty_map("Any")
+        return f"{indent_str}def __ffi_init__(self, *args: Any) -> None: ...{ignore}"
+    # schema.args[0] is return type, schema.args[1:] are param types.
+    parts: list[str] = []
+    for i, arg in enumerate(schema.args[1:]):
+        parts.append(f"_{i}: {render(arg)}")
+    if parts:
+        params = ", ".join(parts)
+        return f"{indent_str}def __ffi_init__(self, {params}, /) -> None: ...{ignore}"
+    return f"{indent_str}def __ffi_init__(self) -> None: ...{ignore}"
+
+
+def render_object_ffi_init(
+    info: ObjectInfo,
+    ty_map: Callable[[str], str],
+    indent: int,
+    render_type: RenderType | None = None,
+) -> list[str]:
+    """Render a ``__ffi_init__`` stub when it's not already in TypeMethod.
+
+    For types whose ``__ffi_init__`` is auto-generated by ``RegisterFFIInit``
+    (TypeAttrColumn only), synthesize a static-method stub from field metadata.
+    Types that already have ``__ffi_init__`` in TypeMethod (from explicit
+    ``refl::init<>``) get it via ``render_object_methods`` instead.
+    """
+    if not info.has_init:
+        return []
+    # If __ffi_init__ is already in methods (from TypeMethod), methods render it.
+    if any(m.schema.name.rsplit(".", 1)[-1] == "__ffi_init__" for m in info.methods):
+        return []
+    return _render_ffi_init_from_fields(info, ty_map, indent, render_type)
+
+
+def render_object_init(
+    info: ObjectInfo,
+    ty_map: Callable[[str], str],
+    indent: int,
+    render_type: RenderType | None = None,
+) -> list[str]:
+    """Render an ``__init__`` stub from init-eligible field metadata."""
+    if not info.has_init:
+        return []
+    return _render_init_from_fields(info, ty_map, indent, render_type)
+
+
+def _format_field_params(
+    info: ObjectInfo,
+    ty_map: Callable[[str], str],
+    render_type: RenderType | None = None,
+) -> str:
+    """Format init-eligible fields as a parameter string with defaults and kw_only."""
+    render = _bind_render(render_type, ty_map)
+    positional = [f for f in info.init_fields if not f.kw_only]
+    kw_only = [f for f in info.init_fields if f.kw_only]
+
+    pos_required = [f for f in positional if not f.has_default]
+    pos_default = [f for f in positional if f.has_default]
+    kw_required = [f for f in kw_only if not f.has_default]
+    kw_default = [f for f in kw_only if f.has_default]
+
+    parts: list[str] = []
+    for f in pos_required:
+        parts.append(f"{f.name}: {render(f.schema)}")
+    for f in pos_default:
+        parts.append(f"{f.name}: {render(f.schema)} = ...")
+    if kw_required or kw_default:
+        parts.append("*")
+        for f in kw_required:
+            parts.append(f"{f.name}: {render(f.schema)}")
+        for f in kw_default:
+            parts.append(f"{f.name}: {render(f.schema)} = ...")
+
+    return ", ".join(parts)
+
+
+def _render_init_from_fields(
+    info: ObjectInfo,
+    ty_map: Callable[[str], str],
+    indent: int,
+    render_type: RenderType | None = None,
+) -> list[str]:
+    """Render ``__init__`` from init-eligible field metadata (auto-generated init)."""
+    indent_str = " " * indent
+    params = _format_field_params(info, ty_map, render_type)
+    if params:
+        return [f"{indent_str}def __init__(self, {params}) -> None: ..."]
+    return [f"{indent_str}def __init__(self) -> None: ..."]
+
+
+def _render_ffi_init_from_fields(
+    info: ObjectInfo,
+    ty_map: Callable[[str], str],
+    indent: int,
+    render_type: RenderType | None = None,
+) -> list[str]:
+    """Render ``__ffi_init__`` stub from field metadata for auto-generated init."""
+    indent_str = " " * indent
+    # Subclass __ffi_init__ signatures legitimately differ from the parent
+    # (different fields → different constructor params), so suppress LSP.
+    ignore = "  # ty: ignore[invalid-method-override]"
+    params = _format_field_params(info, ty_map, render_type)
+    if params:
+        return [f"{indent_str}def __ffi_init__(self, {params}) -> None: ...{ignore}"]
+    return [f"{indent_str}def __ffi_init__(self) -> None: ...{ignore}"]
+
 
 # --- Python scaffolding templates (init mode) -------------------------------
 # These emit Python source plus stub-directive markers. The marker comment token
@@ -126,7 +348,7 @@ def generate_python_global_funcs(
         "# fmt: off",
         f'_FFI_INIT_FUNC("{prefix}", __name__)',
         "if TYPE_CHECKING:",
-        *[func.gen(fn_ty_map, opt.indent, render_type) for func in global_funcs],
+        *[render_func_signature(func, fn_ty_map, opt.indent, render_type) for func in global_funcs],
         "# fmt: on",
     ]
     indent = " " * code.indent
@@ -153,12 +375,12 @@ def generate_python_object(
     info = obj_info
     method_names = {m.schema.name.rsplit(".", 1)[-1] for m in info.methods}
     fn_ty_map = _type_suffix_and_record(ty_map, imports, func_names=method_names)
-    init_lines = info.gen_init(fn_ty_map, opt.indent, render_type)
-    ffi_init_lines = info.gen_ffi_init(fn_ty_map, opt.indent, render_type)
+    init_lines = render_object_init(info, fn_ty_map, opt.indent, render_type)
+    ffi_init_lines = render_object_ffi_init(info, fn_ty_map, opt.indent, render_type)
     type_checking_lines = [
         *init_lines,
         *ffi_init_lines,
-        *info.gen_methods(fn_ty_map, opt.indent, render_type),
+        *render_object_methods(info, fn_ty_map, opt.indent, render_type),
     ]
     if type_checking_lines:
         imports.append(
@@ -169,7 +391,7 @@ def generate_python_object(
         )
         results = [
             "# fmt: off",
-            *info.gen_fields(fn_ty_map, 0, render_type),
+            *render_object_fields(info, fn_ty_map, 0, render_type),
             "if TYPE_CHECKING:",
             *type_checking_lines,
             "# fmt: on",
@@ -177,7 +399,7 @@ def generate_python_object(
     else:
         results = [
             "# fmt: off",
-            *info.gen_fields(fn_ty_map, 0, render_type),
+            *render_object_fields(info, fn_ty_map, 0, render_type),
             "# fmt: on",
         ]
     indent = " " * code.indent
@@ -363,13 +585,3 @@ def generate_python_init(
     if not any(code.kind == "export" for code in code_blocks):
         return code
     return ""
-
-
-# Backward-compatible aliases while callers migrate to backend-specific names.
-generate_global_funcs = generate_python_global_funcs
-generate_object = generate_python_object
-generate_import_section = generate_python_import_section
-generate_all = generate_python_all
-generate_export = generate_python_export
-generate_ffi_api = generate_python_ffi_api
-generate_init = generate_python_init

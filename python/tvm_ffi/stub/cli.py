@@ -35,7 +35,7 @@ from .lib_state import (
     object_info_from_type_key,
     toposort_objects,
 )
-from .utils import FuncInfo, ImportItem, InitConfig, Options
+from .utils import FuncInfo, InitConfig, Options
 
 if TYPE_CHECKING:
     from .backend import Backend
@@ -206,25 +206,12 @@ def _stage_3(  # noqa: PLR0912
         backend = get_backend("python")
     defined_funcs: set[str] = set()
     defined_types: set[str] = set()
-    imports: list[ImportItem] = []
-    ffi_load_lib_imported = False
+    imports = backend.new_imports()
     # Stage 1. Collect `tvm-ffi-stubgen(import-object): ...`
     for code in file.code_blocks:
         if code.kind == "import-object":
             name, type_checking_only, alias = code.param
-            imports.append(
-                ImportItem(
-                    name,
-                    type_checking_only=(
-                        bool(type_checking_only)
-                        and isinstance(type_checking_only, str)
-                        and type_checking_only.lower() == "true"
-                    ),
-                    alias=alias if alias else None,
-                )
-            )
-            if (alias and alias == "_FFI_LOAD_LIB") or name.endswith("libinfo.load_lib_module"):
-                ffi_load_lib_imported = True
+            backend.add_imported_object(imports, name, type_checking_only, alias)
     # Stage 2. Process `tvm-ffi-stubgen(begin): global/...`
     for code in file.code_blocks:
         if code.kind == "global":
@@ -239,21 +226,17 @@ def _stage_3(  # noqa: PLR0912
             assert isinstance(type_key, str)
             obj_info = object_info_from_type_key(type_key)
             type_key = ty_map.get(type_key, type_key)
-            full_name = ImportItem(type_key).full_name
-            defined_types.add(full_name)
+            defined_types.add(backend.canonical_type_name(type_key))
             backend.generate_object_block(code, ty_map, imports, opt, obj_info)
     # Stage 4. Add imports for used types.
-    imports = [i for i in imports if i.full_name not in defined_types]
     for code in file.code_blocks:
         if code.kind == "import-section":
-            backend.generate_import_section_block(code, imports, opt)
+            backend.generate_import_section_block(code, imports, opt, defined_types)
             break  # Only one import block per file is supported for now.
     # Stage 5. Add `__all__` for defined classes and functions.
     for code in file.code_blocks:
         if code.kind == "__all__":
-            export_names = defined_funcs | defined_types
-            if ffi_load_lib_imported:
-                export_names = export_names | {"LIB"}
+            export_names = defined_funcs | defined_types | backend.extra_export_names(imports)
             backend.generate_all_block(code, export_names, opt)
             break  # Only one __all__ block per file is supported for now.
     # Stage 6. Process `tvm-ffi-stubgen(begin): export/...`

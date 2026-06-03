@@ -23,7 +23,9 @@ import tvm_ffi.stub.cli as stub_cli
 from tvm_ffi.core import TypeSchema
 from tvm_ffi.stub import consts as C
 from tvm_ffi.stub.cli import _stage_2, _stage_3
-from tvm_ffi.stub.codegen import (
+from tvm_ffi.stub.file_utils import CodeBlock, FileInfo
+from tvm_ffi.stub.python_backend import consts as PC
+from tvm_ffi.stub.python_backend.codegen import (
     generate_python_all,
     generate_python_export,
     generate_python_ffi_api,
@@ -31,11 +33,13 @@ from tvm_ffi.stub.codegen import (
     generate_python_import_section,
     generate_python_init,
     generate_python_object,
+    render_func_signature,
+    render_object_fields,
+    render_object_methods,
 )
-from tvm_ffi.stub.file_utils import CodeBlock, FileInfo
+from tvm_ffi.stub.python_backend.imports import ImportItem
 from tvm_ffi.stub.utils import (
     FuncInfo,
-    ImportItem,
     InitConfig,
     NamedTypeSchema,
     ObjectInfo,
@@ -48,11 +52,11 @@ def _identity_ty_map(name: str) -> str:
 
 
 def _default_ty_map() -> dict[str, str]:
-    return C.TY_MAP_DEFAULTS.copy()
+    return PC.TY_MAP_DEFAULTS.copy()
 
 
 def _type_suffix(name: str) -> str:
-    return C.TY_MAP_DEFAULTS.get(name, name).rsplit(".", 1)[-1]
+    return PC.TY_MAP_DEFAULTS.get(name, name).rsplit(".", 1)[-1]
 
 
 def test_codeblock_from_begin_line_variants() -> None:
@@ -165,7 +169,7 @@ def test_funcinfo_gen_variants() -> None:
 
     schema_no_args = NamedTypeSchema("demo.no_args", TypeSchema("Callable", ()))
     func = FuncInfo(schema=schema_no_args, is_member=False)
-    assert func.gen(ty_map, indent=2) == "  def no_args(*args: Any) -> Any: ..."
+    assert render_func_signature(func, ty_map, indent=2) == "  def no_args(*args: Any) -> Any: ..."
     assert called == ["Any"]
 
     schema_member = NamedTypeSchema(
@@ -181,12 +185,15 @@ def test_funcinfo_gen_variants() -> None:
     )
     member_func = FuncInfo(schema=schema_member, is_member=True)
     assert (
-        member_func.gen(_identity_ty_map, indent=0) == "def method(self, _1: float, /) -> str: ..."
+        render_func_signature(member_func, _identity_ty_map, indent=0)
+        == "def method(self, _1: float, /) -> str: ..."
     )
 
     schema_bad = NamedTypeSchema("bad", TypeSchema("int"))
     with pytest.raises(ValueError):
-        FuncInfo(schema=schema_bad, is_member=False).gen(_identity_ty_map, indent=0)
+        render_func_signature(
+            FuncInfo(schema=schema_bad, is_member=False), _identity_ty_map, indent=0
+        )
 
 
 def test_objectinfo_gen_fields_and_methods() -> None:
@@ -218,13 +225,13 @@ def test_objectinfo_gen_fields_and_methods() -> None:
         ],
     )
 
-    assert info.gen_fields(ty_map, indent=2) == [
+    assert render_object_fields(info, ty_map, indent=2) == [
         "  field_a: Sequence[int]",
         "  field_b: Mapping[str, float]",
     ]
     assert ty_calls.count("list") == 1 and ty_calls.count("dict") == 1
 
-    methods = info.gen_methods(_identity_ty_map, indent=2)
+    methods = render_object_methods(info, _identity_ty_map, indent=2)
     assert methods == [
         "  @staticmethod",
         "  def static() -> int: ...",
@@ -285,7 +292,7 @@ def test_objectinfo_gen_fields_container_types() -> None:
         ],
         methods=[],
     )
-    assert info.gen_fields(_type_suffix, indent=0) == [
+    assert render_object_fields(info, _type_suffix, indent=0) == [
         "arr: Sequence[int]",
         "lst: MutableSequence[str]",
         "mp: Mapping[str, int]",
@@ -424,7 +431,10 @@ def test_generate_object_fields_only_block() -> None:
     expected = [
         f"{C.PYTHON_SYNTAX.begin} object/demo.TypeDerived",
         " " * code.indent + "# fmt: off",
-        *[(" " * code.indent) + line for line in info.gen_fields(_type_suffix, indent=0)],
+        *[
+            (" " * code.indent) + line
+            for line in render_object_fields(info, _type_suffix, indent=0)
+        ],
         " " * code.indent + "# fmt: on",
         C.PYTHON_SYNTAX.end,
     ]
