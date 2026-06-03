@@ -14,15 +14,15 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Code generation logic for Python `tvm-ffi-stubgen` backend."""
+"""Code generation logic for the `tvm-ffi-stubgen` tool."""
 
 from __future__ import annotations
 
 from typing import Callable
 
-from .. import consts as C
-from ..file_utils import CodeBlock
-from ..utils import FuncInfo, ImportItem, InitConfig, ObjectInfo, Options, RenderType
+from . import consts as C
+from .file_utils import CodeBlock
+from .utils import FuncInfo, ImportItem, InitConfig, ObjectInfo, Options, RenderType
 
 # --- Python scaffolding templates (init mode) -------------------------------
 # These emit Python source plus stub-directive markers. The marker comment token
@@ -363,3 +363,13 @@ def generate_python_init(
     if not any(code.kind == "export" for code in code_blocks):
         return code
     return ""
+
+
+# Backward-compatible aliases while callers migrate to backend-specific names.
+generate_global_funcs = generate_python_global_funcs
+generate_object = generate_python_object
+generate_import_section = generate_python_import_section
+generate_all = generate_python_all
+generate_export = generate_python_export
+generate_ffi_api = generate_python_ffi_api
+generate_init = generate_python_init
