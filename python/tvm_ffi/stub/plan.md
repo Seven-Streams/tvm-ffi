@@ -58,6 +58,7 @@
 | §4① | `rust_backend/codegen.py`：object 生成（`generate_rust_object`：struct+ObjectCore+ref+Deref+impl/new/methods） | ✅ 已完成（步骤 5） |
 | §4①附 | `generate_rust_import_section`（`use` 段 + `defined_types` 过滤） | ✅ 已完成（步骤 7a） |
 | — | `generate_rust_all` / `generate_rust_export`（再导出） | ⏸ 推迟（步骤 7b，依赖布局步骤 9） |
+| 装配 | `RustBackend` 接线（normal 模式端到端） | ✅ 已完成（步骤 8） |
 | §4⑥ | `cli.py` 目标文件名由 backend 决定 | ⬜ 待做（P3，依赖布局决策） |
 
 ---
@@ -298,7 +299,7 @@ stub/                       # 语言无关
   这两种块"都不确定。
 - **决定**：布局未定前不实现 ②③；待步骤 9 后再做（或那时确认 Rust 不需要 `__all__`/`export`）。
 
-#### 步骤 8：装配 `RustBackend`（去掉 NotImplementedError）
+#### 步骤 8：装配 `RustBackend`（去掉 NotImplementedError）✅ 已完成
 
 - 在 `rust_backend/backend.py` 把各方法委托到上面 `codegen` 自由函数：
   - `default_ty_map → RUST_TY_MAP_DEFAULTS.copy()`

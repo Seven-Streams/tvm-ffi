@@ -22,6 +22,7 @@ import pytest
 import tvm_ffi.stub.cli as stub_cli
 from tvm_ffi.core import TypeSchema
 from tvm_ffi.stub import consts as C
+from tvm_ffi.stub.backend import Backend, get_backend
 from tvm_ffi.stub.cli import _stage_2, _stage_3
 from tvm_ffi.stub.file_utils import CodeBlock, FileInfo
 from tvm_ffi.stub.python_backend import consts as PC
@@ -1216,6 +1217,65 @@ def test_rust_import_section_empty() -> None:
         "// tvm-ffi-stubgen(begin): import-section",
         "// tvm-ffi-stubgen(end)",
     ]
+
+
+def test_rust_backend_wired() -> None:
+    be = get_backend("rust")
+    assert isinstance(be, Backend)
+    imp = be.new_imports()
+    assert isinstance(imp, RustImports)
+    be.add_imported_object(imp, "cpp_rust_test.Expr", "False", "")
+    assert imp.items == [RustUse("cpp_rust_test::Expr")]
+    assert be.canonical_type_name("cpp_rust_test.Expr") == "cpp_rust_test::Expr"
+    assert be.extra_export_names(imp) == set()
+    # object block delegates to generate_rust_object
+    block = _rust_object_block("cpp_rust_test.Expr")
+    be.generate_object_block(
+        block, RC.RUST_TY_MAP_DEFAULTS.copy(), be.new_imports(), Options(), _expr_info()
+    )
+    assert "struct ExprObj {" in "\n".join(block.lines)
+    # all/export blocks are no-ops (deferred); must not raise
+    be.generate_all_block(_rust_object_block("x"), {"Foo"}, Options())
+    be.generate_export_block(_rust_object_block("x"))
+
+
+def test_rust_stage3_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rs = tmp_path / "demo.rs"
+    rs.write_text(
+        "\n".join(
+            [
+                f"{C.RUST_SYNTAX.begin} object/cpp_rust_test.Expr",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} import-section",
+                C.RUST_SYNTAX.end,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    info = FileInfo.from_file(rs)
+    assert info is not None
+    # Avoid needing a loaded shared library: feed a constructed ObjectInfo.
+    monkeypatch.setattr(stub_cli, "object_info_from_type_key", lambda key: _expr_info())
+
+    _stage_3(
+        info,
+        Options(dry_run=True),
+        RC.RUST_TY_MAP_DEFAULTS.copy(),
+        {},
+        backend=RustBackend(),
+    )
+    text = "\n".join(info.lines)
+    # object block filled
+    assert "struct ExprObj {" in text
+    assert "impl Expr {" in text
+    assert 'get_type_method(ExprObj::TYPE_KEY, "__ffi_init__")' in text
+    # import-section filled with the machinery `use`s
+    assert "use tvm_ffi::object::ObjectArc;" in text
+    assert "use tvm_ffi::object::ObjectCore;" in text
+    # Expr defines itself -> no self `use`
+    assert "use cpp_rust_test::Expr;" not in text
 
 
 def test_rust_global_funcs_block_is_noop() -> None:

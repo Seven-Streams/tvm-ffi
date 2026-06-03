@@ -17,16 +17,22 @@
 """The Rust code-generation backend for ``tvm-ffi-stubgen``.
 
 :class:`RustBackend` implements the :class:`tvm_ffi.stub.backend.Backend`
-protocol. Skeleton only — the method bodies that need a Rust implementation
-raise :class:`NotImplementedError`.
+protocol. Normal (in-place) mode is functional: object blocks render full Rust
+bindings (:func:`.codegen.generate_rust_object`) and the import section renders
+the collected ``use``s (:func:`.codegen.generate_rust_import_section`). Global
+function blocks and the ``__all__``/``export`` blocks are intentional no-ops
+(decision 5 / deferred). Only the ``--init`` scaffolding (``generate_api_file`` /
+``generate_init_file``) is still unimplemented — it awaits the Rust file-layout
+decision and raises :class:`NotImplementedError`.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from .. import consts as C
-from .codegen import render_rust_type
+from .codegen import generate_rust_import_section, generate_rust_object, render_rust_type
+from .imports import RustImports, RustUse
 
 if TYPE_CHECKING:
     from tvm_ffi.core import TypeSchema
@@ -39,11 +45,12 @@ if TYPE_CHECKING:
 class RustBackend:
     """Backend that emits Rust binding stubs.
 
-    Skeleton only — the method bodies that need a Rust implementation raise
-    :class:`NotImplementedError`. Per the design decisions on this branch:
+    Per the design decisions on this branch:
 
-    * ``Union[...]`` rendering is *not* supported and must raise a clear error.
+    * ``Union`` / ``Map`` / ``Dict`` / ``List`` are *not* representable -> the
+      enclosing object is skipped with a warning.
     * imports are modelled separately from Python (a Rust ``use`` collector).
+    * global functions and ``__all__``/``export`` re-exports are not generated.
     """
 
     name = "rust"
@@ -65,30 +72,39 @@ class RustBackend:
         """
         return render_rust_type(schema, ty_render)
 
-    def new_imports(self) -> Any:
-        """Create a Rust ``use`` collector. TODO(rust)."""
-        raise NotImplementedError("RustBackend.new_imports")
+    def new_imports(self) -> RustImports:
+        """Create an empty Rust ``use`` collector."""
+        return RustImports()
 
     def add_imported_object(
-        self, imports: Any, name: str, type_checking_only: str, alias: str
+        self, imports: RustImports, name: str, type_checking_only: str, alias: str
     ) -> None:
-        """Record an ``import-object`` directive into the Rust collector. TODO(rust)."""
-        raise NotImplementedError("RustBackend.add_imported_object")
+        """Record an ``import-object`` directive as a ``use``.
+
+        ``type_checking_only`` is ignored (Rust has no ``TYPE_CHECKING`` split).
+        """
+        use = RustUse(name, alias=alias or None)
+        if use not in imports.items:
+            imports.items.append(use)
 
     def canonical_type_name(self, type_key: str) -> str:
-        """Return the canonical Rust path for a defined type key. TODO(rust)."""
-        raise NotImplementedError("RustBackend.canonical_type_name")
+        """Return the canonical Rust path for a defined type key.
 
-    def extra_export_names(self, imports: Any) -> set[str]:
-        """Return extra Rust re-export names implied by the imports. TODO(rust)."""
-        raise NotImplementedError("RustBackend.extra_export_names")
+        Must match :attr:`RustUse.full_name` so the import section can drop a
+        ``use`` that targets a locally-defined type.
+        """
+        return RustUse(type_key).full_name
+
+    def extra_export_names(self, imports: RustImports) -> set[str]:
+        """No extra export names for Rust (no ``LIB``/global-func surface)."""
+        return set()
 
     def generate_global_funcs_block(
         self,
         code: CodeBlock,
         global_funcs: list[FuncInfo],
         ty_map: dict[str, str],
-        imports: Any,
+        imports: RustImports,
         opt: Options,
     ) -> None:
         """No-op (decision 5): global functions are not generated for Rust.
@@ -102,26 +118,27 @@ class RustBackend:
         self,
         code: CodeBlock,
         ty_map: dict[str, str],
-        imports: Any,
+        imports: RustImports,
         opt: Options,
         obj_info: ObjectInfo,
     ) -> None:
-        """Emit a Rust ``struct``/``impl`` for an ``object/<key>`` block. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_object_block")
+        """Emit a Rust ``struct``/``impl`` binding for an ``object/<key>`` block."""
+        generate_rust_object(code, ty_map, imports, opt, obj_info)
 
     def generate_import_section_block(
-        self, code: CodeBlock, imports: Any, opt: Options, defined_types: set[str]
+        self, code: CodeBlock, imports: RustImports, opt: Options, defined_types: set[str]
     ) -> None:
-        """Emit Rust ``use`` statements for the collected imports. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_import_section_block")
+        """Emit Rust ``use`` statements for the collected imports."""
+        generate_rust_import_section(code, imports, opt, defined_types)
 
     def generate_all_block(self, code: CodeBlock, names: set[str], opt: Options) -> None:
-        """Emit Rust public re-exports. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_all_block")
+        """No-op for now: Rust re-exports are deferred until the file layout is decided.
+
+        (Plan step 7b — depends on the undecided Rust module layout, step 9.)
+        """
 
     def generate_export_block(self, code: CodeBlock) -> None:
-        """Emit a Rust submodule re-export for an ``export/<submodule>`` block. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_export_block")
+        """No-op for now: submodule re-export is deferred (plan step 7b / layout step 9)."""
 
     def generate_api_file(
         self,
