@@ -43,6 +43,7 @@ from tvm_ffi.stub.rust_backend.backend import RustBackend
 from tvm_ffi.stub.rust_backend.codegen import (
     UnsupportedTypeError,
     build_ty_render,
+    generate_rust_import_section,
     generate_rust_object,
     render_rust_type,
 )
@@ -1164,6 +1165,57 @@ def test_rust_object_skipped_on_unsupported(capsys: pytest.CaptureFixture[str]) 
     ]
     assert imports.items == [RustUse("tvm_ffi::Tensor")]
     assert "[Skipped] object demo.HasMap" in capsys.readouterr().out
+
+
+def _rust_import_block() -> CodeBlock:
+    return CodeBlock(
+        kind="import-section",
+        param="",
+        lineno_start=1,
+        lineno_end=2,
+        lines=["// tvm-ffi-stubgen(begin): import-section", "// tvm-ffi-stubgen(end)"],
+    )
+
+
+def test_rust_import_section_renders_dedups_sorts() -> None:
+    block = _rust_import_block()
+    imports = RustImports(
+        items=[
+            RustUse("tvm_ffi::Tensor"),
+            RustUse("tvm_ffi::object::ObjectArc"),
+            RustUse("tvm_ffi::Tensor"),  # duplicate -> collapsed
+            RustUse("crate_b::Foo", alias="Foo2"),
+        ]
+    )
+    generate_rust_import_section(block, imports, Options(), defined_types=set())
+    assert block.lines == [
+        "// tvm-ffi-stubgen(begin): import-section",
+        "use crate_b::Foo as Foo2;",
+        "use tvm_ffi::Tensor;",
+        "use tvm_ffi::object::ObjectArc;",
+        "// tvm-ffi-stubgen(end)",
+    ]
+
+
+def test_rust_import_section_filters_defined_types() -> None:
+    block = _rust_import_block()
+    imports = RustImports(items=[RustUse("cpp_rust_test::Expr"), RustUse("tvm_ffi::Tensor")])
+    # Expr is defined in this file -> its `use` must be dropped.
+    generate_rust_import_section(block, imports, Options(), defined_types={"cpp_rust_test::Expr"})
+    assert block.lines == [
+        "// tvm-ffi-stubgen(begin): import-section",
+        "use tvm_ffi::Tensor;",
+        "// tvm-ffi-stubgen(end)",
+    ]
+
+
+def test_rust_import_section_empty() -> None:
+    block = _rust_import_block()
+    generate_rust_import_section(block, RustImports(), Options(), defined_types=set())
+    assert block.lines == [
+        "// tvm-ffi-stubgen(begin): import-section",
+        "// tvm-ffi-stubgen(end)",
+    ]
 
 
 def test_rust_global_funcs_block_is_noop() -> None:

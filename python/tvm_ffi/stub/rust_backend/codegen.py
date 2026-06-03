@@ -447,3 +447,35 @@ def _method_fn(
         f"    call({call_args})",
         "}",
     ]
+
+
+# --- import section (`use` statements) --------------------------------------
+
+
+def generate_rust_import_section(
+    code: CodeBlock,
+    imports: RustImports,
+    opt: Options,
+    defined_types: set[str],
+) -> None:
+    """Render the collected ``use`` statements into an ``import-section`` block.
+
+    Imports whose target is a type *defined in this same file* are dropped
+    (``RustUse.full_name in defined_types``) -- you don't ``use`` what you
+    define locally. The remaining uses are deduped and sorted for a stable,
+    one-per-line rendering (Rust has no ``TYPE_CHECKING`` split).
+    """
+    assert len(code.lines) >= 2
+    seen: dict[str, RustUse] = {}
+    for item in imports.items:
+        if item.full_name in defined_types:
+            continue
+        seen.setdefault(item.as_use_line(), item)
+    use_lines = sorted(seen)
+    indent = " " * code.indent
+    code.lines = [
+        code.lines[0],
+        *[indent + line for line in use_lines],
+        code.lines[-1],
+    ]
+    _ = opt  # accepted for protocol parity; Rust needs no indent/TYPE_CHECKING handling

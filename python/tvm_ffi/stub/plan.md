@@ -56,6 +56,8 @@
 | §4② | `RustBackend.render_type` 类型遍历 + 不支持类型抛异常 | ✅ 已完成（步骤 3） |
 | §4②附 | Rust `TyRenderer`（去重 + 同名 leaf 起别名，方案 A） | ✅ 已完成（步骤 4） |
 | §4① | `rust_backend/codegen.py`：object 生成（`generate_rust_object`：struct+ObjectCore+ref+Deref+impl/new/methods） | ✅ 已完成（步骤 5） |
+| §4①附 | `generate_rust_import_section`（`use` 段 + `defined_types` 过滤） | ✅ 已完成（步骤 7a） |
+| — | `generate_rust_all` / `generate_rust_export`（再导出） | ⏸ 推迟（步骤 7b，依赖布局步骤 9） |
 | §4⑥ | `cli.py` 目标文件名由 backend 决定 | ⬜ 待做（P3，依赖布局决策） |
 
 ---
@@ -278,13 +280,23 @@ stub/                       # 语言无关
 - **测试**：`test_rust_codegen.py::test_global_funcs_noop`，断言 `global/` 块经过后内容不变。
 - **验收**：含 `global/` 块的 `.rs` 文件处理后该块无新增内容、不报错。
 
-#### 步骤 7：`generate_rust_import_section` / `generate_rust_all` / `generate_rust_export`
+#### 步骤 7a：`generate_rust_import_section`（`use` 段）——现做
 
-- `import_section`：把 `RustImports` 渲染成 `use` 行，按 `defined_types` 过滤本地定义。
-- `all`：Rust 公开再导出（`pub use`）。
-- `export`：子模块再导出（`pub mod` / `pub use`）。
-- **测试**：各一条断言生成行。
-- **验收**：三种块都能生成；过滤逻辑有测试。
+- 把 step 5 攒在 `RustImports` 里的 `use` 真正落地到 `import-section` 块。
+- **按 `defined_types` 过滤本地定义**：`RustUse.full_name` 若在 `defined_types`（由
+  `canonical_type_name` 产出，step 8）里则跳过——清掉 step 5 留的伪 import
+  （如 `Add` 字段 `a: Expr` 记的 `use cpp_rust_test::Expr;`，因 `Expr` 本地定义而丢弃）。
+- 去重（`RustUse` 可哈希）+ 排序后，一条一行写入块（Rust 无 `TYPE_CHECKING` 概念）。
+- **测试**：渲染若干 `use` + 断言过滤掉 `defined_types` 中的项 + 去重 + 排序稳定。
+- **验收**：`use` 段正确落地，本地类型不出现在 `use` 里。
+
+#### 步骤 7b：`generate_rust_all` / `generate_rust_export`（再导出）——**推迟到步骤 9 后**
+
+- `all`（Python `__all__` 等价物）与 `export`（子模块再导出）本质是**模块对外再导出结构**，
+  取决于**尚未拍板的 Rust 文件布局（步骤 9）**：单文件 vs `mod.rs`+多文件、生成类型是否 `pub`、
+  再导出如何组织。且这两种 marker 块由脚手架（步骤 11）放入，布局没定时连"Rust 文件里有没有
+  这两种块"都不确定。
+- **决定**：布局未定前不实现 ②③；待步骤 9 后再做（或那时确认 Rust 不需要 `__all__`/`export`）。
 
 #### 步骤 8：装配 `RustBackend`（去掉 NotImplementedError）
 
