@@ -39,6 +39,12 @@ from tvm_ffi.stub.python_backend.codegen import (
 )
 from tvm_ffi.stub.python_backend.imports import ImportItem
 from tvm_ffi.stub.rust_backend import consts as RC
+from tvm_ffi.stub.rust_backend.backend import RustBackend
+from tvm_ffi.stub.rust_backend.codegen import (
+    UnsupportedTypeError,
+    build_ty_render,
+    render_rust_type,
+)
 from tvm_ffi.stub.rust_backend.imports import RustImports, RustUse
 from tvm_ffi.stub.utils import (
     FuncInfo,
@@ -872,3 +878,87 @@ def test_rustimports_default_empty() -> None:
     assert imp.items == []
     imp.items.append(RustUse("tvm_ffi::Tensor"))
     assert imp.items[0].leaf == "Tensor"
+
+
+# ---------------------------------------------------------------------------
+# Rust backend: type renderer (rust_backend/codegen.py)
+# ---------------------------------------------------------------------------
+
+
+def _rust_render(schema: TypeSchema) -> tuple[str, RustImports]:
+    """Render `schema` with a fresh collector; return (text, imports)."""
+    imports = RustImports()
+    ty_render = build_ty_render(RC.RUST_TY_MAP_DEFAULTS, imports)
+    return render_rust_type(schema, ty_render), imports
+
+
+def test_render_primitive_no_import() -> None:
+    text, imports = _rust_render(TypeSchema("int"))
+    assert text == "i64"
+    assert imports.items == []  # primitives need no `use`
+
+
+def test_render_optional() -> None:
+    text, _ = _rust_render(TypeSchema("Optional", (TypeSchema("int"),)))
+    assert text == "Option<i64>"
+
+
+def test_render_array_records_use() -> None:
+    text, imports = _rust_render(TypeSchema("Array", (TypeSchema("int"),)))
+    assert text == "Array<i64>"
+    assert RustUse("tvm_ffi::Array") in imports.items
+
+
+def test_render_callable_is_function() -> None:
+    text, imports = _rust_render(TypeSchema("Callable", (TypeSchema("int"),)))
+    assert text == "Function"
+    assert RustUse("tvm_ffi::Function") in imports.items
+
+
+def test_render_tuple() -> None:
+    assert _rust_render(TypeSchema("tuple"))[0] == "()"
+    text, _ = _rust_render(TypeSchema("tuple", (TypeSchema("int"), TypeSchema("float"))))
+    assert text == "(i64, f64)"
+
+
+def test_render_object_leaf_records_use() -> None:
+    text, imports = _rust_render(TypeSchema("ffi.String"))
+    assert text == "String"
+    assert RustUse("tvm_ffi::String") in imports.items
+
+
+def test_render_nested() -> None:
+    schema = TypeSchema("Optional", (TypeSchema("Array", (TypeSchema("int"),)),))
+    text, imports = _rust_render(schema)
+    assert text == "Option<Array<i64>>"
+    assert RustUse("tvm_ffi::Array") in imports.items
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        TypeSchema("Union", (TypeSchema("int"), TypeSchema("str"))),
+        TypeSchema("Map", (TypeSchema("str"), TypeSchema("int"))),
+        TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))),
+        TypeSchema("List", (TypeSchema("int"),)),
+    ],
+)
+def test_render_unsupported_raises(schema: TypeSchema) -> None:
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _rust_render(schema)
+    assert exc.value.origin == schema.origin
+
+
+def test_render_unsupported_nested_raises() -> None:
+    # Map buried inside an Array still bubbles up.
+    schema = TypeSchema("Array", (TypeSchema("Map", (TypeSchema("str"), TypeSchema("int"))),))
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _rust_render(schema)
+    assert exc.value.origin == "Map"
+
+
+def test_rust_backend_render_type_delegates() -> None:
+    imports = RustImports()
+    ty_render = build_ty_render(RC.RUST_TY_MAP_DEFAULTS, imports)
+    out = RustBackend().render_type(TypeSchema("Optional", (TypeSchema("int"),)), ty_render)
+    assert out == "Option<i64>"

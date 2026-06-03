@@ -26,6 +26,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from .. import consts as C
+from .codegen import render_rust_type
 
 if TYPE_CHECKING:
     from tvm_ffi.core import TypeSchema
@@ -56,8 +57,13 @@ class RustBackend:
         return dict(self._DEFAULT_TY_MAP)
 
     def render_type(self, schema: TypeSchema, ty_render: TyRenderer) -> str:
-        """Render a type schema as a Rust type expression. TODO(rust)."""
-        raise NotImplementedError("RustBackend.render_type: implement Rust type rendering")
+        """Render a type schema as a Rust type expression.
+
+        Delegates to :func:`.codegen.render_rust_type`. Raises
+        :class:`.codegen.UnsupportedTypeError` for FFI types the crate cannot
+        represent (``Union`` / ``Map`` / ``Dict`` / ``List``).
+        """
+        return render_rust_type(schema, ty_render)
 
     def new_imports(self) -> Any:
         """Create a Rust ``use`` collector. TODO(rust)."""
