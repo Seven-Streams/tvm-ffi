@@ -28,10 +28,17 @@ decision and raises :class:`NotImplementedError`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING
 
 from .. import consts as C
-from .codegen import generate_rust_import_section, generate_rust_object, render_rust_type
+from .codegen import (
+    generate_rust_api_file,
+    generate_rust_import_section,
+    generate_rust_init,
+    generate_rust_object,
+    render_rust_type,
+)
+from .consts import RUST_TY_MAP_DEFAULTS
 from .imports import RustImports, RustUse
 
 if TYPE_CHECKING:
@@ -56,12 +63,9 @@ class RustBackend:
     name = "rust"
     syntax = C.RUST_SYNTAX
 
-    #: TODO(rust): replace with the real FFI-origin -> Rust-type name map.
-    _DEFAULT_TY_MAP: ClassVar[dict[str, str]] = {}
-
     def default_ty_map(self) -> dict[str, str]:
         """Return the default FFI-origin -> Rust-type name map."""
-        return dict(self._DEFAULT_TY_MAP)
+        return RUST_TY_MAP_DEFAULTS.copy()
 
     def render_type(self, schema: TypeSchema, ty_render: TyRenderer) -> str:
         """Render a type schema as a Rust type expression.
@@ -140,6 +144,14 @@ class RustBackend:
     def generate_export_block(self, code: CodeBlock) -> None:
         """No-op for now: submodule re-export is deferred (plan step 7b / layout step 9)."""
 
+    def api_filename(self) -> str:
+        """One Rust file per module prefix (option A)."""
+        return "mod.rs"
+
+    def init_filename(self) -> str:
+        """No separate entry file for Rust; reuse the API file (init text is empty)."""
+        return "mod.rs"
+
     def generate_api_file(
         self,
         code_blocks: list[CodeBlock],
@@ -149,11 +161,13 @@ class RustBackend:
         init_cfg: InitConfig,
         is_root: bool,
     ) -> str:
-        """Return text appended to a scaffolded Rust API module. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_api_file")
+        """Scaffold a Rust binding file: header + helpers + object/import markers."""
+        return generate_rust_api_file(
+            code_blocks, ty_map, module_name, object_infos, init_cfg, is_root, self.syntax
+        )
 
     def generate_init_file(
         self, code_blocks: list[CodeBlock], module_name: str, submodule: str
     ) -> str:
-        """Return text appended to a scaffolded Rust module entry. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_init_file")
+        """No-op: Rust has no separate package-entry file (option A)."""
+        return generate_rust_init(code_blocks, module_name, submodule, self.syntax)

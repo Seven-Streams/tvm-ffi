@@ -367,6 +367,9 @@ def _impl_block(
     imports: RustImports,
 ) -> list[str]:
     """Emit `impl <T> { new; methods }`; empty list when there's nothing to emit."""
+    init_method = next(
+        (m for m in info.methods if m.schema.name.rsplit(".", 1)[-1] == "__ffi_init__"), None
+    )
     methods = [m for m in info.methods if m.schema.name.rsplit(".", 1)[-1] != "__ffi_init__"]
     if not info.has_init and not methods:
         return []
@@ -376,7 +379,7 @@ def _impl_block(
 
     inner: list[str] = []
     if info.has_init:
-        inner += _new_fn(info, leaf, obj_struct, render_param)
+        inner += _new_fn(info, leaf, obj_struct, render_param, init_method)
         if methods:
             inner.append("")
     for i, method in enumerate(methods):
@@ -392,12 +395,25 @@ def _new_fn(
     leaf: str,
     obj_struct: str,
     render_param: Callable[[TypeSchema], str],
+    init_method: FuncInfo | None,
 ) -> list[str]:
-    """Emit `fn new(<init_fields>) -> Result<Self>` calling reflected `__ffi_init__`."""
-    params = [(f.name, render_param(f.schema)) for f in info.init_fields]
-    sig = ", ".join(f"{_rust_ident(n)}: {t}" for n, t in params)
+    """Emit `fn new(...) -> Result<Self>` calling reflected `__ffi_init__`.
+
+    Parameter order/types come from the ``__ffi_init__`` method schema when
+    available (``args[0]`` is the constructed object / return; ``args[1:]`` are
+    the constructor params) -- this is the authoritative order. The schema has no
+    parameter names, so positional names ``_0, _1, ...`` are used. Only when the
+    init is a column-only auto-init (no ``__ffi_init__`` method) do we fall back
+    to ``init_fields`` (named), which may not match the true constructor order.
+    """
+    if init_method is not None:
+        arg_schemas = list(init_method.schema.args[1:]) if init_method.schema.args else []
+        params = [(f"_{i}", render_param(s)) for i, s in enumerate(arg_schemas)]
+    else:
+        params = [(_rust_ident(f.name), render_param(f.schema)) for f in info.init_fields]
+    sig = ", ".join(f"{n}: {t}" for n, t in params)
     fn_types = ", ".join(t for _, t in params)
-    call_args = ", ".join(_rust_ident(n) for n, _ in params)
+    call_args = ", ".join(n for n, _ in params)
     return [
         f"fn new({sig}) -> Result<Self> {{",
         f'    let ctor = get_type_method({obj_struct}::TYPE_KEY, "__ffi_init__")?;',
@@ -479,3 +495,108 @@ def generate_rust_import_section(
         code.lines[-1],
     ]
     _ = opt  # accepted for protocol parity; Rust needs no indent/TYPE_CHECKING handling
+
+
+# --- whole-file scaffolding (`--init` mode) ---------------------------------
+
+#: Shared per-file helper functions (decision Q4). Written fully-qualified with
+#: zero `use`s so they never clash with the import-section block (which carries
+#: every object-driven `use`). `lookup_type_index` resolves+caches a type index;
+#: `get_type_method` pulls a reflected method off the type's method table.
+_RUST_HELPERS = """fn lookup_type_index(type_key: &'static str) -> i32 {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<&'static str, i32>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(type_key) {
+        return *v;
+    }
+    let arg = unsafe { tvm_ffi::tvm_ffi_sys::TVMFFIByteArray::from_str(type_key) };
+    let mut tindex = 0;
+    let ret = unsafe { tvm_ffi::tvm_ffi_sys::TVMFFITypeKeyToIndex(&arg, &mut tindex) };
+    assert_eq!(ret, 0, "type key `{type_key}` is not registered");
+    cache.lock().unwrap().insert(type_key, tindex);
+    tindex
+}
+
+fn get_type_method(
+    type_key: &'static str,
+    method_name: &str,
+) -> tvm_ffi::Result<tvm_ffi::Function> {
+    let type_index = lookup_type_index(type_key);
+    unsafe {
+        let info = tvm_ffi::tvm_ffi_sys::TVMFFIGetTypeInfo(type_index);
+        if info.is_null() {
+            return Err(tvm_ffi::Error::new(
+                tvm_ffi::TYPE_ERROR,
+                &format!("no type info for `{type_key}`"),
+                "",
+            ));
+        }
+        let info = &*info;
+        for i in 0..info.num_methods {
+            let mi = &*info.methods.add(i as usize);
+            if mi.name.as_str() == method_name {
+                if !<tvm_ffi::Function as tvm_ffi::type_traits::AnyCompatible>::check_any_strict(
+                    &mi.method,
+                ) {
+                    return Err(tvm_ffi::Error::new(
+                        tvm_ffi::TYPE_ERROR,
+                        &format!("method `{method_name}` on `{type_key}` is not a Function"),
+                        "",
+                    ));
+                }
+                return Ok(<tvm_ffi::Function as tvm_ffi::type_traits::AnyCompatible>::copy_from_any_view_after_check(&mi.method));
+            }
+        }
+    }
+    Err(tvm_ffi::Error::new(
+        tvm_ffi::TYPE_ERROR,
+        &format!("method `{method_name}` not found on `{type_key}`"),
+        "",
+    ))
+}"""
+
+
+def generate_rust_api_file(
+    code_blocks: list[CodeBlock],
+    ty_map: dict[str, str],
+    module_name: str,
+    object_infos: list[ObjectInfo],
+    init_cfg: object,
+    is_root: bool,
+    syntax: C.MarkerSyntax = C.RUST_SYNTAX,
+) -> str:
+    """Scaffold a single Rust binding file (option A: one file per module prefix).
+
+    A fresh file gets the ``#![allow(...)]`` header, the shared helper functions,
+    and an ``import-section`` marker. Each registered object type gets an empty
+    ``object/<type_key>`` marker block. No ``global``/``__all__``/``export``
+    blocks are emitted (decision 5 / step 7b). ``stage_3`` later fills the blocks.
+    """
+    append = ""
+    if not code_blocks:
+        append += "#![allow(dead_code, unused_imports)]\n"
+        append += f"//! FFI bindings for `{module_name}` (generated by tvm-ffi-stubgen).\n\n"
+        append += _RUST_HELPERS + "\n\n"
+    if not any(c.kind == "import-section" for c in code_blocks):
+        append += f"{syntax.begin} import-section\n{syntax.end}\n\n"
+    defined = {c.param for c in code_blocks if c.kind == "object"}
+    for info in object_infos:
+        type_key = info.type_key
+        if type_key is None or type_key in defined:
+            continue
+        append += f"{syntax.begin} object/{type_key}\n{syntax.end}\n\n"
+    _ = (ty_map, init_cfg, is_root)  # unused for the Rust single-file layout
+    return append
+
+
+def generate_rust_init(
+    code_blocks: list[CodeBlock],
+    module_name: str,
+    submodule: str = "mod",
+    syntax: C.MarkerSyntax = C.RUST_SYNTAX,
+) -> str:
+    """No init/re-export file for Rust (option A: the API file *is* the module)."""
+    _ = (code_blocks, module_name, submodule, syntax)
+    return ""

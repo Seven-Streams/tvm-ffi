@@ -162,6 +162,14 @@ class Backend(Protocol):
 
     # --- whole-file scaffolding (used by `--init` mode) ---------------------
 
+    def api_filename(self) -> str:
+        """File name of the scaffolded API file (Python ``_ffi_api.py``; Rust ``mod.rs``)."""
+        ...
+
+    def init_filename(self) -> str:
+        """File name of the scaffolded package entry (Python ``__init__.py``)."""
+        ...
+
     def generate_api_file(
         self,
         code_blocks: list[CodeBlock],

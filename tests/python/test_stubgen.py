@@ -1278,6 +1278,76 @@ def test_rust_stage3_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert "use cpp_rust_test::Expr;" not in text
 
 
+def test_rust_default_ty_map_is_real() -> None:
+    # Regression: default_ty_map must be the real table, not an empty placeholder.
+    m = RustBackend().default_ty_map()
+    assert m["int"] == "i64"
+    assert m["None"] == "()"
+
+
+def test_rust_new_uses_ffi_init_schema_order() -> None:
+    # __ffi_init__ schema arg order (a, b, value) is authoritative and differs
+    # from the parent-first init_fields order (value, a, b).
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("a", TypeSchema("demo.Expr")),
+            NamedTypeSchema("b", TypeSchema("demo.Expr")),
+        ],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema(
+                    "__ffi_init__",
+                    TypeSchema(
+                        "Callable",
+                        (
+                            TypeSchema("Object"),  # return (constructed object)
+                            TypeSchema("demo.Expr"),
+                            TypeSchema("demo.Expr"),
+                            TypeSchema("int"),
+                        ),
+                    ),
+                ),
+                is_member=True,
+            )
+        ],
+        type_key="demo.Add",
+        parent_type_key="demo.Expr",
+        init_fields=[
+            InitFieldInfo("value", NamedTypeSchema("value", TypeSchema("int")), False, False),
+            InitFieldInfo("a", NamedTypeSchema("a", TypeSchema("demo.Expr")), False, False),
+            InitFieldInfo("b", NamedTypeSchema("b", TypeSchema("demo.Expr")), False, False),
+        ],
+        has_init=True,
+    )
+    text, _ = _gen_rust_object(info)
+    assert "fn new(_0: Expr, _1: Expr, _2: i64) -> Result<Self> {" in text
+    assert "into_typed_fn!(ctor, Fn(Expr, Expr, i64) -> Result<Add>);" in text
+    # __ffi_init__ becomes `new`, not a regular method (only referenced once).
+    assert text.count("__ffi_init__") == 1
+
+
+def test_rust_api_filenames() -> None:
+    be = RustBackend()
+    assert be.api_filename() == "mod.rs"
+    assert be.init_filename() == "mod.rs"
+    assert be.generate_init_file([], "demo", "mod") == ""
+
+
+def test_rust_api_file_scaffold() -> None:
+    text = RustBackend().generate_api_file(
+        [], {}, "demo", [_expr_info()], InitConfig("p", "l", "demo."), is_root=True
+    )
+    assert "#![allow(dead_code, unused_imports)]" in text
+    assert "fn lookup_type_index(" in text
+    assert "fn get_type_method(" in text
+    assert f"{C.RUST_SYNTAX.begin} import-section" in text
+    assert f"{C.RUST_SYNTAX.begin} object/cpp_rust_test.Expr" in text
+    # no global / __all__ / export markers for Rust
+    assert "global/" not in text
+    assert "__all__" not in text
+    assert "export/" not in text
+
+
 def test_rust_global_funcs_block_is_noop() -> None:
     # Decision 5: Rust does not generate global functions; the block is untouched.
     lines = ["// tvm-ffi-stubgen(begin): global/demo", "// tvm-ffi-stubgen(end)"]

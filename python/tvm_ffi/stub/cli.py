@@ -172,8 +172,9 @@ def _stage_2(
         # Step 1. Create target directory if not exists
         directory = init_path / prefix.replace(".", "/")
         directory.mkdir(parents=True, exist_ok=True)
-        # Step 2. Generate `_ffi_api.py`
-        target_path = directory / "_ffi_api.py"
+        # Step 2. Generate the API file (Python `_ffi_api.py` / Rust `mod.rs`).
+        api_filename = backend.api_filename()
+        target_path = directory / api_filename
         target_file = _find_or_insert_file(target_path)
         with target_path.open("a", encoding="utf-8") as f:
             f.write(
@@ -187,11 +188,13 @@ def _stage_2(
                 )
             )
         target_file.reload()
-        # Step 3. Generate `__init__.py`
-        target_path = directory / "__init__.py"
+        # Step 3. Generate the package entry (Python `__init__.py`; re-exports the
+        # API submodule). `submodule` is the API file's stem.
+        submodule = api_filename.rsplit(".", 1)[0]
+        target_path = directory / backend.init_filename()
         target_file = _find_or_insert_file(target_path)
         with target_path.open("a", encoding="utf-8") as f:
-            f.write(backend.generate_init_file(target_file.code_blocks, prefix, "_ffi_api"))
+            f.write(backend.generate_init_file(target_file.code_blocks, prefix, submodule))
         target_file.reload()
 
 

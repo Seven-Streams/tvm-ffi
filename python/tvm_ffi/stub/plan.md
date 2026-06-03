@@ -59,7 +59,9 @@
 | §4①附 | `generate_rust_import_section`（`use` 段 + `defined_types` 过滤） | ✅ 已完成（步骤 7a） |
 | — | `generate_rust_all` / `generate_rust_export`（再导出） | ⏸ 推迟（步骤 7b，依赖布局步骤 9） |
 | 装配 | `RustBackend` 接线（normal 模式端到端） | ✅ 已完成（步骤 8） |
-| §4⑥ | `cli.py` 目标文件名由 backend 决定 | ⬜ 待做（P3，依赖布局决策） |
+| §4⑥ | `cli.py` 文件名后端化（`api_filename`/`init_filename`） | ✅ 已完成（步骤 10） |
+| 布局 | Rust 布局 = 单文件/前缀、全 `pub`*、helper 每文件、无 all/export | ✅ 已定（步骤 9，全 A） |
+| 脚手架 | `generate_rust_api_file`（`#![allow]`+helper+import/object marker）+ `--init` 端到端 | ✅ 已完成（步骤 11，cargo run 验证） |
 
 ---
 
