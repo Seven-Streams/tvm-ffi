@@ -86,14 +86,23 @@ class Options:
 
 @dataclasses.dataclass(init=False)
 class NamedTypeSchema(TypeSchema):
-    """A type schema with an associated name."""
+    """A type schema with an associated name.
+
+    ``frozen`` is the field's read-only flag from reflection (``def_ro`` ->
+    ``True``, ``def_rw`` -> ``False``). It is only meaningful for object fields;
+    method/init schemas leave it at the default ``False``. Backends that care
+    about mutability (e.g. the Rust backend's mutable-vs-immutable class
+    decision) read it; the Python backend ignores it.
+    """
 
     name: str
+    frozen: bool = False
 
-    def __init__(self, name: str, schema: TypeSchema) -> None:
-        """Initialize a `NamedTypeSchema` with the given name and type schema."""
+    def __init__(self, name: str, schema: TypeSchema, frozen: bool = False) -> None:
+        """Initialize a `NamedTypeSchema` with the given name, schema and read-only flag."""
         super().__init__(origin=schema.origin, args=schema.args)
         self.name = name
+        self.frozen = frozen
 
 
 @dataclasses.dataclass
@@ -171,6 +180,7 @@ class ObjectInfo:
                 NamedTypeSchema(
                     name=field.name,
                     schema=_parse_type_schema(field.metadata["type_schema"]),
+                    frozen=field.frozen,
                 )
                 for field in type_info.fields
             ],

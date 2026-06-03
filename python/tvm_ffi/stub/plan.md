@@ -55,7 +55,7 @@
 | §4④(Rust) | Rust import 表示（`use` 收集器） | ✅ 已完成（步骤 2） |
 | §4② | `RustBackend.render_type` 类型遍历 + 不支持类型抛异常 | ✅ 已完成（步骤 3） |
 | §4②附 | Rust `TyRenderer`（去重 + 同名 leaf 起别名，方案 A） | ✅ 已完成（步骤 4） |
-| §4① | `rust_backend/codegen.py`：object 生成（struct+impl）；**global 函数不生成**（决策 5） | ⬜ 待做（P2） |
+| §4① | `rust_backend/codegen.py`：object 生成（`generate_rust_object`：struct+ObjectCore+ref+Deref+impl/new/methods） | ✅ 已完成（步骤 5） |
 | §4⑥ | `cli.py` 目标文件名由 backend 决定 | ⬜ 待做（P3，依赖布局决策） |
 
 ---
@@ -202,26 +202,59 @@ stub/                       # 语言无关
 
   **(3) `<T>` ref**：`#[repr(C)] #[derive(ObjectRef, Clone)] struct <T> { data: ObjectArc<<T>Obj> }`。
 
-  **(4) `Deref/DerefMut`**：ref `<T>` → `<T>Obj`（`&self.data`）；派生 `<T>Obj` → 父 Obj（`&self.base`）。
+  **(0) 类的可变性（决策 Q1，由字段注册模式决定）**
+  - 每个字段经反射带 `frozen` 标志（`frozen=(flags & Writable)==0`：`def_ro→frozen`，`def_rw→可写`）。
+  - 全部字段可写 → 类为 **mutable**；全部字段只读 → 类为 **immutable**；
+    **既有只读又有可写 → 打 warning，按 immutable 处理**。无字段的类默认 immutable。
+  - mutable 类 → 生成 `DerefMut`，实例方法用 `&mut self`；immutable 类 → **不生成 `DerefMut`**，
+    实例方法用 `&self`。（字段始终 `pub`；可变与否由是否有 `DerefMut` 把关。）
+  - 实现备注：`ObjectInfo` 需新增携带每字段 `frozen`（当前未捕获），来源 `TypeField.frozen`。
 
-  **(5) `impl <T>` 方法**（`ObjectInfo.methods`，**真实调用**，非占位）：每个实例方法
+  **(4) `Deref`（+ mutable 类才有 `DerefMut`）**：ref `<T>` → `<T>Obj`（`&self.data`）；
+    派生 `<T>Obj` → 父 Obj（`&self.base`）。`DerefMut` 仅在类为 mutable 时生成。
+
+  **(5) `impl <T>` 方法**（`ObjectInfo.methods`，**真实调用**，非占位）：
+  - **实例方法**（`is_member=True`）——self 接收器按类可变性（见 (0)）：
 
     ```rust
-    fn <name>(&self, _0: P0, _1: P1, ...) -> Result<<Ret>> {
+    fn <name>(&self /* 或 &mut self */, _0: P0, ...) -> Result<<Ret>> {
         let f = get_type_method(<T>Obj::TYPE_KEY, "<ffi 方法名>")?;
-        let call = into_typed_fn!(f, Fn(&<T>, P0, P1, ...) -> Result<<Ret>>);
-        call(self, _0, _1, ...)
+        let call = into_typed_fn!(f, Fn(&<T> /* 或 &mut <T> */, P0, ...) -> Result<<Ret>>);
+        call(self, _0, ...)
     }
     ```
 
-  - 方法 schema 是 `Callable`：`args[0]`=返回类型，`args[1]`=self（is_member），`args[2:]`=真实参数；
-    渲染时跳过 self（与 Python `gen` 一致）。返回恒包 `Result<…>`，void → `Result<()>`。
-  - `&self` vs `&mut self`、`static`（无 self）：**待定**（见 §五）。
+  - **静态方法**（`is_member=False`，示例 `Expr::test`）——关联函数，无 self：
 
-  **(6) 每文件共享辅助函数**（emit 一次/文件）：`lookup_type_index(type_key) -> i32`
-    （经 `TVMFFITypeKeyToIndex` + 缓存）和 `get_type_method(type_key, name) -> Result<Function>`
-    （遍历 `TVMFFIGetTypeInfo(idx).methods` 按名取 `Function`）。**这两个 helper 放哪里待定**
-    （每文件生成 / 抽到 `tvm_ffi` crate）见 §五。
+    ```rust
+    fn <name>(_0: P0, ...) -> Result<<Ret>> {
+        let f = get_type_method(<T>Obj::TYPE_KEY, "<ffi 方法名>")?;
+        let call = into_typed_fn!(f, Fn(P0, ...) -> Result<<Ret>>);
+        call(_0, ...)
+    }
+    ```
+
+  - 方法 schema 是 `Callable`：`args[0]`=返回类型，其后为参数；实例方法的 `args[1]`=self（渲染跳过，
+    与 Python `gen` 一致），静态方法无 self。返回恒包 `Result<…>`，void → `Result<()>`。
+
+  **(5b) `new` 构造函数（决策 Q3，仅当 `has_init`）**：`fn new(<init_fields>) -> Result<<T>>`，
+    参数取自 `ObjectInfo.init_fields`（按序展开为位置参数；Rust 无 kwargs/默认值）。经反射
+    `__ffi_init__` 构造（自包含，**无需**全局工厂命名约定）：
+
+    ```rust
+    fn new(value: i64) -> Result<Self> {
+        let ctor = get_type_method(<T>Obj::TYPE_KEY, "__ffi_init__")?;
+        let call = into_typed_fn!(ctor, Fn(<init_params>) -> Result<<T>>);
+        call(<init_params>)
+    }
+    ```
+
+    `has_init=False` → 不生成 `new`。方法循环里需**跳过 `__ffi_init__`**（它变成 `new`，不作普通方法）。
+
+  **(6) 每文件共享辅助函数**（emit 一次/文件，决策 Q4）：
+    `lookup_type_index(type_key) -> i32`（`TVMFFITypeKeyToIndex` + per-key `OnceLock` 缓存，
+    match 臂覆盖**本文件**定义的全部 type key）和 `get_type_method(type_key, name) -> Result<Function>`
+    （遍历 `TVMFFIGetTypeInfo(idx).methods` 按名取 `Function`，原样照搬示例）。
 - **额外 `use`**：除字段/返回类型外，生成物还需要机制类型的 `use`：
   `tvm_ffi::{Result, Function, AnyView, into_typed_fn}`、`tvm_ffi::object::{Object, ObjectArc, ObjectCore}`、
   `tvm_ffi::derive::ObjectRef`、以及 helper 用到的 `tvm_ffi::tvm_ffi_sys::{TVMFFIGetTypeInfo,
@@ -310,16 +343,25 @@ Python 全树 `uv run tvm-ffi-stubgen --dry-run python/tvm_ffi` 无异常。
 已由 crate 核对确定（见步骤 1 表）：标量 `int→i64`/`float→f64`/`bool→bool`、
 `None→()`、`String`/`Bytes`、Object 等类型名均以 `rust/tvm-ffi` 为准；
 `Map`/`Dict`/`List` 确认不支持、需报错。**方法调用机制已由 `cpp_rust_test/` 示例确定**
-（`get_type_method` + `into_typed_fn!`，见步骤 5），不再用 `todo!()` 占位。仍待明确：
+（`get_type_method` + `into_typed_fn!`，见步骤 5）。
 
-- **方法 `&self` vs `&mut self`**：示例里 `update` 手写成 `&mut self`（C++ 非 const、会改 `value`）。
-  反射元数据能否区分 const/mut？若不能，默认取哪个（保守 `&self`？还是 `&mut self`）。
-- **static 方法**：`is_member=False` 的方法不带 self，`into_typed_fn!` 签名也无 self；需确认调用形态。
-- **`__init__`/`__ffi_init__` / 构造**：示例靠 global 工厂 `make_expr`/`make_add` 构造，而
-  全局函数**不生成**（决策 5）。那 Rust 端是否要为 object 生成构造函数（调 `__ffi_init__`），
-  还是让用户自己 `get_global` 工厂？先 TODO。
-- **共享 helper 放哪**：`lookup_type_index` / `get_type_method` 每文件生成一份，还是抽进
-  `tvm_ffi` crate（更干净，但需改 crate）。`lookup_type_index` 的缓存形式（per-type `OnceLock`？）。
-- `Any` vs `AnyView`：返回/参数/字段位置分别用拥有型 `Any` 还是非拥有 `AnyView`/引用。
-- `tuple`（含空 tuple）的 Rust 落点（`()` 还是元组类型）。
-- Rust 文件布局（步骤 9）。
+**已全部拍板**（用户确认）：
+
+- **Q1 可变性**：由字段 `frozen` 决定——全可写→mutable（`DerefMut` + `&mut self`）；全只读→immutable
+  （仅 `Deref` + `&self`）；混合→warn 后按 immutable。
+- **Q2 static 方法**：关联函数、无 self（示例 `Expr::test`）。
+- **Q3 `new`**：经反射 `__ffi_init__` 构造（cpp_rust_test1 已演示），参数取 `init_fields`，
+  仅当 `has_init` 才生成；方法循环跳过 `__ffi_init__`。
+- **Q4 helper**：`lookup_type_index` / `get_type_method` 每文件各生成一份。
+- **Q5 `Any` vs `AnyView`**（已采纳，文档 `docs/concepts/any.rst:38/230` 背书）：字段→`Any`、
+  返回→`Any`、**方法参数顶层 `Any`→`AnyView`**（嵌套仍 `Any`；仅在 step 5 渲染参数时特判，不改 `render_type`）。
+- **Q6 tuple**：空→`()`，非空→`(T1, T2, ...)`。
+
+实现期需顺手处理的小事（不阻塞，step 5 内解决）：
+
+- **标识符净化**：FFI 字段/方法名若是 Rust 关键字或非法 ident（如 `type`/`match`），用 `r#` 原始标识符或跳过。
+- `init_fields` 含 `kw_only`/`has_default` 元信息，Rust 无对应概念 → 一律按位置参数展开。
+
+仍待确认：
+
+- Rust 文件布局（步骤 9，属 P3，不挡 step 5）。

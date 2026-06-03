@@ -43,12 +43,14 @@ from tvm_ffi.stub.rust_backend.backend import RustBackend
 from tvm_ffi.stub.rust_backend.codegen import (
     UnsupportedTypeError,
     build_ty_render,
+    generate_rust_object,
     render_rust_type,
 )
 from tvm_ffi.stub.rust_backend.imports import RustImports, RustUse
 from tvm_ffi.stub.utils import (
     FuncInfo,
     InitConfig,
+    InitFieldInfo,
     NamedTypeSchema,
     ObjectInfo,
     Options,
@@ -1000,3 +1002,179 @@ def test_ty_render_seeds_from_existing_imports() -> None:
     imports = RustImports(items=[RustUse("crate_a::Foo")])
     tr = build_ty_render({"B": "crate_b::Foo"}, imports)
     assert tr("B") == "Foo2"
+
+
+# ---------------------------------------------------------------------------
+# Rust backend: object generation (rust_backend/codegen.py)
+# ---------------------------------------------------------------------------
+
+
+def _rust_object_block(key: str) -> CodeBlock:
+    return CodeBlock(
+        kind="object",
+        param=key,
+        lineno_start=1,
+        lineno_end=2,
+        lines=[f"// tvm-ffi-stubgen(begin): object/{key}", "// tvm-ffi-stubgen(end)"],
+    )
+
+
+def _gen_rust_object(info: ObjectInfo) -> tuple[str, RustImports]:
+    block = _rust_object_block(info.type_key or "x")
+    imports = RustImports()
+    generate_rust_object(block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), info)
+    return "\n".join(block.lines), imports
+
+
+def _expr_info(*, value_frozen: bool = False) -> ObjectInfo:
+    """Root `Expr`: field `value: i64`, static `test() -> i64`, init(i64)."""
+    return ObjectInfo(
+        fields=[NamedTypeSchema("value", TypeSchema("int"), frozen=value_frozen)],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema("test", TypeSchema("Callable", (TypeSchema("int"),))),
+                is_member=False,
+            )
+        ],
+        type_key="cpp_rust_test.Expr",
+        parent_type_key="ffi.Object",
+        init_fields=[
+            InitFieldInfo("value", NamedTypeSchema("value", TypeSchema("int")), False, False)
+        ],
+        has_init=True,
+    )
+
+
+def _add_info() -> ObjectInfo:
+    """Return derived `Add` info with fields, method, and constructor metadata."""
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("a", TypeSchema("cpp_rust_test.Expr")),
+            NamedTypeSchema("b", TypeSchema("cpp_rust_test.Expr")),
+        ],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema(
+                    "update",
+                    TypeSchema("Callable", (TypeSchema("None"), TypeSchema("cpp_rust_test.Add"))),
+                ),
+                is_member=True,
+            )
+        ],
+        type_key="cpp_rust_test.Add",
+        parent_type_key="cpp_rust_test.Expr",
+        init_fields=[
+            InitFieldInfo(
+                "a", NamedTypeSchema("a", TypeSchema("cpp_rust_test.Expr")), False, False
+            ),
+            InitFieldInfo(
+                "b", NamedTypeSchema("b", TypeSchema("cpp_rust_test.Expr")), False, False
+            ),
+            InitFieldInfo("value", NamedTypeSchema("value", TypeSchema("int")), False, False),
+        ],
+        has_init=True,
+    )
+
+
+def test_rust_object_root_struct_and_impl() -> None:
+    text, imports = _gen_rust_object(_expr_info())
+    # data struct embeds the root Object as `base`
+    assert "#[repr(C)]" in text
+    assert "struct ExprObj {" in text
+    assert "    base: Object," in text
+    assert "    pub value: i64," in text
+    # ObjectCore impl
+    assert 'const TYPE_KEY: &\'static str = "cpp_rust_test.Expr";' in text
+    assert "        lookup_type_index(Self::TYPE_KEY)" in text
+    assert "        Object::object_header_mut(&mut this.base)" in text
+    # ref + Deref/DerefMut (value is def_rw -> mutable class)
+    assert "#[derive(DeriveObjectRef, Clone)]" in text
+    assert "struct Expr {" in text
+    assert "    data: ObjectArc<ExprObj>," in text
+    assert "impl Deref for Expr {" in text
+    assert "impl DerefMut for Expr {" in text
+    # new via __ffi_init__
+    assert "fn new(value: i64) -> Result<Self> {" in text
+    assert 'let ctor = get_type_method(ExprObj::TYPE_KEY, "__ffi_init__")?;' in text
+    assert "let call = into_typed_fn!(ctor, Fn(i64) -> Result<Expr>);" in text
+    # static method: no self
+    assert "fn test() -> Result<i64> {" in text
+    assert 'let f = get_type_method(ExprObj::TYPE_KEY, "test")?;' in text
+    assert "let call = into_typed_fn!(f, Fn() -> Result<i64>);" in text
+    uses = {u.as_use_line() for u in imports.items}
+    assert "use tvm_ffi::object::Object;" in uses
+    assert "use std::ops::DerefMut;" in uses
+
+
+def test_rust_object_derived_embeds_parent() -> None:
+    text, _ = _gen_rust_object(_add_info())
+    assert "struct AddObj {" in text
+    assert "    base: ExprObj," in text  # parent Obj embedded, not Object
+    assert "    pub a: Expr," in text
+    assert "        ExprObj::object_header_mut(&mut this.base)" in text
+    # derived Obj also derefs to its embedded base
+    assert "impl Deref for AddObj {" in text
+    assert "    type Target = ExprObj;" in text
+    # instance method: &mut self receiver (mutable class) but shared `&Add` in typed fn
+    assert "fn update(&mut self) -> Result<()> {" in text
+    assert "let call = into_typed_fn!(f, Fn(&Add) -> Result<()>);" in text
+    assert "        call(self)" in text
+    assert "fn new(a: Expr, b: Expr, value: i64) -> Result<Self> {" in text
+
+
+def test_rust_object_immutable_has_no_derefmut() -> None:
+    text, _ = _gen_rust_object(_expr_info(value_frozen=True))  # def_ro -> immutable
+    assert "impl Deref for Expr {" in text
+    assert "DerefMut" not in text
+    assert "fn test() -> Result<i64> {" in text  # static unaffected
+
+
+def test_rust_object_mixed_fields_warns_and_immutable(capsys: pytest.CaptureFixture[str]) -> None:
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("ro", TypeSchema("int"), frozen=True),
+            NamedTypeSchema("rw", TypeSchema("int"), frozen=False),
+        ],
+        methods=[],
+        type_key="demo.Mixed",
+        parent_type_key="ffi.Object",
+    )
+    text, _ = _gen_rust_object(info)
+    out = capsys.readouterr().out
+    assert "mixed read-only/read-write" in out
+    assert "DerefMut" not in text  # treated as immutable
+
+
+def test_rust_object_skipped_on_unsupported(capsys: pytest.CaptureFixture[str]) -> None:
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("cfg", TypeSchema("Map", (TypeSchema("str"), TypeSchema("int")))),
+        ],
+        methods=[],
+        type_key="demo.HasMap",
+        parent_type_key="ffi.Object",
+    )
+    block = _rust_object_block("demo.HasMap")
+    imports = RustImports(items=[RustUse("tvm_ffi::Tensor")])
+    generate_rust_object(block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), info)
+    # block emptied to just the markers; imports untouched (no partial leakage)
+    assert block.lines == [
+        "// tvm-ffi-stubgen(begin): object/demo.HasMap",
+        "// tvm-ffi-stubgen(end)",
+    ]
+    assert imports.items == [RustUse("tvm_ffi::Tensor")]
+    assert "[Skipped] object demo.HasMap" in capsys.readouterr().out
+
+
+def test_rust_object_no_init_no_methods_has_no_impl() -> None:
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("value", TypeSchema("int"))],
+        methods=[],
+        type_key="demo.Plain",
+        parent_type_key="ffi.Object",
+        has_init=False,
+    )
+    text, _ = _gen_rust_object(info)
+    assert "struct PlainObj {" in text
+    assert "impl Plain {" not in text  # no new, no methods -> no impl block
+    assert "fn new" not in text
