@@ -52,17 +52,45 @@ class UnsupportedTypeError(Exception):
 def build_ty_render(ty_map: dict[str, str], imports: RustImports) -> Callable[[str], str]:
     """Build a leaf-origin -> Rust-leaf-name mapper that records ``use`` imports.
 
-    Provisional, minimal version used by :func:`render_rust_type`. Given an FFI
-    origin, it looks up the (fully-qualified) Rust path in ``ty_map``, records the
-    ``use`` (when the path is qualified, i.e. not a prelude/primitive), and returns
-    the leaf name. Step 4 will extend this with alias/collision handling.
+    Given an FFI origin, it looks up the (fully-qualified) Rust path in ``ty_map``,
+    records the ``use`` it needs, and returns the name to use in scope:
+
+    * bare prelude/primitive types (``i64`` / ``bool`` / ``()`` / ``Option``) carry
+      no ``::`` -> no ``use`` is recorded and the bare name is returned;
+    * a qualified path is recorded once (repeat references to the *same* path reuse
+      the binding rather than emitting a duplicate ``use``);
+    * if a different path wants a leaf name already taken (e.g. ``a::Foo`` and
+      ``b::Foo``), the later one is aliased -- ``use b::Foo as Foo2;`` -- and the
+      alias is returned. This type-vs-type clash is the only ``use`` collision that
+      arises in Rust (function/method names live in a separate namespace, and
+      methods are scoped inside ``impl`` blocks, so they never shadow a ``use``).
     """
+    # Seed from anything already recorded (e.g. import-object directives) so we
+    # don't re-import or collide with pre-existing uses.
+    binding_of: dict[str, str] = {u.full_name: u.name_in_scope for u in imports.items}
+    used_names: set[str] = {u.name_in_scope for u in imports.items}
 
     def _run(origin: str) -> str:
-        use = RustUse(ty_map.get(origin, origin))
-        if use.as_use_line():  # qualified path -> needs `use`; bare prelude -> skip
-            imports.items.append(use)
-        return use.leaf
+        probe = RustUse(ty_map.get(origin, origin))
+        if not probe.as_use_line():
+            # bare prelude/primitive: no import, no collision tracking.
+            return probe.leaf
+        full = probe.full_name
+        if full in binding_of:
+            return binding_of[full]  # same path already imported (maybe aliased)
+        leaf = probe.leaf
+        if leaf not in used_names:
+            name, use = leaf, probe
+        else:
+            n = 2
+            while f"{leaf}{n}" in used_names:
+                n += 1
+            name = f"{leaf}{n}"
+            use = RustUse(full, alias=name)
+        imports.items.append(use)
+        used_names.add(name)
+        binding_of[full] = name
+        return name
 
     return _run
 

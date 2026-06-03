@@ -962,3 +962,41 @@ def test_rust_backend_render_type_delegates() -> None:
     ty_render = build_ty_render(RC.RUST_TY_MAP_DEFAULTS, imports)
     out = RustBackend().render_type(TypeSchema("Optional", (TypeSchema("int"),)), ty_render)
     assert out == "Option<i64>"
+
+
+def test_ty_render_dedups_same_path() -> None:
+    imports = RustImports()
+    tr = build_ty_render(RC.RUST_TY_MAP_DEFAULTS, imports)
+    assert tr("Array") == "Array"
+    assert tr("Array") == "Array"  # same path again -> reuse binding
+    assert imports.items == [RustUse("tvm_ffi::Array")]  # recorded exactly once
+
+
+def test_ty_render_aliases_same_leaf_different_path() -> None:
+    imports = RustImports()
+    tr = build_ty_render({"A": "crate_a::Foo", "B": "crate_b::Foo", "C": "crate_c::Foo"}, imports)
+    assert tr("A") == "Foo"  # first claims the bare leaf
+    assert tr("B") == "Foo2"  # collision -> aliased
+    assert tr("C") == "Foo3"  # next collision
+    lines = [u.as_use_line() for u in imports.items]
+    assert lines == [
+        "use crate_a::Foo;",
+        "use crate_b::Foo as Foo2;",
+        "use crate_c::Foo as Foo3;",
+    ]
+
+
+def test_ty_render_bare_types_not_tracked() -> None:
+    imports = RustImports()
+    tr = build_ty_render(RC.RUST_TY_MAP_DEFAULTS, imports)
+    assert tr("int") == "i64"
+    assert tr("Optional") == "Option"  # prelude, bare
+    assert imports.items == []
+
+
+def test_ty_render_seeds_from_existing_imports() -> None:
+    # A pre-seeded `use` (e.g. from an import-object directive) must be respected:
+    # a different path with the same leaf gets aliased rather than colliding.
+    imports = RustImports(items=[RustUse("crate_a::Foo")])
+    tr = build_ty_render({"B": "crate_b::Foo"}, imports)
+    assert tr("B") == "Foo2"

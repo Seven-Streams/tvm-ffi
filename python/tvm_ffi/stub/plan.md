@@ -50,7 +50,8 @@
 | 测试适配 | `test_stubgen.py` 迁移到新结构 | ✅ 26 passed |
 | §4⑤ | `rust_backend` 常量表（类型/路径/builtin） | ✅ 已完成（步骤 1） |
 | §4④(Rust) | Rust import 表示（`use` 收集器） | ✅ 已完成（步骤 2） |
-| §4② | `RustBackend.render_type` 类型遍历 + 不支持类型抛异常 | ✅ 已完成（步骤 3；ty_render 临时版，步骤 4 正式化） |
+| §4② | `RustBackend.render_type` 类型遍历 + 不支持类型抛异常 | ✅ 已完成（步骤 3） |
+| §4②附 | Rust `TyRenderer`（去重 + 同名 leaf 起别名，方案 A） | ✅ 已完成（步骤 4） |
 | §4① | `rust_backend/codegen.py`：object 生成（struct+impl）；**global 函数不生成**（决策 5） | ⬜ 待做（P2） |
 | §4⑥ | `cli.py` 目标文件名由 backend 决定 | ⬜ 待做（P3，依赖布局决策） |
 
