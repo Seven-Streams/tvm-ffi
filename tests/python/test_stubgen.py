@@ -39,6 +39,7 @@ from tvm_ffi.stub.python_backend.codegen import (
 )
 from tvm_ffi.stub.python_backend.imports import ImportItem
 from tvm_ffi.stub.rust_backend import consts as RC
+from tvm_ffi.stub.rust_backend.imports import RustImports, RustUse
 from tvm_ffi.stub.utils import (
     FuncInfo,
     InitConfig,
@@ -819,3 +820,55 @@ def test_rust_unsupported_origins(origin: str) -> None:
 
 def test_rust_mod_map_ffi_to_crate_root() -> None:
     assert RC.RUST_MOD_MAP["ffi"] == "tvm_ffi"
+
+
+# ---------------------------------------------------------------------------
+# Rust backend: use modelling (rust_backend/imports.py)
+# ---------------------------------------------------------------------------
+
+
+def test_rustuse_keeps_qualified_path() -> None:
+    u = RustUse("tvm_ffi::Array")
+    assert u.path == "tvm_ffi::Array"
+    assert u.leaf == "Array"
+    assert u.full_name == "tvm_ffi::Array"
+    assert u.name_in_scope == "Array"
+    assert u.as_use_line() == "use tvm_ffi::Array;"
+
+
+def test_rustuse_normalizes_dotted_ffi_name() -> None:
+    # leading `ffi` segment rewritten via RUST_MOD_MAP, dots -> ::
+    assert RustUse("ffi.String").path == "tvm_ffi::String"
+    # unmapped crate prefix is preserved, dots still -> ::
+    u = RustUse("my_pkg.sub.Foo")
+    assert u.path == "my_pkg::sub::Foo"
+    assert u.leaf == "Foo"
+    assert u.as_use_line() == "use my_pkg::sub::Foo;"
+
+
+def test_rustuse_alias() -> None:
+    u = RustUse("tvm_ffi::Array", alias="_Array")
+    assert u.name_in_scope == "_Array"
+    assert u.as_use_line() == "use tvm_ffi::Array as _Array;"
+
+
+@pytest.mark.parametrize("bare", ["i64", "f64", "bool", "()", "Option"])
+def test_rustuse_bare_types_need_no_use(bare: str) -> None:
+    u = RustUse(bare)
+    assert u.path == bare
+    assert u.leaf == bare
+    assert u.as_use_line() == ""
+
+
+def test_rustuse_is_hashable_and_dedups() -> None:
+    a = RustUse("tvm_ffi::Array")
+    b = RustUse("tvm_ffi::Array")
+    assert a == b
+    assert len({a, b}) == 1
+
+
+def test_rustimports_default_empty() -> None:
+    imp = RustImports()
+    assert imp.items == []
+    imp.items.append(RustUse("tvm_ffi::Tensor"))
+    assert imp.items[0].leaf == "Tensor"

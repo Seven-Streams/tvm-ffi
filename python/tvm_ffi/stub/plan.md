@@ -49,7 +49,7 @@
 | 结构拆分 | Rust 骨架 → `rust_backend/` | ✅ 已完成（仅骨架） |
 | 测试适配 | `test_stubgen.py` 迁移到新结构 | ✅ 26 passed |
 | §4⑤ | `rust_backend` 常量表（类型/路径/builtin） | ✅ 已完成（步骤 1） |
-| §4④(Rust) | Rust import 表示（`use` 收集器） | ⬜ 待做（P1） |
+| §4④(Rust) | Rust import 表示（`use` 收集器） | ✅ 已完成（步骤 2） |
 | §4② | `RustBackend.render_type` 类型遍历 + 不支持类型抛异常 | ⬜ 待做（P2） |
 | §4① | `rust_backend/codegen.py`：object 生成（struct+impl）；**global 函数不生成**（决策 5） | ⬜ 待做（P2） |
 | §4⑥ | `cli.py` 目标文件名由 backend 决定 | ⬜ 待做（P3，依赖布局决策） |
