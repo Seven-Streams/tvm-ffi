@@ -269,7 +269,7 @@ stub/                       # 语言无关
 - **验收**：能为 `cpp_rust_test` 的 `Expr`/`Add` 生成与 `rust/src/main.rs` **同构**的绑定
   （命名/布局/方法分发一致，可编译可跑）；含不支持类型的 object 被整体跳过。
 
-#### 步骤 6：全局函数块 = **no-op**（决策 5）
+#### 步骤 6：全局函数块 = **no-op**（决策 5）✅ 已完成
 
 - `global/<prefix>` 块在 Rust 后端**不生成任何内容**——Rust 运行时经
   `Function::get_global` 动态调用，无需 stub。

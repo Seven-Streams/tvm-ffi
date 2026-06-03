@@ -1166,6 +1166,25 @@ def test_rust_object_skipped_on_unsupported(capsys: pytest.CaptureFixture[str]) 
     assert "[Skipped] object demo.HasMap" in capsys.readouterr().out
 
 
+def test_rust_global_funcs_block_is_noop() -> None:
+    # Decision 5: Rust does not generate global functions; the block is untouched.
+    lines = ["// tvm-ffi-stubgen(begin): global/demo", "// tvm-ffi-stubgen(end)"]
+    block = CodeBlock(
+        kind="global", param=("demo", ""), lineno_start=1, lineno_end=2, lines=list(lines)
+    )
+    funcs = [
+        FuncInfo(
+            NamedTypeSchema("demo.f", TypeSchema("Callable", (TypeSchema("int"),))), is_member=False
+        )
+    ]
+    imports = RustImports()
+    RustBackend().generate_global_funcs_block(
+        block, funcs, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options()
+    )
+    assert block.lines == lines
+    assert imports.items == []
+
+
 def test_rust_object_no_init_no_methods_has_no_impl() -> None:
     info = ObjectInfo(
         fields=[NamedTypeSchema("value", TypeSchema("int"))],

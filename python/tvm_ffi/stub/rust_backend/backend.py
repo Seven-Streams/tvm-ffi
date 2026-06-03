@@ -91,8 +91,12 @@ class RustBackend:
         imports: Any,
         opt: Options,
     ) -> None:
-        """Emit Rust function signatures for a ``global/<prefix>`` block. TODO(rust)."""
-        raise NotImplementedError("RustBackend.generate_global_funcs_block")
+        """No-op (decision 5): global functions are not generated for Rust.
+
+        Rust calls C++ globals dynamically via ``Function::get_global(name)``, so
+        a ``global/<prefix>`` block needs no static stub -- leave it untouched.
+        """
+        pass
 
     def generate_object_block(
         self,
