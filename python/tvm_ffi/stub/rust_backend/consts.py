@@ -70,6 +70,14 @@ RUST_TY_MAP_DEFAULTS = {
     "ffi.Function": "tvm_ffi::Function",
 }
 
+#: Rust paths that must be rendered **fully qualified inline** and emit **no**
+#: ``use``. The sole case is ``tvm_ffi::String``: importing it (``use
+#: tvm_ffi::String;``) shadows the prelude ``std::string::String`` for the whole
+#: module, which breaks ``#[derive(ObjectRef)]`` (its ``fn type_str() -> String``
+#: then resolves to ``tvm_ffi::String`` and fails the trait signature). Rendering
+#: it as ``tvm_ffi::String`` inline avoids the shadow entirely.
+RUST_NO_IMPORT_FULLPATH = frozenset({"tvm_ffi::String"})
+
 #: FFI origins the Rust crate cannot represent. ``render_type`` raises a sentinel
 #: ``UnsupportedTypeError`` on these (defined in the Rust codegen module); the
 #: object-level generator then warns and skips that object. Do NOT map these to

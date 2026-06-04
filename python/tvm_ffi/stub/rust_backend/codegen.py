@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from .. import consts as C
-from .consts import RUST_UNSUPPORTED_ORIGINS
+from .consts import RUST_NO_IMPORT_FULLPATH, RUST_UNSUPPORTED_ORIGINS
 from .imports import RustImports, RustUse
 
 if TYPE_CHECKING:
@@ -78,6 +78,10 @@ def build_ty_render(ty_map: dict[str, str], imports: RustImports) -> Callable[[s
         if not probe.as_use_line():
             # bare prelude/primitive: no import, no collision tracking.
             return probe.leaf
+        if probe.full_name in RUST_NO_IMPORT_FULLPATH:
+            # rendered fully-qualified inline; no `use` (avoids shadowing a
+            # prelude name -- e.g. `String` vs `std::string::String`).
+            return probe.full_name
         full = probe.full_name
         if full in binding_of:
             return binding_of[full]  # same path already imported (maybe aliased)
