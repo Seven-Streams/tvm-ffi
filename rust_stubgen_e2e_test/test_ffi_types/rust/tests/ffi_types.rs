@@ -21,7 +21,10 @@
 
 use test_ffi_types::ensure_loaded;
 use test_ffi_types::generated::test_ffi_types::FfiTypesHolder;
-use tvm_ffi::{AnyView, DLDataType, DLDataTypeCode, DLDevice, DLDeviceType, Function, Result, Shape};
+use tvm_ffi::{
+    AnyView, CPUNDAlloc, DLDataType, DLDataTypeCode, DLDevice, DLDeviceType, Function, Result,
+    Shape, Tensor,
+};
 
 #[test]
 fn shape_param_and_return() -> Result<()> {
@@ -92,5 +95,27 @@ fn function_as_return() -> Result<()> {
     let adder = FfiTypesHolder::make_adder(10)?;
     let r: i64 = adder.call_packed(&[AnyView::from(&5i64)])?.try_into()?;
     assert_eq!(r, 15);
+    Ok(())
+}
+
+// --- F1: Tensor (DLPack) as param / return ------------------------------------
+
+#[test]
+fn tensor_param_and_return() -> Result<()> {
+    ensure_loaded();
+    let dtype = DLDataType::new(DLDataTypeCode::kDLFloat, 32, 1);
+    let device = DLDevice::new(DLDeviceType::kDLCPU, 0);
+    let tensor = Tensor::from_nd_alloc(CPUNDAlloc {}, &[2, 3, 4], dtype, device);
+
+    // Tensor as a parameter: C++ reads ndim / numel / dtype.
+    assert_eq!(FfiTypesHolder::tensor_ndim(tensor.clone())?, 3);
+    assert_eq!(FfiTypesHolder::tensor_numel(tensor.clone())?, 24);
+    assert_eq!(FfiTypesHolder::tensor_dtype(tensor.clone())?.bits, 32);
+
+    // Tensor as a return value (echoed): the round-trip preserves shape/dtype.
+    let echoed = FfiTypesHolder::echo_tensor(tensor)?;
+    assert_eq!(echoed.shape(), &[2, 3, 4]);
+    assert_eq!(echoed.ndim(), 3);
+    assert_eq!(echoed.dtype().code, DLDataTypeCode::kDLFloat as u8);
     Ok(())
 }

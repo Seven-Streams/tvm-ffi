@@ -296,3 +296,9 @@ impl NestedHolder {
     }
 }
 // tvm-ffi-stubgen(end)
+
+// tvm-ffi-stubgen(begin): object/test_container_types.MapHolder
+// tvm-ffi-stubgen(end)
+
+// tvm-ffi-stubgen(begin): object/test_container_types.VariantHolder
+// tvm-ffi-stubgen(end)

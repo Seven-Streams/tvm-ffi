@@ -20,7 +20,7 @@
 
 use test_object_hierarchy::ensure_loaded;
 use test_object_hierarchy::generated::test_object_hierarchy::{
-    Box3D, Circle, ColoredBox, Group, Rectangle, Shape, ShapeBatch, Tracked,
+    Box3D, Circle, ColoredBox, Group, Rectangle, Shape, ShapeBatch, Tracked, Validated,
 };
 use tvm_ffi::{Array, Result};
 
@@ -279,5 +279,42 @@ fn mid_level_type_has_own_method_and_inherited_fields() -> Result<()> {
     assert_eq!(b.depth, 5);
     assert_eq!(b.width, 2); // inherited ShapeObj field
     assert_eq!(b.volume()?, 30); // own method: 2 * 3 * 5
+    Ok(())
+}
+
+// --- D2 / D3: constructor and static method throw -----------------------------
+
+#[test]
+fn constructor_throws_returns_err() -> Result<()> {
+    ensure_loaded();
+    // D2: a valid constructor succeeds; an invalid one surfaces as `Err`.
+    let ok = Validated::new(5)?;
+    assert_eq!(ok.value, 5);
+
+    // `.err()` avoids requiring `Validated: Debug` (which `expect_err` would need).
+    let err = Validated::new(-1).err().expect("negative value must error");
+    assert_eq!(err.kind().as_str(), "ValueError");
+    assert!(err.message().contains("non-negative"));
+    Ok(())
+}
+
+#[test]
+fn static_method_throws_returns_err() -> Result<()> {
+    ensure_loaded();
+    // D3: static method throws on divide-by-zero.
+    assert_eq!(ShapeBatch::safe_divide(10, 2)?, 5);
+    let err = ShapeBatch::safe_divide(1, 0).expect_err("divide-by-zero must error");
+    assert_eq!(err.kind().as_str(), "ValueError");
+    Ok(())
+}
+
+// --- B2: pure static factory returning an object ------------------------------
+
+#[test]
+fn static_factory_returns_object() -> Result<()> {
+    ensure_loaded();
+    let unit = ShapeBatch::unit_shape()?;
+    assert_eq!(unit.width, 1);
+    assert_eq!(unit.height, 1);
     Ok(())
 }

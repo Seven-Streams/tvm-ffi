@@ -85,6 +85,7 @@ use tvm_ffi::DLDevice;
 use tvm_ffi::Function;
 use tvm_ffi::Result;
 use tvm_ffi::Shape;
+use tvm_ffi::Tensor;
 use tvm_ffi::derive::ObjectRef as DeriveObjectRef;
 use tvm_ffi::object::Object;
 use tvm_ffi::object::ObjectArc;
@@ -175,6 +176,26 @@ impl FfiTypesHolder {
 
     pub fn make_adder(_0: i64) -> Result<Function> {
         let f = get_type_method(FfiTypesHolderObj::TYPE_KEY, "make_adder")?;
+        Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
+    }
+
+    pub fn tensor_ndim(_0: Tensor) -> Result<i64> {
+        let f = get_type_method(FfiTypesHolderObj::TYPE_KEY, "tensor_ndim")?;
+        Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
+    }
+
+    pub fn tensor_numel(_0: Tensor) -> Result<i64> {
+        let f = get_type_method(FfiTypesHolderObj::TYPE_KEY, "tensor_numel")?;
+        Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
+    }
+
+    pub fn tensor_dtype(_0: Tensor) -> Result<DLDataType> {
+        let f = get_type_method(FfiTypesHolderObj::TYPE_KEY, "tensor_dtype")?;
+        Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
+    }
+
+    pub fn echo_tensor(_0: Tensor) -> Result<Tensor> {
+        let f = get_type_method(FfiTypesHolderObj::TYPE_KEY, "echo_tensor")?;
         Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
     }
 

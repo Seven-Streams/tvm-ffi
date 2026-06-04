@@ -200,8 +200,9 @@ uv run tvm-ffi-stubgen --target rust \
 | Nested containers (Array<Array\<T\>>, Array<Optional\<T\>>, Optional<Array\<T\>>) | test_container_types | ✓ |
 | Shape / DataType / Device | test_ffi_types | ✓ |
 | Function (callback param + return) | test_ffi_types | ✓ |
-| Tensor (DLPack) | — | Pending* |
-| Tuples / Map / Dict / Variant | — | Pending* (Map/Dict/Variant skipped by design) |
+| Tensor (DLPack), param + return | test_ffi_types | ✓ |
+| Map / Dict / Variant (unsupported → graceful `[Skipped]`) | test_container_types | ✓ (skip verified) |
+| Tuple | — | Pending* (no Rust tuple type / not AnyCompatible) |
 | Any/AnyView (param→AnyView, return/field→Any) | test_any_types | ✓ |
 | Object references | test_object_hierarchy | ✓ |
 | Objects as params / returns / fields | test_object_hierarchy | ✓ |

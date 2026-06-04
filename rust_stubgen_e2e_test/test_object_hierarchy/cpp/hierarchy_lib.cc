@@ -132,6 +132,17 @@ class ShapeBatchObj : public ffi::Object {
     return ffi::Array<Shape>({Shape(s->width, 0), Shape(0, s->height)});
   }
 
+  // D3: static method that throws.
+  static int64_t SafeDivide(int64_t a, int64_t b) {
+    if (b == 0) {
+      TVM_FFI_THROW(ValueError) << "SafeDivide: division by zero";
+    }
+    return a / b;
+  }
+
+  // B2: pure static factory producing a fresh object (Rust takes over refcount).
+  static Shape UnitShape() { return Shape(1, 1); }
+
   static constexpr bool _type_mutable = true;
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("test_object_hierarchy.ShapeBatch", ShapeBatchObj, ffi::Object);
 };
@@ -141,6 +152,29 @@ class ShapeBatch : public ffi::ObjectRef {
   ShapeBatch() { data_ = ffi::make_object<ShapeBatchObj>(); }
 
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(ShapeBatch, ffi::ObjectRef, ShapeBatchObj);
+};
+
+// D2: a constructor that throws on invalid arguments. `new(...)` must surface
+// the C++ exception as `Err`, not panic across the FFI boundary.
+class ValidatedObj : public ffi::Object {
+ public:
+  int64_t value;
+
+  explicit ValidatedObj(int64_t value = 0) : value(value) {
+    if (value < 0) {
+      TVM_FFI_THROW(ValueError) << "Validated: value must be non-negative";
+    }
+  }
+
+  static constexpr bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("test_object_hierarchy.Validated", ValidatedObj, ffi::Object);
+};
+
+class Validated : public ffi::ObjectRef {
+ public:
+  explicit Validated(int64_t value = 0) { data_ = ffi::make_object<ValidatedObj>(value); }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(Validated, ffi::ObjectRef, ValidatedObj);
 };
 
 // --- C: registered object(s) as FIELD types (nested objects) -----------------
@@ -336,10 +370,19 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def_static("total_area", &ShapeBatchObj::TotalArea, "sum of areas in an Array<Shape>")
       .def_static("non_empty_or_none", &ShapeBatchObj::NonEmptyOrNone,
                   "Some(s) if area>0 else None")
-      .def_static("split", &ShapeBatchObj::Split, "split a shape into two");
+      .def_static("split", &ShapeBatchObj::Split, "split a shape into two")
+      .def_static("safe_divide", &ShapeBatchObj::SafeDivide, "a / b, throws on zero")
+      .def_static("unit_shape", &ShapeBatchObj::UnitShape, "return a fresh 1x1 Shape");
 
   refl::TypeAttrDef<ShapeBatchObj>().def(
       refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<ShapeBatch>);
+
+  refl::ObjectDef<ValidatedObj>()
+      .def(refl::init<int64_t>())
+      .def_rw("value", &ValidatedObj::value, "non-negative value");
+
+  refl::TypeAttrDef<ValidatedObj>().def(
+      refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<Validated>);
 
   refl::ObjectDef<GroupObj>()
       .def(refl::init<Shape, ffi::Array<Shape>>())

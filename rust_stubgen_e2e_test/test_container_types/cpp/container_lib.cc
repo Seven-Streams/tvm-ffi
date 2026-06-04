@@ -199,6 +199,46 @@ class NestedHolder : public ffi::ObjectRef {
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(NestedHolder, ffi::ObjectRef, NestedHolderObj);
 };
 
+// E3/E4: container kinds the Rust crate has no equivalent for (`Map`/`Dict` and
+// `Variant`->`Union`). The generator must skip these objects gracefully -- emit
+// an empty block + a `[Skipped]` message -- rather than produce broken bindings.
+class MapHolderObj : public ffi::Object {
+ public:
+  ffi::Map<ffi::String, int64_t> table;
+
+  explicit MapHolderObj(ffi::Map<ffi::String, int64_t> table = ffi::Map<ffi::String, int64_t>())
+      : table(table) {}
+
+  static constexpr bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("test_container_types.MapHolder", MapHolderObj, ffi::Object);
+};
+
+class MapHolder : public ffi::ObjectRef {
+ public:
+  MapHolder() { data_ = ffi::make_object<MapHolderObj>(); }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(MapHolder, ffi::ObjectRef, MapHolderObj);
+};
+
+class VariantHolderObj : public ffi::Object {
+ public:
+  static ffi::Variant<int64_t, ffi::String> Pick(bool as_int) {
+    if (as_int) return static_cast<int64_t>(7);
+    return ffi::String("x");
+  }
+
+  static constexpr bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("test_container_types.VariantHolder", VariantHolderObj,
+                                    ffi::Object);
+};
+
+class VariantHolder : public ffi::ObjectRef {
+ public:
+  VariantHolder() { data_ = ffi::make_object<VariantHolderObj>(); }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(VariantHolder, ffi::ObjectRef, VariantHolderObj);
+};
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
 
@@ -242,6 +282,19 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 
   refl::TypeAttrDef<NestedHolderObj>().def(
       refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<NestedHolder>);
+
+  refl::ObjectDef<MapHolderObj>()
+      .def(refl::init<ffi::Map<ffi::String, int64_t>>())
+      .def_rw("table", &MapHolderObj::table, "a Map<String, int> field (unsupported in Rust)");
+
+  refl::TypeAttrDef<MapHolderObj>().def(
+      refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<MapHolder>);
+
+  refl::ObjectDef<VariantHolderObj>().def_static(
+      "pick", &VariantHolderObj::Pick, "returns a Variant<int, String> (unsupported in Rust)");
+
+  refl::TypeAttrDef<VariantHolderObj>().def(
+      refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<VariantHolder>);
 }
 
 }  // namespace test_container_types

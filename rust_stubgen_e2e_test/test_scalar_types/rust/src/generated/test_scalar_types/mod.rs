@@ -171,3 +171,56 @@ impl ScalarHolder {
     }
 }
 // tvm-ffi-stubgen(end)
+
+// tvm-ffi-stubgen(begin): object/test_scalar_types.Keywords
+#[repr(C)]
+pub struct KeywordsObj {
+    base: Object,
+    pub r#type: i64,
+    pub r#match: i64,
+    pub r#move: i64,
+}
+
+unsafe impl ObjectCore for KeywordsObj {
+    const TYPE_KEY: &'static str = "test_scalar_types.Keywords";
+
+    fn type_index() -> i32 {
+        lookup_type_index(Self::TYPE_KEY)
+    }
+
+    unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject {
+        Object::object_header_mut(&mut this.base)
+    }
+}
+
+#[repr(C)]
+#[derive(DeriveObjectRef, Clone)]
+pub struct Keywords {
+    data: ObjectArc<KeywordsObj>,
+}
+
+impl Deref for Keywords {
+    type Target = KeywordsObj;
+    fn deref(&self) -> &KeywordsObj {
+        &self.data
+    }
+}
+
+impl DerefMut for Keywords {
+    fn deref_mut(&mut self) -> &mut KeywordsObj {
+        &mut self.data
+    }
+}
+
+impl Keywords {
+    pub fn new(_0: i64, _1: i64, _2: i64) -> Result<Self> {
+        let ctor = get_type_method(KeywordsObj::TYPE_KEY, "__ffi_init__")?;
+        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2)])?.try_into()?)
+    }
+
+    pub fn r#fn(&mut self) -> Result<i64> {
+        let f = get_type_method(KeywordsObj::TYPE_KEY, "fn")?;
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
+    }
+}
+// tvm-ffi-stubgen(end)

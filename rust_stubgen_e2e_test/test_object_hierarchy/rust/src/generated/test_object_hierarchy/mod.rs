@@ -370,6 +370,16 @@ impl ShapeBatch {
         let f = get_type_method(ShapeBatchObj::TYPE_KEY, "split")?;
         Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
     }
+
+    pub fn safe_divide(_0: i64, _1: i64) -> Result<i64> {
+        let f = get_type_method(ShapeBatchObj::TYPE_KEY, "safe_divide")?;
+        Ok(f.call_packed(&[AnyView::from(&_0), AnyView::from(&_1)])?.try_into()?)
+    }
+
+    pub fn unit_shape() -> Result<Shape> {
+        let f = get_type_method(ShapeBatchObj::TYPE_KEY, "unit_shape")?;
+        Ok(f.call_packed(&[])?.try_into()?)
+    }
 }
 // tvm-ffi-stubgen(end)
 
@@ -588,6 +598,52 @@ impl ColoredBox {
     pub fn new(_0: i64, _1: i64, _2: i64, _3: i64) -> Result<Self> {
         let ctor = get_type_method(ColoredBoxObj::TYPE_KEY, "__ffi_init__")?;
         Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2), AnyView::from(&_3)])?.try_into()?)
+    }
+}
+// tvm-ffi-stubgen(end)
+
+// tvm-ffi-stubgen(begin): object/test_object_hierarchy.Validated
+#[repr(C)]
+pub struct ValidatedObj {
+    base: Object,
+    pub value: i64,
+}
+
+unsafe impl ObjectCore for ValidatedObj {
+    const TYPE_KEY: &'static str = "test_object_hierarchy.Validated";
+
+    fn type_index() -> i32 {
+        lookup_type_index(Self::TYPE_KEY)
+    }
+
+    unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject {
+        Object::object_header_mut(&mut this.base)
+    }
+}
+
+#[repr(C)]
+#[derive(DeriveObjectRef, Clone)]
+pub struct Validated {
+    data: ObjectArc<ValidatedObj>,
+}
+
+impl Deref for Validated {
+    type Target = ValidatedObj;
+    fn deref(&self) -> &ValidatedObj {
+        &self.data
+    }
+}
+
+impl DerefMut for Validated {
+    fn deref_mut(&mut self) -> &mut ValidatedObj {
+        &mut self.data
+    }
+}
+
+impl Validated {
+    pub fn new(_0: i64) -> Result<Self> {
+        let ctor = get_type_method(ValidatedObj::TYPE_KEY, "__ffi_init__")?;
+        Ok(ctor.call_packed(&[AnyView::from(&_0)])?.try_into()?)
     }
 }
 // tvm-ffi-stubgen(end)

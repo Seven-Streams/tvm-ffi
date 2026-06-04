@@ -74,6 +74,22 @@ class FfiTypesHolderObj : public ffi::Object {
     return ffi::Function::FromTyped([n](int64_t x) -> int64_t { return n + x; }, "adder");
   }
 
+  // --- F1: Tensor (DLPack) as param / return --------------------------------
+  static int64_t TensorNdim(ffi::Tensor t) { return static_cast<int64_t>(t.ndim()); }
+
+  static int64_t TensorNumel(ffi::Tensor t) {
+    int64_t numel = 1;
+    ffi::ShapeView s = t.shape();
+    for (size_t i = 0; i < s.size(); ++i) {
+      numel *= s[i];
+    }
+    return numel;
+  }
+
+  static DLDataType TensorDtype(ffi::Tensor t) { return t.dtype(); }
+
+  static ffi::Tensor EchoTensor(ffi::Tensor t) { return t; }
+
   static constexpr bool _type_mutable = true;
   TVM_FFI_DECLARE_OBJECT_INFO("test_ffi_types.FfiTypesHolder", FfiTypesHolderObj, ffi::Object);
 };
@@ -105,6 +121,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def_static("device_id", &FfiTypesHolderObj::DeviceId, "device id of a Device")
       .def_static("apply_fn", &FfiTypesHolderObj::ApplyFn, "call fn(x) and return the result")
       .def_static("make_adder", &FfiTypesHolderObj::MakeAdder, "return a closure adding n")
+      .def_static("tensor_ndim", &FfiTypesHolderObj::TensorNdim, "ndim of a Tensor")
+      .def_static("tensor_numel", &FfiTypesHolderObj::TensorNumel, "element count of a Tensor")
+      .def_static("tensor_dtype", &FfiTypesHolderObj::TensorDtype, "dtype of a Tensor")
+      .def_static("echo_tensor", &FfiTypesHolderObj::EchoTensor, "return the Tensor unchanged")
       .def("shape_ndim", &FfiTypesHolderObj::ShapeNdim, "number of shape dims");
 
   refl::TypeAttrDef<FfiTypesHolderObj>().def(

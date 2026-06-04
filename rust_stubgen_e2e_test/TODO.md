@@ -51,7 +51,7 @@ assertion focus**.
 ### B. Registered object as a RETURN value
 
 - [x] **B1** Instance method returns object: `Shape::scaled(factor) -> Shape` (new object). → `object_returned_from_instance_method`
-- [ ] **B2** Static factory returns object: `static ScalarHolder make_default()`; non-constructor object production, Rust takes over refcount. *(B1 already covers non-constructor object production via an instance method; a pure-static variant is still nice-to-have.)*
+- [x] **B2** Static factory returns object: `ShapeBatch::unit_shape() -> Shape`. → `test_object_hierarchy::static_factory_returns_object`
 - [x] **B3** Returns nullable object: `ShapeBatch::non_empty_or_none(Shape) -> Optional<Shape>`; both `Some`/`None`. → `nullable_object_return`
 - [x] **B4** Returns container-of-objects: `ShapeBatch::split(Shape) -> Array<Shape>`. → `array_of_objects_returned`
 
@@ -62,8 +62,8 @@ assertion focus**.
 ### D. Error propagation (`Result::Err` branch currently 0%)
 
 - [x] **D1** `Shape::checked_div(int64_t)` `TVM_FFI_THROW(ValueError)` on divide-by-zero; Rust asserts `Err`, checks kind=`ValueError` + message. → `checked_div_ok_and_err`
-- [ ] **D2** Constructor throws on invalid args; assert `new(...)` returns `Err`.
-- [ ] **D3** Static method throws.
+- [x] **D2** Constructor throws on invalid args (`Validated::new(-1)`); asserts `Err` + kind. → `test_object_hierarchy::constructor_throws_returns_err`
+- [x] **D3** Static method throws (`ShapeBatch::safe_divide(1, 0)`). → `test_object_hierarchy::static_method_throws_returns_err`
 
 ---
 
@@ -73,13 +73,13 @@ assertion focus**.
 
 - [x] **E1** Nested containers: `Array<Array<i64>>`, `Array<Optional<i64>>`, `Optional<Array<String>>` (param/return/field) on `NestedHolder`. → `test_container_types::{nested_array_param_and_return, array_of_optionals_param, nested_container_fields, optional_array_field_some_and_none}`
 - [x] **E2** `Optional<String>` as param + return, both Some/None. → `test_container_types::echo_optional_string`
-- [ ] **E3** `Map<K,V>` / `Dict`: at minimum verify stubgen skips unsupported types and prints `[Skipped]`; if supported, add positive test.
-- [ ] **E4** `Variant<...>`.
-- [ ] **E5** `Tuple` / multiple return values.
+- [x] **E3** `Map<K,V>`: verified graceful skip — `MapHolder` (Map field) → `[Skipped] ... unsupported type 'Map'`, empty block, crate still builds. → `test_container_types` (`MapHolder`, no Rust binding by design)
+- [x] **E4** `Variant<...>`: verified graceful skip — `VariantHolder` (Variant method) → `[Skipped] ... unsupported type 'Union'`. → `test_container_types` (`VariantHolder`)
+- [ ] **E5** `Tuple` / multiple return values. *Unsupported by the crate: there is no `Tuple` Rust type and tuples aren't `AnyCompatible`, and `ffi::Tuple` reflects as origin `Tuple` which is NOT in `RUST_UNSUPPORTED_ORIGINS` — so it would render a bare, undefined `Tuple` rather than skip cleanly. Needs either crate tuple support or adding `Tuple` to the unsupported set for a graceful skip.*
 
 ### F. Core FFI types (new module `test_ffi_types`, class `FfiTypesHolder`)
 
-- [ ] **F1** `Tensor` (DLPack) as field/param/return.
+- [x] **F1** `Tensor` (DLPack) as param + return (echo round-trip; Rust builds via `Tensor::from_nd_alloc`). → `test_ffi_types::tensor_param_and_return` *(field position not exercised — a default-constructed `Tensor` field is awkward; param/return covers the codec.)*
 - [x] **F2** `ffi::Shape` as param/return/field. → `test_ffi_types::shape_param_and_return`, `ffi_type_fields`
 - [x] **F3** `Device` / `DataType` (`DLDevice`/`DLDataType`) as param/return/field. → `test_ffi_types::{datatype_param_and_return, device_param_and_return, ffi_type_fields}`
 
@@ -129,9 +129,9 @@ assertion focus**.
 
 ## P3 — Misc / robustness
 
-- [ ] **L1** Global free functions: `register_global_func` not attached to any class; verify generated free function is callable (all current cases are class methods; zero free-function samples).
-- [ ] **L2** Rust reserved-word field/method names: fields named `type` / `match` / `fn` / `move`; verify generated code escapes or renames.
-- [ ] **L3** Multiple `init` overloads / constructor default arguments.
+- [ ] **L1** Global free functions. *N/A for the Rust backend by design: it does not generate bindings for `register_global_func` globals (decision 5 — Rust calls them dynamically via `Function::get_global(name)`); a `global/<prefix>` block is left untouched. Nothing to e2e-test in generated output.*
+- [x] **L2** Rust reserved-word field/method names: fields `type`/`match`/`move` + method registered as `fn` → raw-escaped `r#type`/`r#fn`/... → `test_scalar_types::reserved_word_names_are_raw_escaped`
+- [ ] **L3** Multiple `init` overloads / constructor default arguments. *Limited: reflection exposes a single `__ffi_init__`, and C++ default args don't translate to Rust optionals (the generated `new` always takes all params positionally). No distinct behavior to assert beyond existing ctor tests.*
 - [x] **L4** Boundary values: `i64::MAX`/`MIN`, negative `format_scalars`, empty + Unicode string. → `test_scalar_types::boundary_values`
 - [ ] **L5** Namespace / module-name collision: two libraries registering the same short type name.
 

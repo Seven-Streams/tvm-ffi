@@ -19,7 +19,7 @@
 //! End-to-end tests for the generated `test_scalar_types` bindings.
 
 use test_scalar_types::ensure_loaded;
-use test_scalar_types::generated::test_scalar_types::ScalarHolder;
+use test_scalar_types::generated::test_scalar_types::{Keywords, ScalarHolder};
 use tvm_ffi::{Result, String as FFIString};
 
 #[test]
@@ -116,5 +116,23 @@ fn boundary_values() -> Result<()> {
     // Negative values through a static formatter.
     let s = ScalarHolder::format_scalars(-7, -1.5, false, FFIString::from("x"))?;
     assert_eq!(s.as_str(), "int=-7,float=-1.5,bool=false,str=x");
+    Ok(())
+}
+
+// --- L2: Rust reserved-word field / method names ------------------------------
+
+#[test]
+fn reserved_word_names_are_raw_escaped() -> Result<()> {
+    ensure_loaded();
+    // Fields `type`/`match`/`move` and a method registered as `fn` become raw
+    // identifiers (`r#type`, `r#fn`, ...) in the generated bindings.
+    let mut kw = Keywords::new(1, 2, 3)?;
+    assert_eq!(kw.r#type, 1);
+    assert_eq!(kw.r#match, 2);
+    assert_eq!(kw.r#move, 3);
+    assert_eq!(kw.r#fn()?, 6); // 1 + 2 + 3
+
+    kw.r#type = 10;
+    assert_eq!(kw.r#fn()?, 15);
     Ok(())
 }

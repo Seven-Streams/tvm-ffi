@@ -91,6 +91,32 @@ class ScalarHolder : public ffi::ObjectRef {
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(ScalarHolder, ffi::ObjectRef, ScalarHolderObj);
 };
 
+// L2: field / method names that are Rust reserved words. The generator must
+// raw-escape them (`r#type`, `r#match`, ...) so the bindings compile.
+class KeywordsObj : public ffi::Object {
+ public:
+  int64_t type;
+  int64_t match;
+  int64_t move;
+
+  explicit KeywordsObj(int64_t type = 0, int64_t match = 0, int64_t move = 0)
+      : type(type), match(match), move(move) {}
+
+  int64_t Sum() { return type + match + move; }
+
+  static constexpr bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("test_scalar_types.Keywords", KeywordsObj, ffi::Object);
+};
+
+class Keywords : public ffi::ObjectRef {
+ public:
+  explicit Keywords(int64_t type = 0, int64_t match = 0, int64_t move = 0) {
+    data_ = ffi::make_object<KeywordsObj>(type, match, move);
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(Keywords, ffi::ObjectRef, KeywordsObj);
+};
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::ObjectDef<ScalarHolderObj>()
@@ -109,6 +135,16 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 
   refl::TypeAttrDef<ScalarHolderObj>().def(
       refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<ScalarHolder>);
+
+  refl::ObjectDef<KeywordsObj>()
+      .def(refl::init<int64_t, int64_t, int64_t>())
+      .def_rw("type", &KeywordsObj::type, "field named `type`")
+      .def_rw("match", &KeywordsObj::match, "field named `match`")
+      .def_rw("move", &KeywordsObj::move, "field named `move`")
+      .def("fn", &KeywordsObj::Sum, "method registered under the reserved name `fn`");
+
+  refl::TypeAttrDef<KeywordsObj>().def(refl::type_attr::kConvert,
+                                       &refl::details::FFIConvertFromAnyViewToObjectRef<Keywords>);
 }
 
 }  // namespace test_scalar_types
