@@ -79,10 +79,10 @@ fn get_type_method(
 // tvm-ffi-stubgen(begin): import-section
 use std::ops::Deref;
 use std::ops::DerefMut;
+use tvm_ffi::AnyView;
 use tvm_ffi::Array;
 use tvm_ffi::Result;
 use tvm_ffi::derive::ObjectRef as DeriveObjectRef;
-use tvm_ffi::into_typed_fn;
 use tvm_ffi::object::Object;
 use tvm_ffi::object::ObjectArc;
 use tvm_ffi::object::ObjectCore;
@@ -131,68 +131,57 @@ impl DerefMut for Shape {
 impl Shape {
     pub fn new(_0: i64, _1: i64) -> Result<Self> {
         let ctor = get_type_method(ShapeObj::TYPE_KEY, "__ffi_init__")?;
-        let call = into_typed_fn!(ctor, Fn(i64, i64) -> Result<Shape>);
-        call(_0, _1)
+        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1)])?.try_into()?)
     }
 
     pub fn get_default_width() -> Result<i64> {
         let f = get_type_method(ShapeObj::TYPE_KEY, "get_default_width")?;
-        let call = into_typed_fn!(f, Fn() -> Result<i64>);
-        call()
+        Ok(f.call_packed(&[])?.try_into()?)
     }
 
     pub fn get_default_height() -> Result<i64> {
         let f = get_type_method(ShapeObj::TYPE_KEY, "get_default_height")?;
-        let call = into_typed_fn!(f, Fn() -> Result<i64>);
-        call()
+        Ok(f.call_packed(&[])?.try_into()?)
     }
 
     pub fn get_area(&mut self) -> Result<i64> {
         let f = get_type_method(ShapeObj::TYPE_KEY, "get_area")?;
-        let call = into_typed_fn!(f, Fn(&Shape) -> Result<i64>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 
     pub fn get_perimeter(&mut self) -> Result<i64> {
         let f = get_type_method(ShapeObj::TYPE_KEY, "get_perimeter")?;
-        let call = into_typed_fn!(f, Fn(&Shape) -> Result<i64>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 
     pub fn resize(&mut self, _0: i64, _1: i64) -> Result<()> {
         let f = get_type_method(ShapeObj::TYPE_KEY, "resize")?;
-        let call = into_typed_fn!(f, Fn(&Shape, i64, i64) -> Result<()>);
-        call(self, _0, _1)
+        Ok(f.call_packed(&[AnyView::from(&*self), AnyView::from(&_0), AnyView::from(&_1)])?.try_into()?)
     }
 
     pub fn get_description(&mut self) -> Result<tvm_ffi::String> {
         let f = get_type_method(ShapeObj::TYPE_KEY, "get_description")?;
-        let call = into_typed_fn!(f, Fn(&Shape) -> Result<tvm_ffi::String>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 
     pub fn checked_div(&mut self, _0: i64) -> Result<i64> {
         let f = get_type_method(ShapeObj::TYPE_KEY, "checked_div")?;
-        let call = into_typed_fn!(f, Fn(&Shape, i64) -> Result<i64>);
-        call(self, _0)
+        Ok(f.call_packed(&[AnyView::from(&*self), AnyView::from(&_0)])?.try_into()?)
     }
 
     pub fn same_size_as(&mut self, _0: Shape) -> Result<bool> {
         let f = get_type_method(ShapeObj::TYPE_KEY, "same_size_as")?;
-        let call = into_typed_fn!(f, Fn(&Shape, Shape) -> Result<bool>);
-        call(self, _0)
+        Ok(f.call_packed(&[AnyView::from(&*self), AnyView::from(&_0)])?.try_into()?)
     }
 
     pub fn scaled(&mut self, _0: i64) -> Result<Shape> {
         let f = get_type_method(ShapeObj::TYPE_KEY, "scaled")?;
-        let call = into_typed_fn!(f, Fn(&Shape, i64) -> Result<Shape>);
-        call(self, _0)
+        Ok(f.call_packed(&[AnyView::from(&*self), AnyView::from(&_0)])?.try_into()?)
     }
 
     pub fn combined_area(_0: Shape, _1: Shape) -> Result<i64> {
         let f = get_type_method(ShapeObj::TYPE_KEY, "combined_area")?;
-        let call = into_typed_fn!(f, Fn(Shape, Shape) -> Result<i64>);
-        call(_0, _1)
+        Ok(f.call_packed(&[AnyView::from(&_0), AnyView::from(&_1)])?.try_into()?)
     }
 }
 // tvm-ffi-stubgen(end)
@@ -251,20 +240,17 @@ impl DerefMut for CircleObj {
 impl Circle {
     pub fn new(_0: i64) -> Result<Self> {
         let ctor = get_type_method(CircleObj::TYPE_KEY, "__ffi_init__")?;
-        let call = into_typed_fn!(ctor, Fn(i64) -> Result<Circle>);
-        call(_0)
+        Ok(ctor.call_packed(&[AnyView::from(&_0)])?.try_into()?)
     }
 
     pub fn get_circle_area(&mut self) -> Result<i64> {
         let f = get_type_method(CircleObj::TYPE_KEY, "get_circle_area")?;
-        let call = into_typed_fn!(f, Fn(&Circle) -> Result<i64>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 
     pub fn set_radius(&mut self, _0: i64) -> Result<()> {
         let f = get_type_method(CircleObj::TYPE_KEY, "set_radius")?;
-        let call = into_typed_fn!(f, Fn(&Circle, i64) -> Result<()>);
-        call(self, _0)
+        Ok(f.call_packed(&[AnyView::from(&*self), AnyView::from(&_0)])?.try_into()?)
     }
 }
 // tvm-ffi-stubgen(end)
@@ -323,14 +309,12 @@ impl DerefMut for RectangleObj {
 impl Rectangle {
     pub fn new(_0: i64, _1: i64, _2: bool) -> Result<Self> {
         let ctor = get_type_method(RectangleObj::TYPE_KEY, "__ffi_init__")?;
-        let call = into_typed_fn!(ctor, Fn(i64, i64, bool) -> Result<Rectangle>);
-        call(_0, _1, _2)
+        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2)])?.try_into()?)
     }
 
     pub fn update_square_flag(&mut self) -> Result<()> {
         let f = get_type_method(RectangleObj::TYPE_KEY, "update_square_flag")?;
-        let call = into_typed_fn!(f, Fn(&Rectangle) -> Result<()>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 }
 // tvm-ffi-stubgen(end)
@@ -369,26 +353,22 @@ impl Deref for ShapeBatch {
 impl ShapeBatch {
     pub fn new() -> Result<Self> {
         let ctor = get_type_method(ShapeBatchObj::TYPE_KEY, "__ffi_init__")?;
-        let call = into_typed_fn!(ctor, Fn() -> Result<ShapeBatch>);
-        call()
+        Ok(ctor.call_packed(&[])?.try_into()?)
     }
 
     pub fn total_area(_0: Array<Shape>) -> Result<i64> {
         let f = get_type_method(ShapeBatchObj::TYPE_KEY, "total_area")?;
-        let call = into_typed_fn!(f, Fn(Array<Shape>) -> Result<i64>);
-        call(_0)
+        Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
     }
 
     pub fn non_empty_or_none(_0: Shape) -> Result<Option<Shape>> {
         let f = get_type_method(ShapeBatchObj::TYPE_KEY, "non_empty_or_none")?;
-        let call = into_typed_fn!(f, Fn(Shape) -> Result<Option<Shape>>);
-        call(_0)
+        Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
     }
 
     pub fn split(_0: Shape) -> Result<Array<Shape>> {
         let f = get_type_method(ShapeBatchObj::TYPE_KEY, "split")?;
-        let call = into_typed_fn!(f, Fn(Shape) -> Result<Array<Shape>>);
-        call(_0)
+        Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
     }
 }
 // tvm-ffi-stubgen(end)
@@ -435,14 +415,12 @@ impl DerefMut for Group {
 impl Group {
     pub fn new(_0: Shape, _1: Array<Shape>) -> Result<Self> {
         let ctor = get_type_method(GroupObj::TYPE_KEY, "__ffi_init__")?;
-        let call = into_typed_fn!(ctor, Fn(Shape, Array<Shape>) -> Result<Group>);
-        call(_0, _1)
+        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1)])?.try_into()?)
     }
 
     pub fn total_area(&mut self) -> Result<i64> {
         let f = get_type_method(GroupObj::TYPE_KEY, "total_area")?;
-        let call = into_typed_fn!(f, Fn(&Group) -> Result<i64>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 }
 // tvm-ffi-stubgen(end)
@@ -481,14 +459,12 @@ impl Deref for Tracked {
 impl Tracked {
     pub fn new() -> Result<Self> {
         let ctor = get_type_method(TrackedObj::TYPE_KEY, "__ffi_init__")?;
-        let call = into_typed_fn!(ctor, Fn() -> Result<Tracked>);
-        call()
+        Ok(ctor.call_packed(&[])?.try_into()?)
     }
 
     pub fn live_count() -> Result<i64> {
         let f = get_type_method(TrackedObj::TYPE_KEY, "live_count")?;
-        let call = into_typed_fn!(f, Fn() -> Result<i64>);
-        call()
+        Ok(f.call_packed(&[])?.try_into()?)
     }
 }
 // tvm-ffi-stubgen(end)

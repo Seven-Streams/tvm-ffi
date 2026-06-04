@@ -1108,11 +1108,12 @@ def test_rust_object_root_struct_and_impl() -> None:
     assert "pub fn test() -> Result<i64> {" in text
     assert "fn new(value: i64) -> Result<Self> {" in text
     assert 'let ctor = get_type_method(ExprObj::TYPE_KEY, "__ffi_init__")?;' in text
-    assert "let call = into_typed_fn!(ctor, Fn(i64) -> Result<Expr>);" in text
+    # uniform packed-call convention: args -> &[AnyView], return via try_into
+    assert "Ok(ctor.call_packed(&[AnyView::from(&value)])?.try_into()?)" in text
     # static method: no self
     assert "fn test() -> Result<i64> {" in text
     assert 'let f = get_type_method(ExprObj::TYPE_KEY, "test")?;' in text
-    assert "let call = into_typed_fn!(f, Fn() -> Result<i64>);" in text
+    assert "Ok(f.call_packed(&[])?.try_into()?)" in text
     uses = {u.as_use_line() for u in imports.items}
     assert "use tvm_ffi::object::Object;" in uses
     assert "use std::ops::DerefMut;" in uses
@@ -1127,10 +1128,9 @@ def test_rust_object_derived_embeds_parent() -> None:
     # derived Obj also derefs to its embedded base
     assert "impl Deref for AddObj {" in text
     assert "    type Target = ExprObj;" in text
-    # instance method: &mut self receiver (mutable class) but shared `&Add` in typed fn
+    # instance method: &mut self receiver (mutable class); self is packed as `&*self`
     assert "fn update(&mut self) -> Result<()> {" in text
-    assert "let call = into_typed_fn!(f, Fn(&Add) -> Result<()>);" in text
-    assert "        call(self)" in text
+    assert "Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)" in text
     assert "fn new(a: Expr, b: Expr, value: i64) -> Result<Self> {" in text
 
 
@@ -1167,10 +1167,9 @@ def test_rust_method_any_return_stays_any_not_anyview() -> None:
     # return -> owning Any; param -> non-owning AnyView
     assert "pub fn probe(&mut self, _0: AnyView) -> Result<Any> {" in text
     assert "Result<AnyView>" not in text  # the bug would have produced this
-    # `Any`/`AnyView` can't go through `into_typed_fn!` (AnyView is not
-    # `AnyCompatible`; an `Any` return hits the reflexive `TryFrom<Any>` whose
-    # error is `Infallible`). The method drops to the raw packed call, which
-    # speaks `AnyView` natively and returns `Any` directly (no `try_into`).
+    # All methods use the uniform `call_packed` convention (which natively speaks
+    # `AnyView` args and an `Any` return -- the only convention that can). An
+    # `Any` return is forwarded directly, with no trailing `try_into`.
     assert "into_typed_fn!" not in text
     assert "f.call_packed(&[AnyView::from(&*self), _0])" in text
     # owning Any return must record its `use`
@@ -1368,7 +1367,10 @@ def test_rust_new_uses_ffi_init_schema_order() -> None:
     )
     text, _ = _gen_rust_object(info)
     assert "fn new(_0: Expr, _1: Expr, _2: i64) -> Result<Self> {" in text
-    assert "into_typed_fn!(ctor, Fn(Expr, Expr, i64) -> Result<Add>);" in text
+    assert (
+        "Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), "
+        "AnyView::from(&_2)])?.try_into()?)"
+    ) in text
     # __ffi_init__ becomes `new`, not a regular method (only referenced once).
     assert text.count("__ffi_init__") == 1
 

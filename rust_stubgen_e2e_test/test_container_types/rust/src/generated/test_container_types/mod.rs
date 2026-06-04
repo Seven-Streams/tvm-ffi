@@ -79,10 +79,10 @@ fn get_type_method(
 // tvm-ffi-stubgen(begin): import-section
 use std::ops::Deref;
 use std::ops::DerefMut;
+use tvm_ffi::AnyView;
 use tvm_ffi::Array;
 use tvm_ffi::Result;
 use tvm_ffi::derive::ObjectRef as DeriveObjectRef;
-use tvm_ffi::into_typed_fn;
 use tvm_ffi::object::Object;
 use tvm_ffi::object::ObjectArc;
 use tvm_ffi::object::ObjectCore;
@@ -132,38 +132,32 @@ impl DerefMut for ArrayHolder {
 impl ArrayHolder {
     pub fn new(_0: Array<i64>, _1: Array<f64>, _2: Array<tvm_ffi::String>) -> Result<Self> {
         let ctor = get_type_method(ArrayHolderObj::TYPE_KEY, "__ffi_init__")?;
-        let call = into_typed_fn!(ctor, Fn(Array<i64>, Array<f64>, Array<tvm_ffi::String>) -> Result<ArrayHolder>);
-        call(_0, _1, _2)
+        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2)])?.try_into()?)
     }
 
     pub fn sum_array(_0: Array<i64>) -> Result<i64> {
         let f = get_type_method(ArrayHolderObj::TYPE_KEY, "sum_array")?;
-        let call = into_typed_fn!(f, Fn(Array<i64>) -> Result<i64>);
-        call(_0)
+        Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
     }
 
     pub fn avg_array(_0: Array<f64>) -> Result<f64> {
         let f = get_type_method(ArrayHolderObj::TYPE_KEY, "avg_array")?;
-        let call = into_typed_fn!(f, Fn(Array<f64>) -> Result<f64>);
-        call(_0)
+        Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
     }
 
     pub fn get_int_array_length(&mut self) -> Result<i64> {
         let f = get_type_method(ArrayHolderObj::TYPE_KEY, "get_int_array_length")?;
-        let call = into_typed_fn!(f, Fn(&ArrayHolder) -> Result<i64>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 
     pub fn join_string_array(&mut self) -> Result<tvm_ffi::String> {
         let f = get_type_method(ArrayHolderObj::TYPE_KEY, "join_string_array")?;
-        let call = into_typed_fn!(f, Fn(&ArrayHolder) -> Result<tvm_ffi::String>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 
     pub fn set_arrays(&mut self, _0: Array<i64>, _1: Array<f64>, _2: Array<tvm_ffi::String>) -> Result<()> {
         let f = get_type_method(ArrayHolderObj::TYPE_KEY, "set_arrays")?;
-        let call = into_typed_fn!(f, Fn(&ArrayHolder, Array<i64>, Array<f64>, Array<tvm_ffi::String>) -> Result<()>);
-        call(self, _0, _1, _2)
+        Ok(f.call_packed(&[AnyView::from(&*self), AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2)])?.try_into()?)
     }
 }
 // tvm-ffi-stubgen(end)
@@ -210,26 +204,22 @@ impl DerefMut for OptionalHolder {
 impl OptionalHolder {
     pub fn new(_0: Option<i64>, _1: Option<tvm_ffi::String>) -> Result<Self> {
         let ctor = get_type_method(OptionalHolderObj::TYPE_KEY, "__ffi_init__")?;
-        let call = into_typed_fn!(ctor, Fn(Option<i64>, Option<tvm_ffi::String>) -> Result<OptionalHolder>);
-        call(_0, _1)
+        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1)])?.try_into()?)
     }
 
     pub fn create_opt_int(_0: i64) -> Result<Option<i64>> {
         let f = get_type_method(OptionalHolderObj::TYPE_KEY, "create_opt_int")?;
-        let call = into_typed_fn!(f, Fn(i64) -> Result<Option<i64>>);
-        call(_0)
+        Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
     }
 
     pub fn create_none_int() -> Result<Option<i64>> {
         let f = get_type_method(OptionalHolderObj::TYPE_KEY, "create_none_int")?;
-        let call = into_typed_fn!(f, Fn() -> Result<Option<i64>>);
-        call()
+        Ok(f.call_packed(&[])?.try_into()?)
     }
 
     pub fn describe_optionals(&mut self) -> Result<tvm_ffi::String> {
         let f = get_type_method(OptionalHolderObj::TYPE_KEY, "describe_optionals")?;
-        let call = into_typed_fn!(f, Fn(&OptionalHolder) -> Result<tvm_ffi::String>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 }
 // tvm-ffi-stubgen(end)

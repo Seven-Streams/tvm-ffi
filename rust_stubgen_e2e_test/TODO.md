@@ -90,15 +90,18 @@ assertion focus**.
 
 ### H. `Any` / `AnyView`
 
-- [x] **H1** `Any` as param (renders as `AnyView`); push int/float/bool/String through `describe_any`. → `test_any_types::describe_any_dispatches_on_runtime_type`
-- [x] **H2** `Any` as return value (`echo`, `get_any`) + `Any` field round-trip. → `test_any_types::{echo_returns_owning_any, any_field_roundtrip}`
+- [x] **H1** `Any` as param (renders as `AnyView`); push int/float/bool/String + an object through `echo` and assert transparent round-trip. → `test_any_types::{echo_roundtrips_primitive_types, echo_roundtrips_an_object}`
+- [x] **H2** `Any` as return value (`echo`, `get_any`) + `Any` field round-trip. → `test_any_types::{echo_roundtrips_primitive_types, any_field_roundtrip}`
 
 > **Stubgen resolution:** `into_typed_fn!` can't carry `Any`/`AnyView` (AnyView isn't
 > `AnyCompatible`; an `Any` return hits the reflexive `TryFrom<Any>` whose error is
-> `Infallible`). Rather than change the crate, the Rust backend now drops methods whose
-> signature involves a top-level `Any`/`AnyView` to the raw `Function::call_packed(&[AnyView])`
-> path (`_needs_packed_call` / `_packed_args_expr` in `rust_backend/codegen.py`). All other
-> methods are unchanged. *Note: nested `Any` (e.g. `Array<Any>`, `Optional<Any>`) is still
+> `Infallible`). Rather than change the crate, the Rust backend generates **one uniform
+> calling convention for every method/constructor**: pack args into `&[AnyView]` and call
+> `Function::call_packed` (`_packed_args_expr` / `_packed_call_lines` in
+> `rust_backend/codegen.py`). Each non-`AnyView` arg becomes `AnyView::from(&x)`, an
+> `AnyView` arg passes through, a member call prepends `AnyView::from(&*self)`; an `Any`
+> return is forwarded as-is, everything else is `?.try_into()?`. No `into_typed_fn!` is
+> emitted anywhere. *Note: nested `Any` (e.g. `Array<Any>`, `Optional<Any>`) is still
 > unsupported — those container types aren't `AnyCompatible` over `Any` either.*
 
 ---

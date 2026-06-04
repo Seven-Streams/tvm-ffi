@@ -18,40 +18,46 @@
  */
 //! End-to-end tests for the generated `test_any_types` bindings.
 //!
-//! Per the FFI convention, a top-level `Any` argument is passed as the
-//! non-owning `AnyView`, while a returned/stored `Any` is owning. These tests
-//! push several underlying types through one `Any` parameter (H1) and read an
-//! `Any` back out of return values and a field (H2).
+//! `Any` is opaque: it carries an arbitrary payload across the FFI boundary
+//! unchanged. Per the FFI convention a top-level `Any` argument is passed as the
+//! non-owning `AnyView` (H1), while a returned/stored `Any` is owning (H2). The
+//! tests below verify *transparent round-trip* — push a value in, get the same
+//! value back out — for several underlying types and for an object, without C++
+//! ever inspecting what's inside.
 
 use test_any_types::ensure_loaded;
 use test_any_types::generated::test_any_types::AnyHolder;
 use tvm_ffi::{AnyView, Result, String as FFIString};
 
 #[test]
-fn describe_any_dispatches_on_runtime_type() -> Result<()> {
+fn echo_roundtrips_primitive_types() -> Result<()> {
     ensure_loaded();
-    // H1: one `Any`/`AnyView` parameter, several underlying types.
-    assert_eq!(AnyHolder::describe_any(AnyView::from(&42i64))?.as_str(), "int=42");
-    assert_eq!(AnyHolder::describe_any(AnyView::from(&2.5f64))?.as_str(), "float=2.5");
-    assert_eq!(AnyHolder::describe_any(AnyView::from(&true))?.as_str(), "bool=true");
+    // One `Any`/`AnyView` parameter (H1) + an owning `Any` return (H2); the
+    // payload must come back byte-for-byte regardless of its underlying type.
+    let i: i64 = AnyHolder::echo(AnyView::from(&42i64))?.try_into()?;
+    assert_eq!(i, 42);
 
-    let s = FFIString::from("hi");
-    assert_eq!(AnyHolder::describe_any(AnyView::from(&s))?.as_str(), "str=hi");
+    let f: f64 = AnyHolder::echo(AnyView::from(&2.5f64))?.try_into()?;
+    assert_eq!(f, 2.5);
+
+    let b: bool = AnyHolder::echo(AnyView::from(&true))?.try_into()?;
+    assert!(b);
+
+    let s = FFIString::from("hello");
+    let back: FFIString = AnyHolder::echo(AnyView::from(&s))?.try_into()?;
+    assert_eq!(back.as_str(), "hello");
     Ok(())
 }
 
 #[test]
-fn echo_returns_owning_any() -> Result<()> {
+fn echo_roundtrips_an_object() -> Result<()> {
     ensure_loaded();
-    // H2: the returned `Any` owns its payload; extract it back out.
-    let echoed = AnyHolder::echo(AnyView::from(&7i64))?;
-    let n: i64 = echoed.try_into()?;
-    assert_eq!(n, 7);
-
-    let s = FFIString::from("world");
-    let echoed = AnyHolder::echo(AnyView::from(&s))?;
-    let back: FFIString = echoed.try_into()?;
-    assert_eq!(back.as_str(), "world");
+    // An object (itself an `AnyHolder`) also passes through `Any` untouched:
+    // the returned handle refers to the same heap object we put in.
+    let original = AnyHolder::new(AnyView::from(&7i64))?;
+    let mut echoed: AnyHolder = AnyHolder::echo(AnyView::from(&original))?.try_into()?;
+    let inner: i64 = echoed.get_any()?.try_into()?;
+    assert_eq!(inner, 7);
     Ok(())
 }
 

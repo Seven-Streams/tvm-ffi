@@ -78,10 +78,10 @@ fn get_type_method(
 
 // tvm-ffi-stubgen(begin): import-section
 use std::ops::Deref;
+use tvm_ffi::AnyView;
 use tvm_ffi::Array;
 use tvm_ffi::Result;
 use tvm_ffi::derive::ObjectRef as DeriveObjectRef;
-use tvm_ffi::into_typed_fn;
 use tvm_ffi::object::Object;
 use tvm_ffi::object::ObjectArc;
 use tvm_ffi::object::ObjectCore;
@@ -126,26 +126,22 @@ impl Deref for ImmutableMetadata {
 impl ImmutableMetadata {
     pub fn new(_0: tvm_ffi::String, _1: tvm_ffi::String, _2: tvm_ffi::String, _3: Array<tvm_ffi::String>) -> Result<Self> {
         let ctor = get_type_method(ImmutableMetadataObj::TYPE_KEY, "__ffi_init__")?;
-        let call = into_typed_fn!(ctor, Fn(tvm_ffi::String, tvm_ffi::String, tvm_ffi::String, Array<tvm_ffi::String>) -> Result<ImmutableMetadata>);
-        call(_0, _1, _2, _3)
+        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2), AnyView::from(&_3)])?.try_into()?)
     }
 
     pub fn get_default_license() -> Result<tvm_ffi::String> {
         let f = get_type_method(ImmutableMetadataObj::TYPE_KEY, "get_default_license")?;
-        let call = into_typed_fn!(f, Fn() -> Result<tvm_ffi::String>);
-        call()
+        Ok(f.call_packed(&[])?.try_into()?)
     }
 
     pub fn to_json(&self) -> Result<tvm_ffi::String> {
         let f = get_type_method(ImmutableMetadataObj::TYPE_KEY, "to_json")?;
-        let call = into_typed_fn!(f, Fn(&ImmutableMetadata) -> Result<tvm_ffi::String>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 
     pub fn get_keyword_count(&self) -> Result<i64> {
         let f = get_type_method(ImmutableMetadataObj::TYPE_KEY, "get_keyword_count")?;
-        let call = into_typed_fn!(f, Fn(&ImmutableMetadata) -> Result<i64>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 }
 // tvm-ffi-stubgen(end)
@@ -188,38 +184,32 @@ impl Deref for ImmutableVersion {
 impl ImmutableVersion {
     pub fn new(_0: i64, _1: i64, _2: i64, _3: tvm_ffi::String) -> Result<Self> {
         let ctor = get_type_method(ImmutableVersionObj::TYPE_KEY, "__ffi_init__")?;
-        let call = into_typed_fn!(ctor, Fn(i64, i64, i64, tvm_ffi::String) -> Result<ImmutableVersion>);
-        call(_0, _1, _2, _3)
+        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2), AnyView::from(&_3)])?.try_into()?)
     }
 
     pub fn get_current_major() -> Result<i64> {
         let f = get_type_method(ImmutableVersionObj::TYPE_KEY, "get_current_major")?;
-        let call = into_typed_fn!(f, Fn() -> Result<i64>);
-        call()
+        Ok(f.call_packed(&[])?.try_into()?)
     }
 
     pub fn get_current_minor() -> Result<i64> {
         let f = get_type_method(ImmutableVersionObj::TYPE_KEY, "get_current_minor")?;
-        let call = into_typed_fn!(f, Fn() -> Result<i64>);
-        call()
+        Ok(f.call_packed(&[])?.try_into()?)
     }
 
     pub fn get_current_patch() -> Result<i64> {
         let f = get_type_method(ImmutableVersionObj::TYPE_KEY, "get_current_patch")?;
-        let call = into_typed_fn!(f, Fn() -> Result<i64>);
-        call()
+        Ok(f.call_packed(&[])?.try_into()?)
     }
 
     pub fn get_version_string(&self) -> Result<tvm_ffi::String> {
         let f = get_type_method(ImmutableVersionObj::TYPE_KEY, "get_version_string")?;
-        let call = into_typed_fn!(f, Fn(&ImmutableVersion) -> Result<tvm_ffi::String>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 
     pub fn is_greater_than_version(&self, _0: i64, _1: i64, _2: i64) -> Result<bool> {
         let f = get_type_method(ImmutableVersionObj::TYPE_KEY, "is_greater_than_version")?;
-        let call = into_typed_fn!(f, Fn(&ImmutableVersion, i64, i64, i64) -> Result<bool>);
-        call(self, _0, _1, _2)
+        Ok(f.call_packed(&[AnyView::from(&*self), AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2)])?.try_into()?)
     }
 }
 // tvm-ffi-stubgen(end)
@@ -260,20 +250,17 @@ impl Deref for MixedMutability {
 impl MixedMutability {
     pub fn new(_0: i64, _1: i64) -> Result<Self> {
         let ctor = get_type_method(MixedMutabilityObj::TYPE_KEY, "__ffi_init__")?;
-        let call = into_typed_fn!(ctor, Fn(i64, i64) -> Result<MixedMutability>);
-        call(_0, _1)
+        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1)])?.try_into()?)
     }
 
     pub fn get_next_id() -> Result<i64> {
         let f = get_type_method(MixedMutabilityObj::TYPE_KEY, "get_next_id")?;
-        let call = into_typed_fn!(f, Fn() -> Result<i64>);
-        call()
+        Ok(f.call_packed(&[])?.try_into()?)
     }
 
     pub fn increment_counter(&self) -> Result<()> {
         let f = get_type_method(MixedMutabilityObj::TYPE_KEY, "increment_counter")?;
-        let call = into_typed_fn!(f, Fn(&MixedMutability) -> Result<()>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 }
 // tvm-ffi-stubgen(end)

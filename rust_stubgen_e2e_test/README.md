@@ -135,14 +135,16 @@ The test suite consists of 4 independent test modules, each focusing on specific
   **return**/**field** stays the owning `Any` (per `docs/concepts/any.rst`).
 - Because `into_typed_fn!` can't carry `Any`/`AnyView` (AnyView isn't
   `AnyCompatible`; an `Any` return hits the reflexive `TryFrom<Any>` whose error
-  is `Infallible`), the Rust backend emits the raw
-  `Function::call_packed(&[AnyView]) -> Result<Any>` path for these methods.
+  is `Infallible`), the Rust backend uses **one uniform calling convention for
+  every method**: pack args into `&[AnyView]` and call
+  `Function::call_packed(&[AnyView]) -> Result<Any>`. No `into_typed_fn!` is emitted.
 
 **Key Class:**
 
 - `AnyHolder`: holds an `Any` field (`stored`)
-  - Static methods: `describe_any(Any)` (dispatches on the runtime type of one
-    `Any`/`AnyView` param), `echo(Any) -> Any` (owning return round-trip)
+  - Static method: `echo(Any) -> Any` — returns its input verbatim; tests assert
+    transparent round-trip for int/float/bool/String and for an object, so the
+    payload comes back unchanged without C++ inspecting it.
   - Instance methods: `set_any(Any)` / `get_any() -> Any` (field write/read)
 
 ## Building Individual Tests

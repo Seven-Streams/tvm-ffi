@@ -79,9 +79,9 @@ fn get_type_method(
 // tvm-ffi-stubgen(begin): import-section
 use std::ops::Deref;
 use std::ops::DerefMut;
+use tvm_ffi::AnyView;
 use tvm_ffi::Result;
 use tvm_ffi::derive::ObjectRef as DeriveObjectRef;
-use tvm_ffi::into_typed_fn;
 use tvm_ffi::object::Object;
 use tvm_ffi::object::ObjectArc;
 use tvm_ffi::object::ObjectCore;
@@ -132,50 +132,42 @@ impl DerefMut for ScalarHolder {
 impl ScalarHolder {
     pub fn new(_0: i64, _1: f64, _2: bool, _3: tvm_ffi::String) -> Result<Self> {
         let ctor = get_type_method(ScalarHolderObj::TYPE_KEY, "__ffi_init__")?;
-        let call = into_typed_fn!(ctor, Fn(i64, f64, bool, tvm_ffi::String) -> Result<ScalarHolder>);
-        call(_0, _1, _2, _3)
+        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2), AnyView::from(&_3)])?.try_into()?)
     }
 
     pub fn get_int_constant() -> Result<i64> {
         let f = get_type_method(ScalarHolderObj::TYPE_KEY, "get_int_constant")?;
-        let call = into_typed_fn!(f, Fn() -> Result<i64>);
-        call()
+        Ok(f.call_packed(&[])?.try_into()?)
     }
 
     pub fn get_float_constant() -> Result<f64> {
         let f = get_type_method(ScalarHolderObj::TYPE_KEY, "get_float_constant")?;
-        let call = into_typed_fn!(f, Fn() -> Result<f64>);
-        call()
+        Ok(f.call_packed(&[])?.try_into()?)
     }
 
     pub fn get_bool_constant() -> Result<bool> {
         let f = get_type_method(ScalarHolderObj::TYPE_KEY, "get_bool_constant")?;
-        let call = into_typed_fn!(f, Fn() -> Result<bool>);
-        call()
+        Ok(f.call_packed(&[])?.try_into()?)
     }
 
     pub fn get_string_constant() -> Result<tvm_ffi::String> {
         let f = get_type_method(ScalarHolderObj::TYPE_KEY, "get_string_constant")?;
-        let call = into_typed_fn!(f, Fn() -> Result<tvm_ffi::String>);
-        call()
+        Ok(f.call_packed(&[])?.try_into()?)
     }
 
     pub fn format_scalars(_0: i64, _1: f64, _2: bool, _3: tvm_ffi::String) -> Result<tvm_ffi::String> {
         let f = get_type_method(ScalarHolderObj::TYPE_KEY, "format_scalars")?;
-        let call = into_typed_fn!(f, Fn(i64, f64, bool, tvm_ffi::String) -> Result<tvm_ffi::String>);
-        call(_0, _1, _2, _3)
+        Ok(f.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2), AnyView::from(&_3)])?.try_into()?)
     }
 
     pub fn set_values(&mut self, _0: i64, _1: f64, _2: bool, _3: tvm_ffi::String) -> Result<()> {
         let f = get_type_method(ScalarHolderObj::TYPE_KEY, "set_values")?;
-        let call = into_typed_fn!(f, Fn(&ScalarHolder, i64, f64, bool, tvm_ffi::String) -> Result<()>);
-        call(self, _0, _1, _2, _3)
+        Ok(f.call_packed(&[AnyView::from(&*self), AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2), AnyView::from(&_3)])?.try_into()?)
     }
 
     pub fn get_description(&mut self) -> Result<tvm_ffi::String> {
         let f = get_type_method(ScalarHolderObj::TYPE_KEY, "get_description")?;
-        let call = into_typed_fn!(f, Fn(&ScalarHolder) -> Result<tvm_ffi::String>);
-        call(self)
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
     }
 }
 // tvm-ffi-stubgen(end)

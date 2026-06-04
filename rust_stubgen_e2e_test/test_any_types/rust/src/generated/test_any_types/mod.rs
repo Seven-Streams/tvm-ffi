@@ -83,7 +83,6 @@ use tvm_ffi::Any;
 use tvm_ffi::AnyView;
 use tvm_ffi::Result;
 use tvm_ffi::derive::ObjectRef as DeriveObjectRef;
-use tvm_ffi::into_typed_fn;
 use tvm_ffi::object::Object;
 use tvm_ffi::object::ObjectArc;
 use tvm_ffi::object::ObjectCore;
@@ -132,11 +131,6 @@ impl AnyHolder {
     pub fn new(_0: AnyView) -> Result<Self> {
         let ctor = get_type_method(AnyHolderObj::TYPE_KEY, "__ffi_init__")?;
         Ok(ctor.call_packed(&[_0])?.try_into()?)
-    }
-
-    pub fn describe_any(_0: AnyView) -> Result<tvm_ffi::String> {
-        let f = get_type_method(AnyHolderObj::TYPE_KEY, "describe_any")?;
-        Ok(f.call_packed(&[_0])?.try_into()?)
     }
 
     pub fn echo(_0: AnyView) -> Result<Any> {

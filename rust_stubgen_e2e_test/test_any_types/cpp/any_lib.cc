@@ -28,7 +28,6 @@
 #include <tvm/ffi/tvm_ffi.h>
 
 #include <cstdint>
-#include <sstream>
 
 namespace test_any_types {
 
@@ -40,30 +39,10 @@ class AnyHolderObj : public ffi::Object {
 
   explicit AnyHolderObj(ffi::Any stored = ffi::Any()) : stored(stored) {}
 
-  // H1: `Any` as a parameter (renders as `AnyView` in Rust). Returns a tag
-  // string describing the runtime type + value, so a test can push several
-  // underlying types through one `Any` param and assert the dispatch.
-  static ffi::String DescribeAny(ffi::Any v) {
-    std::ostringstream oss;
-    // Use `as<T>()` (strict, no implicit conversion) so an int doesn't match
-    // the bool branch via int->bool coercion.
-    if (v == nullptr) {
-      oss << "none";
-    } else if (auto opt = v.as<bool>()) {
-      oss << "bool=" << (*opt ? "true" : "false");
-    } else if (auto opt = v.as<int64_t>()) {
-      oss << "int=" << *opt;
-    } else if (auto opt = v.as<double>()) {
-      oss << "float=" << *opt;
-    } else if (auto opt = v.as<ffi::String>()) {
-      oss << "str=" << opt->c_str();
-    } else {
-      oss << "other:" << v.GetTypeKey();
-    }
-    return ffi::String(oss.str());
-  }
-
-  // H2: `Any` as a return value (owning) — echoes the input straight back.
+  // `Any` is opaque: it carries an arbitrary payload across the FFI boundary
+  // unchanged. `Echo` returns its input verbatim (H1 param + H2 return) so a
+  // test can push several underlying types through and assert round-trip
+  // identity -- without C++ ever inspecting what's inside.
   static ffi::Any Echo(ffi::Any v) { return v; }
 
   // Instance method writing the `Any` field, plus an `Any`-returning getter.
@@ -90,8 +69,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::ObjectDef<AnyHolderObj>()
       .def(refl::init<ffi::Any>())
       .def_rw("stored", &AnyHolderObj::stored, "stored Any value")
-      .def_static("describe_any", &AnyHolderObj::DescribeAny,
-                  "describe the dynamic type/value of an Any")
       .def_static("echo", &AnyHolderObj::Echo, "return the Any unchanged")
       .def("set_any", &AnyHolderObj::SetAny, "store an Any")
       .def("get_any", &AnyHolderObj::GetAny, "retrieve the stored Any");
