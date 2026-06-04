@@ -37,16 +37,20 @@ class AnyHolderObj : public ffi::Object {
  public:
   ffi::Any stored;
 
-  explicit AnyHolderObj(ffi::Any stored = ffi::Any()) : stored(stored) {}
+  explicit AnyHolderObj(ffi::AnyView stored = ffi::AnyView()) : stored(stored) {}
 
   // `Any` is opaque: it carries an arbitrary payload across the FFI boundary
   // unchanged. `Echo` returns its input verbatim (H1 param + H2 return) so a
   // test can push several underlying types through and assert round-trip
   // identity -- without C++ ever inspecting what's inside.
-  static ffi::Any Echo(ffi::Any v) { return v; }
+  //
+  // Per docs/concepts/any.rst, function *parameters* take the non-owning
+  // `AnyView` (no refcount / copy overhead), while *return values* are the
+  // owning `Any` (transfers ownership to the caller).
+  static ffi::Any Echo(ffi::AnyView v) { return v; }
 
   // Instance method writing the `Any` field, plus an `Any`-returning getter.
-  void SetAny(ffi::Any v) { stored = v; }
+  void SetAny(ffi::AnyView v) { stored = v; }
 
   ffi::Any GetAny() { return stored; }
 
@@ -56,7 +60,7 @@ class AnyHolderObj : public ffi::Object {
 
 class AnyHolder : public ffi::ObjectRef {
  public:
-  explicit AnyHolder(ffi::Any stored = ffi::Any()) {
+  explicit AnyHolder(ffi::AnyView stored = ffi::AnyView()) {
     data_ = ffi::make_object<AnyHolderObj>(stored);
   }
 
@@ -67,7 +71,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
 
   refl::ObjectDef<AnyHolderObj>()
-      .def(refl::init<ffi::Any>())
+      .def(refl::init<ffi::AnyView>())
       .def_rw("stored", &AnyHolderObj::stored, "stored Any value")
       .def_static("echo", &AnyHolderObj::Echo, "return the Any unchanged")
       .def("set_any", &AnyHolderObj::SetAny, "store an Any")
