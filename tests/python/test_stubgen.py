@@ -1138,6 +1138,38 @@ def test_rust_object_immutable_has_no_derefmut() -> None:
     assert "fn test() -> Result<i64> {" in text  # static unaffected
 
 
+def test_rust_method_any_return_stays_any_not_anyview() -> None:
+    # Q5: a top-level `Any` *return* stays owning `Any` (a borrow has no lifetime
+    # source coming back out of an FFI call); only top-level `Any` *params* become
+    # the non-owning `AnyView`. Regression for return type being rendered as AnyView.
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("value", TypeSchema("int"), frozen=False)],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema(
+                    # Callable(return=Any, self=Self, param=Any)
+                    "probe",
+                    TypeSchema(
+                        "Callable",
+                        (TypeSchema("Any"), TypeSchema("demo.Boxed"), TypeSchema("Any")),
+                    ),
+                ),
+                is_member=True,
+            )
+        ],
+        type_key="demo.Boxed",
+        parent_type_key="ffi.Object",
+    )
+    text, imports = _gen_rust_object(info)
+    # return -> owning Any; param -> non-owning AnyView
+    assert "pub fn probe(&mut self, _0: AnyView) -> Result<Any> {" in text
+    assert "into_typed_fn!(f, Fn(&Boxed, AnyView) -> Result<Any>);" in text
+    assert "Result<AnyView>" not in text  # the bug would have produced this
+    # owning Any return must record its `use`
+    assert RustUse("tvm_ffi::Any") in imports.items
+    assert RustUse("tvm_ffi::AnyView") in imports.items
+
+
 def test_rust_object_mixed_fields_warns_and_immutable(capsys: pytest.CaptureFixture[str]) -> None:
     info = ObjectInfo(
         fields=[

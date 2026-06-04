@@ -329,7 +329,7 @@ def _render_object_body(
         lines += _deref_impl(obj_struct, base_type, "base", mutable)
 
     # (6) impl with `new` + methods.
-    impl_lines = _impl_block(info, leaf, obj_struct, mutable, render_param, imports)
+    impl_lines = _impl_block(info, leaf, obj_struct, mutable, render_field, render_param, imports)
     if impl_lines:
         lines += impl_lines
 
@@ -366,6 +366,7 @@ def _impl_block(
     leaf: str,
     obj_struct: str,
     mutable: bool,
+    render_ret: Callable[[TypeSchema], str],
     render_param: Callable[[TypeSchema], str],
     imports: RustImports,
 ) -> list[str]:
@@ -386,7 +387,7 @@ def _impl_block(
         if methods:
             inner.append("")
     for i, method in enumerate(methods):
-        inner += _method_fn(method, leaf, obj_struct, mutable, render_param)
+        inner += _method_fn(method, leaf, obj_struct, mutable, render_ret, render_param)
         if i != len(methods) - 1:
             inner.append("")
 
@@ -431,13 +432,20 @@ def _method_fn(
     leaf: str,
     obj_struct: str,
     mutable: bool,
+    render_ret: Callable[[TypeSchema], str],
     render_param: Callable[[TypeSchema], str],
 ) -> list[str]:
-    """Emit one reflected method (instance or static) on `impl <T>`."""
+    """Emit one reflected method (instance or static) on `impl <T>`.
+
+    The return type (``args[0]``) is rendered with ``render_ret`` (owning
+    semantics): per decision Q5 a top-level ``Any`` return stays ``Any``, not the
+    non-owning ``AnyView`` -- a borrow has no lifetime source coming back out of
+    an FFI call. Parameters use ``render_param`` (top-level ``Any -> AnyView``).
+    """
     ffi_name = method.schema.name.rsplit(".", 1)[-1]
     rust_name = _rust_ident(ffi_name)
     args = method.schema.args or ()
-    ret = render_param(args[0]) if args else "Any"
+    ret = render_ret(args[0]) if args else "Any"
     rest = list(args[1:])
     if method.is_member:
         rest = rest[1:]  # drop the leading `self` schema arg
