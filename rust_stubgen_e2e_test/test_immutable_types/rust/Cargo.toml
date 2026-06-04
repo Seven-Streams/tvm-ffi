@@ -29,3 +29,7 @@ path = "src/lib.rs"
 
 [dependencies]
 tvm-ffi = { path = "../../../rust/tvm-ffi" }
+
+[dev-dependencies]
+# I3: compile-fail (UI) tests asserting read-only types reject mutation.
+trybuild = "1.0"

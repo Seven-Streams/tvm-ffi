@@ -127,6 +127,12 @@ The test suite consists of 4 independent test modules, each focusing on specific
   - Will generate a warning about mixed mutability
   - Illustrates how the generator handles edge cases
 
+**Compile-time read-only guarantee (I3):** `tests/ui/*.rs` + `tests/compile_fail.rs`
+use [`trybuild`](https://docs.rs/trybuild) to assert that assigning a `def_ro`
+field or taking `&mut` through a read-only type **fails to compile** (no `DerefMut`
+is generated). Regenerate the expected `.stderr` with `TRYBUILD=overwrite cargo test`
+after a toolchain bump.
+
 ### 5. `test_any_types/` - `Any` / `AnyView` in param / return / field positions
 
 **Coverage:**
@@ -229,7 +235,8 @@ uv run tvm-ffi-stubgen --target rust \
 | Struct and impl generation | All | ✓ |
 | Deref implementation | All | ✓ |
 | DerefMut (mutable types) | test_scalar_types, test_container_types, test_object_hierarchy | ✓ |
-| DerefMut (immutable types) | test_immutable_types | ✓ (negative test) |
+| DerefMut (immutable types) | test_immutable_types | ✓ (runtime + `trybuild` compile-fail) |
+| Reserved-word names raw-escaped (`r#type`) | test_scalar_types | ✓ |
 | ObjectCore trait | All | ✓ |
 | Import section generation | All | ✓ |
 | Helpers generation | All | ✓ |

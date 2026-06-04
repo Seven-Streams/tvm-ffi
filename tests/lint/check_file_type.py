@@ -28,6 +28,7 @@ ALLOW_EXTENSION = {
     "h",
     "s",
     "rs",
+    "stderr",  # trybuild compile-fail expected diagnostics
     "m",
     "mm",
     "g4",

@@ -17,9 +17,14 @@
 
 # Rust Stubgen E2E Test — Coverage Gaps & TODO
 
-This checklist tracks test cases not yet covered by the existing modules
+This checklist tracks test cases for the Rust stubgen across the six modules
 (`test_scalar_types`, `test_container_types`, `test_object_hierarchy`,
-`test_immutable_types`, `test_any_types`).
+`test_immutable_types`, `test_any_types`, `test_ffi_types`).
+
+**Status: all planned items are done.** Every remaining unchecked box is tagged
+**Not planned** with a reason — they are blocked codegen limitations (A3, K2),
+crate-level gaps (E5 Tuple), by-design no-ops (L1), or low-value vs scaffolding
+cost (J3, L3, L5). Run the whole suite with `bash run_all.sh`.
 
 Each item notes **what to test + how to set up the C++ side + the Rust-side
 assertion focus**.
@@ -36,6 +41,16 @@ assertion focus**.
 - ✅ **Registered objects as FIELD types (nested objects)** — C1 (`Group`) in `test_object_hierarchy`.
 - ✅ **Error propagation (`Result::Err` branch)** — D1 (`checked_div`) in `test_object_hierarchy`.
 - ✅ **Destructor / refcount** — J1/J2 (`Tracked`, clone-shares) in `test_object_hierarchy`.
+- ✅ **Error propagation** — D1/D2/D3 (method/ctor/static throw → `Err`).
+- ✅ **Static factory returning object** — B2 (`ShapeBatch::unit_shape`).
+- ✅ **Nested containers + `Optional<String>`** — E1/E2 (`NestedHolder`).
+- ✅ **3-level inheritance** — K1 (`Box3D → ColoredBox`), multi-level Deref.
+- ✅ **Core FFI types** — F1 Tensor, F2 Shape, F3 DataType/Device (`test_ffi_types`).
+- ✅ **Function callbacks** — G1/G2 (closure param + returned closure).
+- ✅ **`Any`/`AnyView`** — H1/H2 (`test_any_types`).
+- ✅ **Unsupported types skip gracefully** — E3/E4 (`Map`/`Variant` → `[Skipped]`).
+- ✅ **Reserved-word names + boundary values + direct field writes** — L2 / L4 / I1 / I2.
+- ✅ **Compile-time read-only guarantee** — I3 (`trybuild`).
 
 ---
 
@@ -45,7 +60,7 @@ assertion focus**.
 
 - [x] **A1** Instance method takes object param: `bool same_size_as(Shape other)` on `Shape`. → `object_as_instance_method_param`
 - [x] **A2** Static factory takes object param: `static int64_t combined_area(Shape a, Shape b)`. → `object_as_static_method_params`
-- [ ] **A3** Derived object passed to base-typed param: signature `Shape`, pass a `Circle` (upcast / polymorphism). *Blocked: generated `Circle` is a distinct Rust type with no upcast `From<Circle> for Shape`; needs a stubgen upcast story first.*
+- [ ] **A3** — **Not planned** (blocked). Derived object passed to a base-typed param needs a stubgen upcast (`From<Circle> for Shape`); the generated `Circle` is a distinct Rust type. Requires a codegen change, out of scope for the test suite.
 - [x] **A4** Container of objects: `static int64_t total_area(Array<Shape>)` on `ShapeBatch`. → `array_of_objects_as_param`
 
 ### B. Registered object as a RETURN value
@@ -75,7 +90,7 @@ assertion focus**.
 - [x] **E2** `Optional<String>` as param + return, both Some/None. → `test_container_types::echo_optional_string`
 - [x] **E3** `Map<K,V>`: verified graceful skip — `MapHolder` (Map field) → `[Skipped] ... unsupported type 'Map'`, empty block, crate still builds. → `test_container_types` (`MapHolder`, no Rust binding by design)
 - [x] **E4** `Variant<...>`: verified graceful skip — `VariantHolder` (Variant method) → `[Skipped] ... unsupported type 'Union'`. → `test_container_types` (`VariantHolder`)
-- [ ] **E5** `Tuple` / multiple return values. *Unsupported by the crate: there is no `Tuple` Rust type and tuples aren't `AnyCompatible`, and `ffi::Tuple` reflects as origin `Tuple` which is NOT in `RUST_UNSUPPORTED_ORIGINS` — so it would render a bare, undefined `Tuple` rather than skip cleanly. Needs either crate tuple support or adding `Tuple` to the unsupported set for a graceful skip.*
+- [ ] **E5** `Tuple` / multiple return values — **Not planned**. The crate has no `Tuple` type and tuples aren't `AnyCompatible`; `ffi::Tuple` reflects as origin `Tuple` (not in `RUST_UNSUPPORTED_ORIGINS`), so it would render a bare undefined `Tuple` rather than skip. Fixing needs either crate tuple support or adding `Tuple`/`tuple` to the unsupported set (one-line, but a codegen change, not a test).
 
 ### F. Core FFI types (new module `test_ffi_types`, class `FfiTypesHolder`)
 
@@ -112,33 +127,41 @@ assertion focus**.
 
 - [x] **I1** Directly write a `String` field via DerefMut. → `test_scalar_types::write_string_field_directly`
 - [x] **I2** Directly write a container field via DerefMut. → `test_container_types::write_container_field_directly`
-- [ ] **I3** Real negative compile test for read-only: use `trybuild` / compile-fail to assert "assigning a `def_ro` field fails to compile" and "taking `&mut` on a read-only type fails to compile". The current "negative test" is only runtime read-only handling, not a compile-time guarantee.
+- [x] **I3** Compile-time read-only guarantee via `trybuild`: `tests/ui/assign_readonly_field.rs` (field assign) and `tests/ui/mut_borrow_readonly.rs` (`&mut`) both fail to compile with "trait `DerefMut` ... not implemented for `ImmutableVersion`". → `test_immutable_types::readonly_types_reject_mutation` (regenerate `.stderr` with `TRYBUILD=overwrite` on a toolchain bump)
 
 ### J. Destructor / refcount (QUICKSTART claims to verify, but no assertion exists)
 
 - [x] **J1** Drop triggers destructor: `Tracked` has a process-global live counter + `live_count()`; assert C++ dtor runs exactly once on last drop. → `drop_runs_destructor_exactly_once`
 - [x] **J2** Clone / shared ownership: clone a `Shape`, mutate via one handle + observe via the other, drop one, confirm the other still usable. → `clone_shares_underlying_object`
-- [ ] **J3** Object survives FFI round-trip without leak / premature free (pair with A, B). *(partially exercised by A4/B4 round-trips.)*
+- [ ] **J3** Object survives FFI round-trip without leak / premature free — **Not planned** (already covered in substance by A4/B4 object round-trips and the J1 refcount assertion; a dedicated leak test would need a memory profiler).
 
 ### K. Inheritance
 
 - [x] **K1** 3+ level inheritance: `Object → Shape → Box3D → ColoredBox`; multi-level Deref reaches top-most `Shape` fields. → `test_object_hierarchy::{three_level_inheritance_field_access, mid_level_type_has_own_method_and_inherited_fields}`
-- [ ] **K2** Calling inherited base methods / base static methods on a derived type. *Blocked (codegen limitation, same class as A3): each generated ref type's `impl` only carries its OWN registered methods; `Deref` reaches the `*Obj` structs (fields), not the parent **ref** type's methods. So `colored_box.volume()` / `circle.get_area()` don't compile. Would need codegen to either re-emit inherited methods on derived ref types or `Deref` a derived ref to its parent ref.*
+- [ ] **K2** Calling inherited base methods on a derived type — **Not planned** (blocked codegen limitation, same class as A3): each generated ref type's `impl` only carries its OWN registered methods; `Deref` reaches the `*Obj` structs (fields), not the parent **ref** type's methods, so `colored_box.volume()` / `circle.get_area()` don't compile. Would need codegen to re-emit inherited methods on derived ref types (or `Deref` a derived ref to its parent ref).
 
 ---
 
 ## P3 — Misc / robustness
 
-- [ ] **L1** Global free functions. *N/A for the Rust backend by design: it does not generate bindings for `register_global_func` globals (decision 5 — Rust calls them dynamically via `Function::get_global(name)`); a `global/<prefix>` block is left untouched. Nothing to e2e-test in generated output.*
+- [ ] **L1** Global free functions — **Not planned** (N/A by design): the Rust backend does not generate bindings for `register_global_func` globals (decision 5 — Rust calls them dynamically via `Function::get_global(name)`); a `global/<prefix>` block is left untouched, so there is no generated output to e2e-test.
 - [x] **L2** Rust reserved-word field/method names: fields `type`/`match`/`move` + method registered as `fn` → raw-escaped `r#type`/`r#fn`/... → `test_scalar_types::reserved_word_names_are_raw_escaped`
-- [ ] **L3** Multiple `init` overloads / constructor default arguments. *Limited: reflection exposes a single `__ffi_init__`, and C++ default args don't translate to Rust optionals (the generated `new` always takes all params positionally). No distinct behavior to assert beyond existing ctor tests.*
+- [ ] **L3** Multiple `init` overloads / constructor default arguments — **Not planned**: reflection exposes a single `__ffi_init__`, and C++ default args don't translate to Rust optionals (the generated `new` always takes all params positionally). No distinct behavior to assert beyond the existing ctor tests.
 - [x] **L4** Boundary values: `i64::MAX`/`MIN`, negative `format_scalars`, empty + Unicode string. → `test_scalar_types::boundary_values`
-- [ ] **L5** Namespace / module-name collision: two libraries registering the same short type name.
+- [ ] **L5** Namespace / module-name collision (two libraries registering the same short type name) — **Not planned**: would require a second shared library + crate; each module already namespaces under its own `type_key` prefix, so the realistic risk is low relative to the scaffolding cost.
 
 ---
 
-## Suggested implementation order
+## Remaining (all Not planned)
 
-**D (error propagation) → A/B (object as param & return) → C (nested object) → J (dtor/refcount).**
-These four are the ones that actually surface ABI and lifetime bugs; the rest are
-nice-to-have and can be added on demand.
+These are intentionally not implemented — see each item above for the reason:
+
+- **A3** / **K2** — blocked codegen limitations (no derived→base upcast; inherited
+  methods not re-emitted on derived ref types).
+- **E5** — `Tuple` unsupported by the crate (would render a bare undefined `Tuple`).
+- **L1** — Rust backend generates no free-function bindings by design.
+- **J3** — leak/round-trip already covered in substance; a true leak test needs a profiler.
+- **L3** / **L5** — limited / low value relative to scaffolding cost.
+
+Picking any of these up means changing the Rust backend codegen or the crate, not
+just adding a test.
