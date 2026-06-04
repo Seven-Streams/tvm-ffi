@@ -20,7 +20,7 @@
 
 use test_object_hierarchy::ensure_loaded;
 use test_object_hierarchy::generated::test_object_hierarchy::{
-    Circle, Group, Rectangle, Shape, ShapeBatch, Tracked,
+    Box3D, Circle, ColoredBox, Group, Rectangle, Shape, ShapeBatch, Tracked,
 };
 use tvm_ffi::{Array, Result};
 
@@ -252,5 +252,32 @@ fn drop_runs_destructor_exactly_once() -> Result<()> {
 
     drop(t2);
     assert_eq!(Tracked::live_count()?, before, "last drop runs the destructor exactly once");
+    Ok(())
+}
+
+// --- K1: 3+ level inheritance (Object -> Shape -> Box3D -> ColoredBox) --------
+
+#[test]
+fn three_level_inheritance_field_access() -> Result<()> {
+    ensure_loaded();
+    // ColoredBox is 3 user levels deep; every ancestor's fields are reachable
+    // through the multi-level Deref chain.
+    let cb = ColoredBox::new(2, 3, 4, 7)?;
+    assert_eq!(cb.color, 7); // own field (ColoredBoxObj)
+    assert_eq!(cb.depth, 4); // Box3DObj  (1 Deref)
+    assert_eq!(cb.width, 2); // ShapeObj  (2 Derefs)
+    assert_eq!(cb.height, 3); // ShapeObj  (2 Derefs)
+    Ok(())
+}
+
+#[test]
+fn mid_level_type_has_own_method_and_inherited_fields() -> Result<()> {
+    ensure_loaded();
+    // Box3D (middle, non-final) can call its own `volume()` and read the
+    // inherited Shape fields.
+    let mut b = Box3D::new(2, 3, 5)?;
+    assert_eq!(b.depth, 5);
+    assert_eq!(b.width, 2); // inherited ShapeObj field
+    assert_eq!(b.volume()?, 30); // own method: 2 * 3 * 5
     Ok(())
 }

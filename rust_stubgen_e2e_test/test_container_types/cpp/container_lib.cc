@@ -137,6 +137,68 @@ class OptionalHolder : public ffi::ObjectRef {
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(OptionalHolder, ffi::ObjectRef, OptionalHolderObj);
 };
 
+// E1/E2: nested containers and `Optional<String>` in param / return / field.
+class NestedHolderObj : public ffi::Object {
+ public:
+  ffi::Array<ffi::Array<int64_t>> matrix;           // Array<Array<i64>>
+  ffi::Array<ffi::Optional<int64_t>> opt_ints;      // Array<Optional<i64>>
+  ffi::Optional<ffi::Array<ffi::String>> opt_strs;  // Optional<Array<String>>
+
+  explicit NestedHolderObj(
+      ffi::Array<ffi::Array<int64_t>> matrix = ffi::Array<ffi::Array<int64_t>>(),
+      ffi::Array<ffi::Optional<int64_t>> opt_ints = ffi::Array<ffi::Optional<int64_t>>(),
+      ffi::Optional<ffi::Array<ffi::String>> opt_strs = ffi::Optional<ffi::Array<ffi::String>>())
+      : matrix(matrix), opt_ints(opt_ints), opt_strs(opt_strs) {}
+
+  // Array<Array<i64>> as a parameter.
+  static int64_t SumMatrix(ffi::Array<ffi::Array<int64_t>> m) {
+    int64_t total = 0;
+    for (size_t i = 0; i < m.size(); ++i) {
+      for (size_t j = 0; j < m[i].size(); ++j) {
+        total += m[i][j];
+      }
+    }
+    return total;
+  }
+
+  // Array<Array<i64>> as a return value (`times` copies of `row`).
+  static ffi::Array<ffi::Array<int64_t>> Replicate(ffi::Array<int64_t> row, int64_t times) {
+    return ffi::Array<ffi::Array<int64_t>>(static_cast<size_t>(times), row);
+  }
+
+  // Array<Optional<i64>> as a parameter: count the present elements.
+  static int64_t CountSome(ffi::Array<ffi::Optional<int64_t>> arr) {
+    int64_t n = 0;
+    for (size_t i = 0; i < arr.size(); ++i) {
+      if (arr[i].has_value()) ++n;
+    }
+    return n;
+  }
+
+  // Optional<String> as parameter + return (E2), covering Some and None.
+  static ffi::Optional<ffi::String> EchoOptString(ffi::Optional<ffi::String> s) { return s; }
+
+  // Reads the Optional<Array<String>> field: element count, or -1 when None.
+  int64_t OptStrsLen() {
+    return opt_strs.has_value() ? static_cast<int64_t>(opt_strs.value().size()) : -1;
+  }
+
+  static constexpr bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO("test_container_types.NestedHolder", NestedHolderObj, ffi::Object);
+};
+
+class NestedHolder : public ffi::ObjectRef {
+ public:
+  explicit NestedHolder(
+      ffi::Array<ffi::Array<int64_t>> matrix = ffi::Array<ffi::Array<int64_t>>(),
+      ffi::Array<ffi::Optional<int64_t>> opt_ints = ffi::Array<ffi::Optional<int64_t>>(),
+      ffi::Optional<ffi::Array<ffi::String>> opt_strs = ffi::Optional<ffi::Array<ffi::String>>()) {
+    data_ = ffi::make_object<NestedHolderObj>(matrix, opt_ints, opt_strs);
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(NestedHolder, ffi::ObjectRef, NestedHolderObj);
+};
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
 
@@ -164,6 +226,22 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 
   refl::TypeAttrDef<OptionalHolderObj>().def(
       refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<OptionalHolder>);
+
+  refl::ObjectDef<NestedHolderObj>()
+      .def(refl::init<ffi::Array<ffi::Array<int64_t>>, ffi::Array<ffi::Optional<int64_t>>,
+                      ffi::Optional<ffi::Array<ffi::String>>>())
+      .def_rw("matrix", &NestedHolderObj::matrix, "Array<Array<i64>>")
+      .def_rw("opt_ints", &NestedHolderObj::opt_ints, "Array<Optional<i64>>")
+      .def_rw("opt_strs", &NestedHolderObj::opt_strs, "Optional<Array<String>>")
+      .def_static("sum_matrix", &NestedHolderObj::SumMatrix, "sum an Array<Array<i64>>")
+      .def_static("replicate", &NestedHolderObj::Replicate, "return Array<Array<i64>>")
+      .def_static("count_some", &NestedHolderObj::CountSome,
+                  "count present in Array<Optional<i64>>")
+      .def_static("echo_opt_string", &NestedHolderObj::EchoOptString, "echo an Optional<String>")
+      .def("opt_strs_len", &NestedHolderObj::OptStrsLen, "len of opt_strs or -1");
+
+  refl::TypeAttrDef<NestedHolderObj>().def(
+      refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<NestedHolder>);
 }
 
 }  // namespace test_container_types

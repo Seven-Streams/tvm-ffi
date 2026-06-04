@@ -263,6 +263,53 @@ class Rectangle : public Shape {
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(Rectangle, Shape, RectangleObj);
 };
 
+// --- K1: 3+ level inheritance (Object -> Shape -> Box3D -> ColoredBox) --------
+// Box3D is a NON-final middle type (so it can be subclassed); ColoredBox is the
+// final leaf. The Rust side reaches the top-most `Shape` fields through a 3-deep
+// Deref chain (ColoredBoxObj -> Box3DObj -> ShapeObj).
+class Box3DObj : public ShapeObj {
+ public:
+  int64_t depth;
+
+  explicit Box3DObj(int64_t width = 0, int64_t height = 0, int64_t depth = 0)
+      : ShapeObj(width, height), depth(depth) {}
+
+  int64_t Volume() { return width * height * depth; }
+
+  TVM_FFI_DECLARE_OBJECT_INFO("test_object_hierarchy.Box3D", Box3DObj, ShapeObj);
+};
+
+class Box3D : public Shape {
+ public:
+  explicit Box3D(int64_t width = 0, int64_t height = 0, int64_t depth = 0)
+      : Shape(ffi::UnsafeInit{}) {
+    data_ = ffi::make_object<Box3DObj>(width, height, depth);
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(Box3D, Shape, Box3DObj);
+};
+
+class ColoredBoxObj : public Box3DObj {
+ public:
+  int64_t color;
+
+  explicit ColoredBoxObj(int64_t width = 0, int64_t height = 0, int64_t depth = 0,
+                         int64_t color = 0)
+      : Box3DObj(width, height, depth), color(color) {}
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("test_object_hierarchy.ColoredBox", ColoredBoxObj, Box3DObj);
+};
+
+class ColoredBox : public Box3D {
+ public:
+  explicit ColoredBox(int64_t width = 0, int64_t height = 0, int64_t depth = 0, int64_t color = 0)
+      : Box3D(ffi::UnsafeInit{}) {
+    data_ = ffi::make_object<ColoredBoxObj>(width, height, depth, color);
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(ColoredBox, Box3D, ColoredBoxObj);
+};
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
 
@@ -326,6 +373,21 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 
   refl::TypeAttrDef<RectangleObj>().def(
       refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<Rectangle>);
+
+  refl::ObjectDef<Box3DObj>()
+      .def(refl::init<int64_t, int64_t, int64_t>())
+      .def_rw("depth", &Box3DObj::depth, "depth of the box")
+      .def("volume", &Box3DObj::Volume, "width * height * depth");
+
+  refl::TypeAttrDef<Box3DObj>().def(refl::type_attr::kConvert,
+                                    &refl::details::FFIConvertFromAnyViewToObjectRef<Box3D>);
+
+  refl::ObjectDef<ColoredBoxObj>()
+      .def(refl::init<int64_t, int64_t, int64_t, int64_t>())
+      .def_rw("color", &ColoredBoxObj::color, "color code of the box");
+
+  refl::TypeAttrDef<ColoredBoxObj>().def(
+      refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<ColoredBox>);
 }
 
 }  // namespace test_object_hierarchy

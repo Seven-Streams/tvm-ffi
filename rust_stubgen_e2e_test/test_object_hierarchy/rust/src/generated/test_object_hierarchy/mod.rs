@@ -468,3 +468,126 @@ impl Tracked {
     }
 }
 // tvm-ffi-stubgen(end)
+
+// tvm-ffi-stubgen(begin): object/test_object_hierarchy.Box3D
+#[repr(C)]
+pub struct Box3DObj {
+    base: ShapeObj,
+    pub depth: i64,
+}
+
+unsafe impl ObjectCore for Box3DObj {
+    const TYPE_KEY: &'static str = "test_object_hierarchy.Box3D";
+
+    fn type_index() -> i32 {
+        lookup_type_index(Self::TYPE_KEY)
+    }
+
+    unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject {
+        ShapeObj::object_header_mut(&mut this.base)
+    }
+}
+
+#[repr(C)]
+#[derive(DeriveObjectRef, Clone)]
+pub struct Box3D {
+    data: ObjectArc<Box3DObj>,
+}
+
+impl Deref for Box3D {
+    type Target = Box3DObj;
+    fn deref(&self) -> &Box3DObj {
+        &self.data
+    }
+}
+
+impl DerefMut for Box3D {
+    fn deref_mut(&mut self) -> &mut Box3DObj {
+        &mut self.data
+    }
+}
+
+impl Deref for Box3DObj {
+    type Target = ShapeObj;
+    fn deref(&self) -> &ShapeObj {
+        &self.base
+    }
+}
+
+impl DerefMut for Box3DObj {
+    fn deref_mut(&mut self) -> &mut ShapeObj {
+        &mut self.base
+    }
+}
+
+impl Box3D {
+    pub fn new(_0: i64, _1: i64, _2: i64) -> Result<Self> {
+        let ctor = get_type_method(Box3DObj::TYPE_KEY, "__ffi_init__")?;
+        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2)])?.try_into()?)
+    }
+
+    pub fn volume(&mut self) -> Result<i64> {
+        let f = get_type_method(Box3DObj::TYPE_KEY, "volume")?;
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
+    }
+}
+// tvm-ffi-stubgen(end)
+
+// tvm-ffi-stubgen(begin): object/test_object_hierarchy.ColoredBox
+#[repr(C)]
+pub struct ColoredBoxObj {
+    base: Box3DObj,
+    pub color: i64,
+}
+
+unsafe impl ObjectCore for ColoredBoxObj {
+    const TYPE_KEY: &'static str = "test_object_hierarchy.ColoredBox";
+
+    fn type_index() -> i32 {
+        lookup_type_index(Self::TYPE_KEY)
+    }
+
+    unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject {
+        Box3DObj::object_header_mut(&mut this.base)
+    }
+}
+
+#[repr(C)]
+#[derive(DeriveObjectRef, Clone)]
+pub struct ColoredBox {
+    data: ObjectArc<ColoredBoxObj>,
+}
+
+impl Deref for ColoredBox {
+    type Target = ColoredBoxObj;
+    fn deref(&self) -> &ColoredBoxObj {
+        &self.data
+    }
+}
+
+impl DerefMut for ColoredBox {
+    fn deref_mut(&mut self) -> &mut ColoredBoxObj {
+        &mut self.data
+    }
+}
+
+impl Deref for ColoredBoxObj {
+    type Target = Box3DObj;
+    fn deref(&self) -> &Box3DObj {
+        &self.base
+    }
+}
+
+impl DerefMut for ColoredBoxObj {
+    fn deref_mut(&mut self) -> &mut Box3DObj {
+        &mut self.base
+    }
+}
+
+impl ColoredBox {
+    pub fn new(_0: i64, _1: i64, _2: i64, _3: i64) -> Result<Self> {
+        let ctor = get_type_method(ColoredBoxObj::TYPE_KEY, "__ffi_init__")?;
+        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2), AnyView::from(&_3)])?.try_into()?)
+    }
+}
+// tvm-ffi-stubgen(end)

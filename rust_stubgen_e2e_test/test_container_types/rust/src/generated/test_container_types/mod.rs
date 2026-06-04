@@ -223,3 +223,76 @@ impl OptionalHolder {
     }
 }
 // tvm-ffi-stubgen(end)
+
+// tvm-ffi-stubgen(begin): object/test_container_types.NestedHolder
+#[repr(C)]
+pub struct NestedHolderObj {
+    base: Object,
+    pub matrix: Array<Array<i64>>,
+    pub opt_ints: Array<Option<i64>>,
+    pub opt_strs: Option<Array<tvm_ffi::String>>,
+}
+
+unsafe impl ObjectCore for NestedHolderObj {
+    const TYPE_KEY: &'static str = "test_container_types.NestedHolder";
+
+    fn type_index() -> i32 {
+        lookup_type_index(Self::TYPE_KEY)
+    }
+
+    unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject {
+        Object::object_header_mut(&mut this.base)
+    }
+}
+
+#[repr(C)]
+#[derive(DeriveObjectRef, Clone)]
+pub struct NestedHolder {
+    data: ObjectArc<NestedHolderObj>,
+}
+
+impl Deref for NestedHolder {
+    type Target = NestedHolderObj;
+    fn deref(&self) -> &NestedHolderObj {
+        &self.data
+    }
+}
+
+impl DerefMut for NestedHolder {
+    fn deref_mut(&mut self) -> &mut NestedHolderObj {
+        &mut self.data
+    }
+}
+
+impl NestedHolder {
+    pub fn new(_0: Array<Array<i64>>, _1: Array<Option<i64>>, _2: Option<Array<tvm_ffi::String>>) -> Result<Self> {
+        let ctor = get_type_method(NestedHolderObj::TYPE_KEY, "__ffi_init__")?;
+        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), AnyView::from(&_2)])?.try_into()?)
+    }
+
+    pub fn sum_matrix(_0: Array<Array<i64>>) -> Result<i64> {
+        let f = get_type_method(NestedHolderObj::TYPE_KEY, "sum_matrix")?;
+        Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
+    }
+
+    pub fn replicate(_0: Array<i64>, _1: i64) -> Result<Array<Array<i64>>> {
+        let f = get_type_method(NestedHolderObj::TYPE_KEY, "replicate")?;
+        Ok(f.call_packed(&[AnyView::from(&_0), AnyView::from(&_1)])?.try_into()?)
+    }
+
+    pub fn count_some(_0: Array<Option<i64>>) -> Result<i64> {
+        let f = get_type_method(NestedHolderObj::TYPE_KEY, "count_some")?;
+        Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
+    }
+
+    pub fn echo_opt_string(_0: Option<tvm_ffi::String>) -> Result<Option<tvm_ffi::String>> {
+        let f = get_type_method(NestedHolderObj::TYPE_KEY, "echo_opt_string")?;
+        Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)
+    }
+
+    pub fn opt_strs_len(&mut self) -> Result<i64> {
+        let f = get_type_method(NestedHolderObj::TYPE_KEY, "opt_strs_len")?;
+        Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
+    }
+}
+// tvm-ffi-stubgen(end)

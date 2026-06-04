@@ -147,6 +147,21 @@ The test suite consists of 4 independent test modules, each focusing on specific
     payload comes back unchanged without C++ inspecting it.
   - Instance methods: `set_any(Any)` / `get_any() -> Any` (field write/read)
 
+### 6. `test_ffi_types/` - Core FFI value types (Shape / DataType / Device / Function)
+
+**Coverage:**
+
+- `ffi::Shape` (F2), `DLDataType` (F3), `DLDevice` (F3) as param / return / field.
+- `Function` as a parameter (G1 — Rust passes a closure that C++ invokes) and as a
+  return value (G2 — C++ returns a closure that Rust calls).
+
+**Key Class:**
+
+- `FfiTypesHolder`: fields `shape` / `dtype` / `device`
+  - Static methods: `shape_product`, `make_shape`, `echo_dtype`, `dtype_bits`,
+    `echo_device`, `device_id`, `apply_fn(fn, x)`, `make_adder(n) -> Function`
+  - Instance method: `shape_ndim()`
+
 ## Building Individual Tests
 
 Each test module has its own CMakeLists.txt and build script:
@@ -182,7 +197,11 @@ uv run tvm-ffi-stubgen --target rust \
 | Scalar types (int, float, bool, string, None) | test_scalar_types | ✓ |
 | Array\<T\> | test_container_types | ✓ |
 | Optional\<T\> | test_container_types | ✓ |
-| Tuples | — | Pending* |
+| Nested containers (Array<Array\<T\>>, Array<Optional\<T\>>, Optional<Array\<T\>>) | test_container_types | ✓ |
+| Shape / DataType / Device | test_ffi_types | ✓ |
+| Function (callback param + return) | test_ffi_types | ✓ |
+| Tensor (DLPack) | — | Pending* |
+| Tuples / Map / Dict / Variant | — | Pending* (Map/Dict/Variant skipped by design) |
 | Any/AnyView (param→AnyView, return/field→Any) | test_any_types | ✓ |
 | Object references | test_object_hierarchy | ✓ |
 | Objects as params / returns / fields | test_object_hierarchy | ✓ |

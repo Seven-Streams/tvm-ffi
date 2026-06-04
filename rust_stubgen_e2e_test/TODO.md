@@ -71,22 +71,22 @@ assertion focus**.
 
 ### E. Container extensions
 
-- [ ] **E1** Nested containers: `Array<Array<i64>>`, `Array<Optional<i64>>`, `Optional<Array<String>>`.
-- [ ] **E2** `Optional<String>` as return/param (currently only `Optional<i64>` returns; `Optional<String>` only as a field).
+- [x] **E1** Nested containers: `Array<Array<i64>>`, `Array<Optional<i64>>`, `Optional<Array<String>>` (param/return/field) on `NestedHolder`. → `test_container_types::{nested_array_param_and_return, array_of_optionals_param, nested_container_fields, optional_array_field_some_and_none}`
+- [x] **E2** `Optional<String>` as param + return, both Some/None. → `test_container_types::echo_optional_string`
 - [ ] **E3** `Map<K,V>` / `Dict`: at minimum verify stubgen skips unsupported types and prints `[Skipped]`; if supported, add positive test.
 - [ ] **E4** `Variant<...>`.
 - [ ] **E5** `Tuple` / multiple return values.
 
-### F. Core FFI types
+### F. Core FFI types (new module `test_ffi_types`, class `FfiTypesHolder`)
 
 - [ ] **F1** `Tensor` (DLPack) as field/param/return.
-- [ ] **F2** `ffi::Shape`.
-- [ ] **F3** `Device` / `DataType`.
+- [x] **F2** `ffi::Shape` as param/return/field. → `test_ffi_types::shape_param_and_return`, `ffi_type_fields`
+- [x] **F3** `Device` / `DataType` (`DLDevice`/`DLDataType`) as param/return/field. → `test_ffi_types::{datatype_param_and_return, device_param_and_return, ffi_type_fields}`
 
-### G. Function / callback
+### G. Function / callback (`test_ffi_types`)
 
-- [ ] **G1** Receive `Function` param: C++ method accepts a callback and invokes it; Rust passes a closure.
-- [ ] **G2** Return `Function`.
+- [x] **G1** Receive `Function` param: `apply_fn(fn, x)` invokes the callback; Rust passes a closure via `Function::from_typed`. → `test_ffi_types::function_as_param`
+- [x] **G2** Return `Function`: `make_adder(n)` returns a closure; Rust calls it via `call_packed`. → `test_ffi_types::function_as_return`
 
 ### H. `Any` / `AnyView`
 
@@ -110,8 +110,8 @@ assertion focus**.
 
 ### I. Mutability & field write-back
 
-- [ ] **I1** Directly write a `String` field: scalar test's `mutate_fields_from_rust` skips `string_val`; add `holder.string_val = FFIString::from(...)`.
-- [ ] **I2** Directly write a container field: `holder.int_array = Array::new(...)` (currently only via C++ `set_arrays`).
+- [x] **I1** Directly write a `String` field via DerefMut. → `test_scalar_types::write_string_field_directly`
+- [x] **I2** Directly write a container field via DerefMut. → `test_container_types::write_container_field_directly`
 - [ ] **I3** Real negative compile test for read-only: use `trybuild` / compile-fail to assert "assigning a `def_ro` field fails to compile" and "taking `&mut` on a read-only type fails to compile". The current "negative test" is only runtime read-only handling, not a compile-time guarantee.
 
 ### J. Destructor / refcount (QUICKSTART claims to verify, but no assertion exists)
@@ -122,8 +122,8 @@ assertion focus**.
 
 ### K. Inheritance
 
-- [ ] **K1** 3+ level inheritance: `Object → A → B → C`; verify multi-level Deref reaches top-most base fields.
-- [ ] **K2** Calling inherited base methods / base static methods on a derived type (currently `Circle` never tests calling `get_area()` / `get_default_width()`).
+- [x] **K1** 3+ level inheritance: `Object → Shape → Box3D → ColoredBox`; multi-level Deref reaches top-most `Shape` fields. → `test_object_hierarchy::{three_level_inheritance_field_access, mid_level_type_has_own_method_and_inherited_fields}`
+- [ ] **K2** Calling inherited base methods / base static methods on a derived type. *Blocked (codegen limitation, same class as A3): each generated ref type's `impl` only carries its OWN registered methods; `Deref` reaches the `*Obj` structs (fields), not the parent **ref** type's methods. So `colored_box.volume()` / `circle.get_area()` don't compile. Would need codegen to either re-emit inherited methods on derived ref types or `Deref` a derived ref to its parent ref.*
 
 ---
 
@@ -132,7 +132,7 @@ assertion focus**.
 - [ ] **L1** Global free functions: `register_global_func` not attached to any class; verify generated free function is callable (all current cases are class methods; zero free-function samples).
 - [ ] **L2** Rust reserved-word field/method names: fields named `type` / `match` / `fn` / `move`; verify generated code escapes or renames.
 - [ ] **L3** Multiple `init` overloads / constructor default arguments.
-- [ ] **L4** Boundary values: `i64` extremes & negatives, negative `format_scalars`, empty string, Unicode string, very long string.
+- [x] **L4** Boundary values: `i64::MAX`/`MIN`, negative `format_scalars`, empty + Unicode string. → `test_scalar_types::boundary_values`
 - [ ] **L5** Namespace / module-name collision: two libraries registering the same short type name.
 
 ---

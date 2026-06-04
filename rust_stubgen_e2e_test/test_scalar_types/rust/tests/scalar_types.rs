@@ -83,3 +83,38 @@ fn set_values_through_cpp_method() -> Result<()> {
     );
     Ok(())
 }
+
+// --- I1: directly write a String field via DerefMut ---------------------------
+
+#[test]
+fn write_string_field_directly() -> Result<()> {
+    ensure_loaded();
+    let mut holder = ScalarHolder::new(0, 0.0, false, FFIString::from("old"))?;
+    holder.string_val = FFIString::from("new");
+    assert_eq!(holder.string_val.as_str(), "new");
+    // C++ observes the replaced String on the shared heap object.
+    assert!(holder.get_description()?.as_str().contains("str=new"));
+    Ok(())
+}
+
+// --- L4: boundary values ------------------------------------------------------
+
+#[test]
+fn boundary_values() -> Result<()> {
+    ensure_loaded();
+    let mut holder = ScalarHolder::new(i64::MAX, -2.5, true, FFIString::from(""))?;
+    assert_eq!(holder.int_val, i64::MAX);
+    assert_eq!(holder.string_val.as_str(), ""); // empty string
+
+    holder.int_val = i64::MIN;
+    assert_eq!(holder.int_val, i64::MIN);
+
+    // Unicode string round-trips intact.
+    holder.string_val = FFIString::from("héllo·世界");
+    assert_eq!(holder.string_val.as_str(), "héllo·世界");
+
+    // Negative values through a static formatter.
+    let s = ScalarHolder::format_scalars(-7, -1.5, false, FFIString::from("x"))?;
+    assert_eq!(s.as_str(), "int=-7,float=-1.5,bool=false,str=x");
+    Ok(())
+}
