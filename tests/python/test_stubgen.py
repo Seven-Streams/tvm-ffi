@@ -928,9 +928,9 @@ def test_render_tuple() -> None:
 
 
 def test_render_object_leaf_records_use() -> None:
-    text, imports = _rust_render(TypeSchema("ffi.String"))
-    assert text == "String"
-    assert RustUse("tvm_ffi::String") in imports.items
+    text, imports = _rust_render(TypeSchema("ffi.Array"))
+    assert text == "Array"
+    assert RustUse("tvm_ffi::Array") in imports.items
 
 
 def test_render_nested() -> None:
