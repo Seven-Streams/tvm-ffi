@@ -87,6 +87,20 @@ The test suite consists of 4 independent test modules, each focusing on specific
   - Mixed boolean and numeric fields
   - Instance method: `update_square_flag()`
 
+**Object-as-value, error, and lifetime coverage (P0):**
+
+- `Shape`: `checked_div()` (error propagation — `TVM_FFI_THROW` → Rust `Err`),
+  `same_size_as(Shape)` / `combined_area(Shape, Shape)` (object params),
+  `scaled(factor) -> Shape` (non-constructor object return).
+- `ShapeBatch`: `total_area(Array<Shape>)` (array-of-objects param),
+  `non_empty_or_none(Shape) -> Optional<Shape>` (nullable object return),
+  `split(Shape) -> Array<Shape>` (array-of-objects return).
+- `Group { Shape primary; Array<Shape> members; }`: nested object fields —
+  construct-with-object, read via `Deref`, write object field via `DerefMut`.
+- `Tracked`: process-global live-instance counter + `live_count()` — asserts the
+  C++ destructor runs exactly once on the last drop and that `clone()` shares one
+  underlying object.
+
 ### 4. `test_immutable_types/` - Read-only Fields and Immutable Types
 
 **Coverage:**
@@ -151,6 +165,9 @@ uv run tvm-ffi-stubgen --target rust \
 | Tuples | — | Pending* |
 | Any/AnyView | — | Pending* |
 | Object references | test_object_hierarchy | ✓ |
+| Objects as params / returns / fields | test_object_hierarchy | ✓ |
+| Error propagation (`Result::Err`) | test_object_hierarchy | ✓ |
+| Destructor / refcount on drop | test_object_hierarchy | ✓ |
 | Immutable types | test_immutable_types | ✓ |
 | Mixed mutability | test_immutable_types | ✓ |
 

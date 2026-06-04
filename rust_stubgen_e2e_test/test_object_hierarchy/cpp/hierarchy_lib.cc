@@ -22,6 +22,7 @@
  */
 #include <tvm/ffi/tvm_ffi.h>
 
+#include <atomic>
 #include <cstdint>
 #include <iostream>
 #include <sstream>
@@ -29,6 +30,10 @@
 namespace test_object_hierarchy {
 
 namespace ffi = tvm::ffi;
+
+// Forward declaration so ShapeObj can take/return the `Shape` ref wrapper in
+// methods exercising object-as-parameter / object-as-return codegen.
+class Shape;
 
 class ShapeObj : public ffi::Object {
  public:
@@ -44,6 +49,23 @@ class ShapeObj : public ffi::Object {
   int64_t GetArea() { return width * height; }
 
   int64_t GetPerimeter() { return 2 * (width + height); }
+
+  // --- D: error propagation -------------------------------------------------
+  // Throws on divide-by-zero; otherwise returns area / denom.
+  int64_t CheckedDiv(int64_t denom) {
+    if (denom == 0) {
+      TVM_FFI_THROW(ValueError) << "CheckedDiv: division by zero";
+    }
+    return GetArea() / denom;
+  }
+
+  // --- A/B: registered object as parameter / return (defined out-of-line) ---
+  // Container-of-object variants (Array<Shape>/Optional<Shape>) live on the
+  // separate `ShapeBatch` class below, since those templates need a complete
+  // `Shape` which is not yet available inside this class body.
+  bool SameSizeAs(Shape other);                   // A1 instance takes object param
+  static int64_t CombinedArea(Shape a, Shape b);  // A2 static takes object params
+  Shape Scaled(int64_t factor);                   // B1 instance returns new object
 
   void Resize(int64_t new_width, int64_t new_height) {
     width = new_width;
@@ -74,6 +96,109 @@ class Shape : public ffi::ObjectRef {
   }
 
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(Shape, ffi::ObjectRef, ShapeObj);
+};
+
+// Out-of-line definitions of the methods that mention `Shape` (now complete).
+inline bool ShapeObj::SameSizeAs(Shape other) {
+  return width * height == other->width * other->height;
+}
+
+inline int64_t ShapeObj::CombinedArea(Shape a, Shape b) {
+  return a->width * a->height + b->width * b->height;
+}
+
+inline Shape ShapeObj::Scaled(int64_t factor) { return Shape(width * factor, height * factor); }
+
+// Hosts the container-of-object methods (A4 / B3 / B4) now that `Shape` is a
+// complete type, so `ffi::Array<Shape>` / `ffi::Optional<Shape>` can be used.
+class ShapeBatchObj : public ffi::Object {
+ public:
+  static int64_t TotalArea(ffi::Array<Shape> shapes) {  // A4 Array<object> param
+    int64_t total = 0;
+    for (Shape s : shapes) {
+      total += s->width * s->height;
+    }
+    return total;
+  }
+
+  static ffi::Optional<Shape> NonEmptyOrNone(Shape s) {  // B3 nullable object return
+    if (s->width * s->height > 0) {
+      return s;
+    }
+    return std::nullopt;
+  }
+
+  static ffi::Array<Shape> Split(Shape s) {  // B4 Array<object> return
+    return ffi::Array<Shape>({Shape(s->width, 0), Shape(0, s->height)});
+  }
+
+  static constexpr bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("test_object_hierarchy.ShapeBatch", ShapeBatchObj, ffi::Object);
+};
+
+class ShapeBatch : public ffi::ObjectRef {
+ public:
+  ShapeBatch() { data_ = ffi::make_object<ShapeBatchObj>(); }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(ShapeBatch, ffi::ObjectRef, ShapeBatchObj);
+};
+
+// --- C: registered object(s) as FIELD types (nested objects) -----------------
+class GroupObj : public ffi::Object {
+ public:
+  Shape primary;              // single nested object field
+  ffi::Array<Shape> members;  // container-of-object field
+
+  explicit GroupObj(Shape primary, ffi::Array<Shape> members)
+      : primary(primary), members(members) {}
+
+  int64_t TotalArea() {
+    int64_t total = primary->width * primary->height;
+    for (Shape s : members) {
+      total += s->width * s->height;
+    }
+    return total;
+  }
+
+  static constexpr bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("test_object_hierarchy.Group", GroupObj, ffi::Object);
+};
+
+class Group : public ffi::ObjectRef {
+ public:
+  explicit Group(Shape primary, ffi::Array<Shape> members) {
+    data_ = ffi::make_object<GroupObj>(primary, members);
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(Group, ffi::ObjectRef, GroupObj);
+};
+
+// --- J: destructor / refcount instrumentation --------------------------------
+// A process-global live-instance counter lets a Rust test assert that dropping
+// an object runs its C++ destructor exactly once (and that a clone shares one
+// underlying object rather than allocating a second). Only the dedicated J test
+// constructs `Tracked`, so the count stays deterministic under parallel tests.
+class TrackedObj : public ffi::Object {
+ public:
+  static std::atomic<int64_t>& Counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+  }
+
+  TrackedObj() { Counter().fetch_add(1, std::memory_order_relaxed); }
+  ~TrackedObj() { Counter().fetch_sub(1, std::memory_order_relaxed); }
+
+  static int64_t LiveCount() { return Counter().load(std::memory_order_relaxed); }
+
+  static constexpr bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("test_object_hierarchy.Tracked", TrackedObj, ffi::Object);
+};
+
+class Tracked : public ffi::ObjectRef {
+ public:
+  Tracked() { data_ = ffi::make_object<TrackedObj>(); }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(Tracked, ffi::ObjectRef, TrackedObj);
 };
 
 class CircleObj : public ShapeObj {
@@ -150,10 +275,40 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("get_area", &ShapeObj::GetArea, "get area")
       .def("get_perimeter", &ShapeObj::GetPerimeter, "get perimeter")
       .def("resize", &ShapeObj::Resize, "resize the shape")
-      .def("get_description", &ShapeObj::GetDescription, "get description");
+      .def("get_description", &ShapeObj::GetDescription, "get description")
+      .def("checked_div", &ShapeObj::CheckedDiv, "area / denom, throws on zero")
+      .def("same_size_as", &ShapeObj::SameSizeAs, "true if same area as other")
+      .def("scaled", &ShapeObj::Scaled, "return a new scaled Shape")
+      .def_static("combined_area", &ShapeObj::CombinedArea, "sum of two shapes' areas");
 
   refl::TypeAttrDef<ShapeObj>().def(refl::type_attr::kConvert,
                                     &refl::details::FFIConvertFromAnyViewToObjectRef<Shape>);
+
+  refl::ObjectDef<ShapeBatchObj>()
+      .def(refl::init<>())
+      .def_static("total_area", &ShapeBatchObj::TotalArea, "sum of areas in an Array<Shape>")
+      .def_static("non_empty_or_none", &ShapeBatchObj::NonEmptyOrNone,
+                  "Some(s) if area>0 else None")
+      .def_static("split", &ShapeBatchObj::Split, "split a shape into two");
+
+  refl::TypeAttrDef<ShapeBatchObj>().def(
+      refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<ShapeBatch>);
+
+  refl::ObjectDef<GroupObj>()
+      .def(refl::init<Shape, ffi::Array<Shape>>())
+      .def_rw("primary", &GroupObj::primary, "primary nested shape")
+      .def_rw("members", &GroupObj::members, "array of member shapes")
+      .def("total_area", &GroupObj::TotalArea, "primary area + members areas");
+
+  refl::TypeAttrDef<GroupObj>().def(refl::type_attr::kConvert,
+                                    &refl::details::FFIConvertFromAnyViewToObjectRef<Group>);
+
+  refl::ObjectDef<TrackedObj>()
+      .def(refl::init<>())
+      .def_static("live_count", &TrackedObj::LiveCount, "number of live TrackedObj instances");
+
+  refl::TypeAttrDef<TrackedObj>().def(refl::type_attr::kConvert,
+                                      &refl::details::FFIConvertFromAnyViewToObjectRef<Tracked>);
 
   refl::ObjectDef<CircleObj>()
       .def(refl::init<int64_t>())

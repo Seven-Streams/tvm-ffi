@@ -30,7 +30,7 @@ cmake -S "$TEST_DIR" -B "$TEST_DIR/build"
 cmake --build "$TEST_DIR/build" --parallel
 
 # Generate Rust bindings (optional - for testing stubgen)
-uv run tvm-ffi-stubgen --target rust \
+uv run tvm-ffi-stubgen "$TEST_DIR/rust/src/generated" --target rust \
   --dlls "$TEST_DIR/build/test_container_types.so" \
   --verbose
 

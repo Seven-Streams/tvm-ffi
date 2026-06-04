@@ -79,6 +79,7 @@ fn get_type_method(
 // tvm-ffi-stubgen(begin): import-section
 use std::ops::Deref;
 use std::ops::DerefMut;
+use tvm_ffi::Array;
 use tvm_ffi::Result;
 use tvm_ffi::derive::ObjectRef as DeriveObjectRef;
 use tvm_ffi::into_typed_fn;
@@ -168,6 +169,30 @@ impl Shape {
         let f = get_type_method(ShapeObj::TYPE_KEY, "get_description")?;
         let call = into_typed_fn!(f, Fn(&Shape) -> Result<tvm_ffi::String>);
         call(self)
+    }
+
+    pub fn checked_div(&mut self, _0: i64) -> Result<i64> {
+        let f = get_type_method(ShapeObj::TYPE_KEY, "checked_div")?;
+        let call = into_typed_fn!(f, Fn(&Shape, i64) -> Result<i64>);
+        call(self, _0)
+    }
+
+    pub fn same_size_as(&mut self, _0: Shape) -> Result<bool> {
+        let f = get_type_method(ShapeObj::TYPE_KEY, "same_size_as")?;
+        let call = into_typed_fn!(f, Fn(&Shape, Shape) -> Result<bool>);
+        call(self, _0)
+    }
+
+    pub fn scaled(&mut self, _0: i64) -> Result<Shape> {
+        let f = get_type_method(ShapeObj::TYPE_KEY, "scaled")?;
+        let call = into_typed_fn!(f, Fn(&Shape, i64) -> Result<Shape>);
+        call(self, _0)
+    }
+
+    pub fn combined_area(_0: Shape, _1: Shape) -> Result<i64> {
+        let f = get_type_method(ShapeObj::TYPE_KEY, "combined_area")?;
+        let call = into_typed_fn!(f, Fn(Shape, Shape) -> Result<i64>);
+        call(_0, _1)
     }
 }
 // tvm-ffi-stubgen(end)
@@ -306,6 +331,164 @@ impl Rectangle {
         let f = get_type_method(RectangleObj::TYPE_KEY, "update_square_flag")?;
         let call = into_typed_fn!(f, Fn(&Rectangle) -> Result<()>);
         call(self)
+    }
+}
+// tvm-ffi-stubgen(end)
+
+// tvm-ffi-stubgen(begin): object/test_object_hierarchy.ShapeBatch
+#[repr(C)]
+pub struct ShapeBatchObj {
+    base: Object,
+}
+
+unsafe impl ObjectCore for ShapeBatchObj {
+    const TYPE_KEY: &'static str = "test_object_hierarchy.ShapeBatch";
+
+    fn type_index() -> i32 {
+        lookup_type_index(Self::TYPE_KEY)
+    }
+
+    unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject {
+        Object::object_header_mut(&mut this.base)
+    }
+}
+
+#[repr(C)]
+#[derive(DeriveObjectRef, Clone)]
+pub struct ShapeBatch {
+    data: ObjectArc<ShapeBatchObj>,
+}
+
+impl Deref for ShapeBatch {
+    type Target = ShapeBatchObj;
+    fn deref(&self) -> &ShapeBatchObj {
+        &self.data
+    }
+}
+
+impl ShapeBatch {
+    pub fn new() -> Result<Self> {
+        let ctor = get_type_method(ShapeBatchObj::TYPE_KEY, "__ffi_init__")?;
+        let call = into_typed_fn!(ctor, Fn() -> Result<ShapeBatch>);
+        call()
+    }
+
+    pub fn total_area(_0: Array<Shape>) -> Result<i64> {
+        let f = get_type_method(ShapeBatchObj::TYPE_KEY, "total_area")?;
+        let call = into_typed_fn!(f, Fn(Array<Shape>) -> Result<i64>);
+        call(_0)
+    }
+
+    pub fn non_empty_or_none(_0: Shape) -> Result<Option<Shape>> {
+        let f = get_type_method(ShapeBatchObj::TYPE_KEY, "non_empty_or_none")?;
+        let call = into_typed_fn!(f, Fn(Shape) -> Result<Option<Shape>>);
+        call(_0)
+    }
+
+    pub fn split(_0: Shape) -> Result<Array<Shape>> {
+        let f = get_type_method(ShapeBatchObj::TYPE_KEY, "split")?;
+        let call = into_typed_fn!(f, Fn(Shape) -> Result<Array<Shape>>);
+        call(_0)
+    }
+}
+// tvm-ffi-stubgen(end)
+
+// tvm-ffi-stubgen(begin): object/test_object_hierarchy.Group
+#[repr(C)]
+pub struct GroupObj {
+    base: Object,
+    pub primary: Shape,
+    pub members: Array<Shape>,
+}
+
+unsafe impl ObjectCore for GroupObj {
+    const TYPE_KEY: &'static str = "test_object_hierarchy.Group";
+
+    fn type_index() -> i32 {
+        lookup_type_index(Self::TYPE_KEY)
+    }
+
+    unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject {
+        Object::object_header_mut(&mut this.base)
+    }
+}
+
+#[repr(C)]
+#[derive(DeriveObjectRef, Clone)]
+pub struct Group {
+    data: ObjectArc<GroupObj>,
+}
+
+impl Deref for Group {
+    type Target = GroupObj;
+    fn deref(&self) -> &GroupObj {
+        &self.data
+    }
+}
+
+impl DerefMut for Group {
+    fn deref_mut(&mut self) -> &mut GroupObj {
+        &mut self.data
+    }
+}
+
+impl Group {
+    pub fn new(_0: Shape, _1: Array<Shape>) -> Result<Self> {
+        let ctor = get_type_method(GroupObj::TYPE_KEY, "__ffi_init__")?;
+        let call = into_typed_fn!(ctor, Fn(Shape, Array<Shape>) -> Result<Group>);
+        call(_0, _1)
+    }
+
+    pub fn total_area(&mut self) -> Result<i64> {
+        let f = get_type_method(GroupObj::TYPE_KEY, "total_area")?;
+        let call = into_typed_fn!(f, Fn(&Group) -> Result<i64>);
+        call(self)
+    }
+}
+// tvm-ffi-stubgen(end)
+
+// tvm-ffi-stubgen(begin): object/test_object_hierarchy.Tracked
+#[repr(C)]
+pub struct TrackedObj {
+    base: Object,
+}
+
+unsafe impl ObjectCore for TrackedObj {
+    const TYPE_KEY: &'static str = "test_object_hierarchy.Tracked";
+
+    fn type_index() -> i32 {
+        lookup_type_index(Self::TYPE_KEY)
+    }
+
+    unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject {
+        Object::object_header_mut(&mut this.base)
+    }
+}
+
+#[repr(C)]
+#[derive(DeriveObjectRef, Clone)]
+pub struct Tracked {
+    data: ObjectArc<TrackedObj>,
+}
+
+impl Deref for Tracked {
+    type Target = TrackedObj;
+    fn deref(&self) -> &TrackedObj {
+        &self.data
+    }
+}
+
+impl Tracked {
+    pub fn new() -> Result<Self> {
+        let ctor = get_type_method(TrackedObj::TYPE_KEY, "__ffi_init__")?;
+        let call = into_typed_fn!(ctor, Fn() -> Result<Tracked>);
+        call()
+    }
+
+    pub fn live_count() -> Result<i64> {
+        let f = get_type_method(TrackedObj::TYPE_KEY, "live_count")?;
+        let call = into_typed_fn!(f, Fn() -> Result<i64>);
+        call()
     }
 }
 // tvm-ffi-stubgen(end)
