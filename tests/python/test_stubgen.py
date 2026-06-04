@@ -928,9 +928,12 @@ def test_render_tuple() -> None:
 
 
 def test_render_object_leaf_records_use() -> None:
+    # `tvm_ffi::String` is rendered fully-qualified inline (RUST_NO_IMPORT_FULLPATH)
+    # and records no `use`, so it can't shadow `std::string::String` in the module
+    # (which would break `#[derive(ObjectRef)]`'s `type_str() -> String`).
     text, imports = _rust_render(TypeSchema("ffi.String"))
-    assert text == "String"
-    assert RustUse("tvm_ffi::String") in imports.items
+    assert text == "tvm_ffi::String"
+    assert RustUse("tvm_ffi::String") not in imports.items
 
 
 def test_render_nested() -> None:
@@ -1163,8 +1166,13 @@ def test_rust_method_any_return_stays_any_not_anyview() -> None:
     text, imports = _gen_rust_object(info)
     # return -> owning Any; param -> non-owning AnyView
     assert "pub fn probe(&mut self, _0: AnyView) -> Result<Any> {" in text
-    assert "into_typed_fn!(f, Fn(&Boxed, AnyView) -> Result<Any>);" in text
     assert "Result<AnyView>" not in text  # the bug would have produced this
+    # `Any`/`AnyView` can't go through `into_typed_fn!` (AnyView is not
+    # `AnyCompatible`; an `Any` return hits the reflexive `TryFrom<Any>` whose
+    # error is `Infallible`). The method drops to the raw packed call, which
+    # speaks `AnyView` natively and returns `Any` directly (no `try_into`).
+    assert "into_typed_fn!" not in text
+    assert "f.call_packed(&[AnyView::from(&*self), _0])" in text
     # owning Any return must record its `use`
     assert RustUse("tvm_ffi::Any") in imports.items
     assert RustUse("tvm_ffi::AnyView") in imports.items

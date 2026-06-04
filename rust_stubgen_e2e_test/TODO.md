@@ -17,9 +17,9 @@
 
 # Rust Stubgen E2E Test — Coverage Gaps & TODO
 
-This checklist tracks test cases not yet covered by the four existing modules
+This checklist tracks test cases not yet covered by the existing modules
 (`test_scalar_types`, `test_container_types`, `test_object_hierarchy`,
-`test_immutable_types`).
+`test_immutable_types`, `test_any_types`).
 
 Each item notes **what to test + how to set up the C++ side + the Rust-side
 assertion focus**.
@@ -90,8 +90,16 @@ assertion focus**.
 
 ### H. `Any` / `AnyView`
 
-- [ ] **H1** `Any` as param (pass several underlying types).
-- [ ] **H2** `Any` as return value.
+- [x] **H1** `Any` as param (renders as `AnyView`); push int/float/bool/String through `describe_any`. → `test_any_types::describe_any_dispatches_on_runtime_type`
+- [x] **H2** `Any` as return value (`echo`, `get_any`) + `Any` field round-trip. → `test_any_types::{echo_returns_owning_any, any_field_roundtrip}`
+
+> **Stubgen resolution:** `into_typed_fn!` can't carry `Any`/`AnyView` (AnyView isn't
+> `AnyCompatible`; an `Any` return hits the reflexive `TryFrom<Any>` whose error is
+> `Infallible`). Rather than change the crate, the Rust backend now drops methods whose
+> signature involves a top-level `Any`/`AnyView` to the raw `Function::call_packed(&[AnyView])`
+> path (`_needs_packed_call` / `_packed_args_expr` in `rust_backend/codegen.py`). All other
+> methods are unchanged. *Note: nested `Any` (e.g. `Array<Any>`, `Optional<Any>`) is still
+> unsupported — those container types aren't `AnyCompatible` over `Any` either.*
 
 ---
 

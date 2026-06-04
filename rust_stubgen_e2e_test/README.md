@@ -127,6 +127,24 @@ The test suite consists of 4 independent test modules, each focusing on specific
   - Will generate a warning about mixed mutability
   - Illustrates how the generator handles edge cases
 
+### 5. `test_any_types/` - `Any` / `AnyView` in param / return / field positions
+
+**Coverage:**
+
+- A top-level `Any` **argument** renders as the non-owning `AnyView`; an `Any`
+  **return**/**field** stays the owning `Any` (per `docs/concepts/any.rst`).
+- Because `into_typed_fn!` can't carry `Any`/`AnyView` (AnyView isn't
+  `AnyCompatible`; an `Any` return hits the reflexive `TryFrom<Any>` whose error
+  is `Infallible`), the Rust backend emits the raw
+  `Function::call_packed(&[AnyView]) -> Result<Any>` path for these methods.
+
+**Key Class:**
+
+- `AnyHolder`: holds an `Any` field (`stored`)
+  - Static methods: `describe_any(Any)` (dispatches on the runtime type of one
+    `Any`/`AnyView` param), `echo(Any) -> Any` (owning return round-trip)
+  - Instance methods: `set_any(Any)` / `get_any() -> Any` (field write/read)
+
 ## Building Individual Tests
 
 Each test module has its own CMakeLists.txt and build script:
@@ -163,7 +181,7 @@ uv run tvm-ffi-stubgen --target rust \
 | Array\<T\> | test_container_types | ✓ |
 | Optional\<T\> | test_container_types | ✓ |
 | Tuples | — | Pending* |
-| Any/AnyView | — | Pending* |
+| Any/AnyView (param→AnyView, return/field→Any) | test_any_types | ✓ |
 | Object references | test_object_hierarchy | ✓ |
 | Objects as params / returns / fields | test_object_hierarchy | ✓ |
 | Error propagation (`Result::Err`) | test_object_hierarchy | ✓ |

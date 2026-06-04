@@ -1,0 +1,103 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+/*!
+ * \file any_lib.cc
+ * \brief C++ types testing `Any` in parameter / return / field positions.
+ *
+ * Per the FFI convention (docs/concepts/any.rst): a top-level `Any` in argument
+ * position is passed as the non-owning `AnyView`, while a returned `Any` is
+ * owning. The Rust stubgen renders these accordingly (param -> `AnyView`,
+ * return/field -> `Any`); this module exercises both directions.
+ */
+#include <tvm/ffi/tvm_ffi.h>
+
+#include <cstdint>
+#include <sstream>
+
+namespace test_any_types {
+
+namespace ffi = tvm::ffi;
+
+class AnyHolderObj : public ffi::Object {
+ public:
+  ffi::Any stored;
+
+  explicit AnyHolderObj(ffi::Any stored = ffi::Any()) : stored(stored) {}
+
+  // H1: `Any` as a parameter (renders as `AnyView` in Rust). Returns a tag
+  // string describing the runtime type + value, so a test can push several
+  // underlying types through one `Any` param and assert the dispatch.
+  static ffi::String DescribeAny(ffi::Any v) {
+    std::ostringstream oss;
+    // Use `as<T>()` (strict, no implicit conversion) so an int doesn't match
+    // the bool branch via int->bool coercion.
+    if (v == nullptr) {
+      oss << "none";
+    } else if (auto opt = v.as<bool>()) {
+      oss << "bool=" << (*opt ? "true" : "false");
+    } else if (auto opt = v.as<int64_t>()) {
+      oss << "int=" << *opt;
+    } else if (auto opt = v.as<double>()) {
+      oss << "float=" << *opt;
+    } else if (auto opt = v.as<ffi::String>()) {
+      oss << "str=" << opt->c_str();
+    } else {
+      oss << "other:" << v.GetTypeKey();
+    }
+    return ffi::String(oss.str());
+  }
+
+  // H2: `Any` as a return value (owning) — echoes the input straight back.
+  static ffi::Any Echo(ffi::Any v) { return v; }
+
+  // Instance method writing the `Any` field, plus an `Any`-returning getter.
+  void SetAny(ffi::Any v) { stored = v; }
+
+  ffi::Any GetAny() { return stored; }
+
+  static constexpr bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO("test_any_types.AnyHolder", AnyHolderObj, ffi::Object);
+};
+
+class AnyHolder : public ffi::ObjectRef {
+ public:
+  explicit AnyHolder(ffi::Any stored = ffi::Any()) {
+    data_ = ffi::make_object<AnyHolderObj>(stored);
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(AnyHolder, ffi::ObjectRef, AnyHolderObj);
+};
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+
+  refl::ObjectDef<AnyHolderObj>()
+      .def(refl::init<ffi::Any>())
+      .def_rw("stored", &AnyHolderObj::stored, "stored Any value")
+      .def_static("describe_any", &AnyHolderObj::DescribeAny,
+                  "describe the dynamic type/value of an Any")
+      .def_static("echo", &AnyHolderObj::Echo, "return the Any unchanged")
+      .def("set_any", &AnyHolderObj::SetAny, "store an Any")
+      .def("get_any", &AnyHolderObj::GetAny, "retrieve the stored Any");
+
+  refl::TypeAttrDef<AnyHolderObj>().def(
+      refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<AnyHolder>);
+}
+
+}  // namespace test_any_types

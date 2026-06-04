@@ -387,15 +387,48 @@ def _impl_block(
 
     inner: list[str] = []
     if info.has_init:
-        inner += _new_fn(info, leaf, obj_struct, render_param, init_method)
+        inner += _new_fn(info, leaf, obj_struct, render_param, init_method, imports)
         if methods:
             inner.append("")
     for i, method in enumerate(methods):
-        inner += _method_fn(method, leaf, obj_struct, mutable, render_ret, render_param)
+        inner += _method_fn(method, leaf, obj_struct, mutable, render_ret, render_param, imports)
         if i != len(methods) - 1:
             inner.append("")
 
     return [f"impl {leaf} {{", *[f"    {line}" if line else "" for line in inner], "}", ""]
+
+
+def _needs_packed_call(ret: str, param_types: list[str]) -> bool:
+    """Whether a method must use the raw packed call instead of `into_typed_fn!`.
+
+    `into_typed_fn!` can't express two `Any`-related cases the FFI convention
+    produces (see docs/concepts/any.rst):
+
+    * a top-level ``Any`` **argument** renders as ``AnyView``, which is not
+      ``AnyCompatible`` and so has no ``IntoArgHolder`` -- the typed arg path
+      rejects it;
+    * a top-level ``Any`` **return** would go through the macro's trailing
+      ``.try_into()?``, resolving to the reflexive ``TryFrom<Any> for Any``
+      whose ``Error`` is ``Infallible`` (which ``tvm_ffi::Error`` can't absorb).
+
+    For these we drop to ``Function::call_packed(&[AnyView]) -> Result<Any>``,
+    the layer that natively speaks ``AnyView``.
+    """
+    return ret == "Any" or "AnyView" in param_types
+
+
+def _packed_args_expr(params: list[tuple[str, str]], is_member: bool) -> str:
+    """Build the ``&[AnyView]`` element list for a packed call.
+
+    Each non-``AnyView`` argument is borrowed as a view via ``AnyView::from(&x)``
+    (works for any ``AnyCompatible`` value -- scalars, ``String``, ``Array``,
+    ``ObjectRef``); an ``AnyView`` argument is already a view and is passed
+    through unchanged. A member call prepends the receiver as ``&*self``.
+    """
+    parts = ["AnyView::from(&*self)"] if is_member else []
+    for name, ty in params:
+        parts.append(name if ty == "AnyView" else f"AnyView::from(&{name})")
+    return ", ".join(parts)
 
 
 def _new_fn(
@@ -404,6 +437,7 @@ def _new_fn(
     obj_struct: str,
     render_param: Callable[[TypeSchema], str],
     init_method: FuncInfo | None,
+    imports: RustImports,
 ) -> list[str]:
     """Emit `fn new(...) -> Result<Self>` calling reflected `__ffi_init__`.
 
@@ -420,11 +454,24 @@ def _new_fn(
     else:
         params = [(_rust_ident(f.name), render_param(f.schema)) for f in info.init_fields]
     sig = ", ".join(f"{n}: {t}" for n, t in params)
-    fn_types = ", ".join(t for _, t in params)
+    param_types = [t for _, t in params]
+    getter = f'    let ctor = get_type_method({obj_struct}::TYPE_KEY, "__ffi_init__")?;'
+    # The constructor return is the object itself (never a top-level `Any`), so
+    # only `AnyView` parameters can force the packed path here.
+    if _needs_packed_call(leaf, param_types):
+        _use(imports, "tvm_ffi::AnyView")
+        packed = _packed_args_expr(params, is_member=False)
+        return [
+            f"pub fn new({sig}) -> Result<Self> {{",
+            getter,
+            f"    Ok(ctor.call_packed(&[{packed}])?.try_into()?)",
+            "}",
+        ]
+    fn_types = ", ".join(param_types)
     call_args = ", ".join(n for n, _ in params)
     return [
         f"pub fn new({sig}) -> Result<Self> {{",
-        f'    let ctor = get_type_method({obj_struct}::TYPE_KEY, "__ffi_init__")?;',
+        getter,
         f"    let call = into_typed_fn!(ctor, Fn({fn_types}) -> Result<{leaf}>);",
         f"    call({call_args})",
         "}",
@@ -438,6 +485,7 @@ def _method_fn(
     mutable: bool,
     render_ret: Callable[[TypeSchema], str],
     render_param: Callable[[TypeSchema], str],
+    imports: RustImports,
 ) -> list[str]:
     """Emit one reflected method (instance or static) on `impl <T>`.
 
@@ -464,16 +512,35 @@ def _method_fn(
 
     if method.is_member:
         sig_parts = [self_recv, *[f"{n}: {t}" for n, t in params]]
+    else:
+        sig_parts = [f"{n}: {t}" for n, t in params]
+    getter = f'    let f = get_type_method({obj_struct}::TYPE_KEY, "{ffi_name}")?;'
+    header = f"pub fn {rust_name}({', '.join(sig_parts)}) -> Result<{ret}> {{"
+
+    # `Any`/`AnyView` in any position can't go through `into_typed_fn!`; use the
+    # raw packed call instead (it speaks `AnyView` natively, returns `Any`).
+    if _needs_packed_call(ret, param_types):
+        _use(imports, "tvm_ffi::AnyView")
+        packed = _packed_args_expr(params, method.is_member)
+        # A top-level `Any` return is already `Result<Any>` from `call_packed`;
+        # anything else converts via `try_into` (its error is `tvm_ffi::Error`).
+        call_line = (
+            f"    f.call_packed(&[{packed}])"
+            if ret == "Any"
+            else f"    Ok(f.call_packed(&[{packed}])?.try_into()?)"
+        )
+        return [header, getter, call_line, "}"]
+
+    if method.is_member:
         fn_types = ", ".join([self_ty, *param_types])
         call_args = ", ".join(["self", *[n for n, _ in params]])
     else:
-        sig_parts = [f"{n}: {t}" for n, t in params]
         fn_types = ", ".join(param_types)
         call_args = ", ".join(n for n, _ in params)
 
     return [
-        f"pub fn {rust_name}({', '.join(sig_parts)}) -> Result<{ret}> {{",
-        f'    let f = get_type_method({obj_struct}::TYPE_KEY, "{ffi_name}")?;',
+        header,
+        getter,
         f"    let call = into_typed_fn!(f, Fn({fn_types}) -> Result<{ret}>);",
         f"    call({call_args})",
         "}",
