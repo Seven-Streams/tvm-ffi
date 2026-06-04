@@ -22,21 +22,39 @@ import pytest
 import tvm_ffi.stub.cli as stub_cli
 from tvm_ffi.core import TypeSchema
 from tvm_ffi.stub import consts as C
+from tvm_ffi.stub.backend import Backend, get_backend
 from tvm_ffi.stub.cli import _stage_2, _stage_3
-from tvm_ffi.stub.codegen import (
-    generate_all,
-    generate_export,
-    generate_ffi_api,
-    generate_global_funcs,
-    generate_import_section,
-    generate_init,
-    generate_object,
-)
 from tvm_ffi.stub.file_utils import CodeBlock, FileInfo
+from tvm_ffi.stub.python_backend import PythonBackend
+from tvm_ffi.stub.python_backend import consts as PC
+from tvm_ffi.stub.python_backend.codegen import (
+    generate_python_all,
+    generate_python_export,
+    generate_python_ffi_api,
+    generate_python_global_funcs,
+    generate_python_import_section,
+    generate_python_init,
+    generate_python_object,
+    render_func_signature,
+    render_object_fields,
+    render_object_methods,
+)
+from tvm_ffi.stub.python_backend.imports import ImportItem
+from tvm_ffi.stub.rust_backend import consts as RC
+from tvm_ffi.stub.rust_backend.backend import RustBackend
+from tvm_ffi.stub.rust_backend.codegen import (
+    UnsupportedTypeError,
+    build_ty_render,
+    finalize_rust_module_tree,
+    generate_rust_import_section,
+    generate_rust_object,
+    render_rust_type,
+)
+from tvm_ffi.stub.rust_backend.imports import RustImports, RustUse
 from tvm_ffi.stub.utils import (
     FuncInfo,
-    ImportItem,
     InitConfig,
+    InitFieldInfo,
     NamedTypeSchema,
     ObjectInfo,
     Options,
@@ -48,20 +66,20 @@ def _identity_ty_map(name: str) -> str:
 
 
 def _default_ty_map() -> dict[str, str]:
-    return C.TY_MAP_DEFAULTS.copy()
+    return PC.TY_MAP_DEFAULTS.copy()
 
 
 def _type_suffix(name: str) -> str:
-    return C.TY_MAP_DEFAULTS.get(name, name).rsplit(".", 1)[-1]
+    return PC.TY_MAP_DEFAULTS.get(name, name).rsplit(".", 1)[-1]
 
 
 def test_codeblock_from_begin_line_variants() -> None:
     cases = [
-        (f"{C.STUB_BEGIN} global/demo", "global", ("demo", "")),
-        (f"{C.STUB_BEGIN} global/demo@.registry", "global", ("demo", ".registry")),
-        (f"{C.STUB_BEGIN} object/demo.TypeBase", "object", "demo.TypeBase"),
-        (f"{C.STUB_BEGIN} ty-map/custom", "ty-map", "custom"),
-        (f"{C.STUB_BEGIN} import-section", "import-section", ""),
+        (f"{C.PYTHON_SYNTAX.begin} global/demo", "global", ("demo", "")),
+        (f"{C.PYTHON_SYNTAX.begin} global/demo@.registry", "global", ("demo", ".registry")),
+        (f"{C.PYTHON_SYNTAX.begin} object/demo.TypeBase", "object", "demo.TypeBase"),
+        (f"{C.PYTHON_SYNTAX.begin} ty-map/custom", "ty-map", "custom"),
+        (f"{C.PYTHON_SYNTAX.begin} import-section", "import-section", ""),
     ]
     for lineno, (line, kind, param) in enumerate(cases, start=1):
         block = CodeBlock.from_begin_line(lineno, line)
@@ -73,7 +91,7 @@ def test_codeblock_from_begin_line_variants() -> None:
 
 
 def test_codeblock_from_begin_line_ty_map_and_unknown() -> None:
-    line = f"{C.STUB_TY_MAP} custom -> mapped"
+    line = f"{C.PYTHON_SYNTAX.ty_map} custom -> mapped"
     block = CodeBlock.from_begin_line(5, line)
     assert block.kind == "ty-map"
     assert block.param == "custom -> mapped"
@@ -81,12 +99,12 @@ def test_codeblock_from_begin_line_ty_map_and_unknown() -> None:
     assert block.lineno_end == 5
 
     with pytest.raises(ValueError):
-        CodeBlock.from_begin_line(1, f"{C.STUB_BEGIN} unsupported/kind")
+        CodeBlock.from_begin_line(1, f"{C.PYTHON_SYNTAX.begin} unsupported/kind")
 
 
 def test_fileinfo_from_file_skip_and_missing_markers(tmp_path: Path) -> None:
     skip = tmp_path / "skip.py"
-    skip.write_text(f"print('hi')\n{C.STUB_SKIP_FILE}\n", encoding="utf-8")
+    skip.write_text(f"print('hi')\n{C.PYTHON_SYNTAX.skip_file}\n", encoding="utf-8")
     assert FileInfo.from_file(skip) is None
 
     plain = tmp_path / "plain.py"
@@ -98,10 +116,10 @@ def test_fileinfo_from_file_parses_blocks(tmp_path: Path) -> None:
     content = "\n".join(
         [
             "first = 1",
-            f"{C.STUB_BEGIN} global/demo.func",
+            f"{C.PYTHON_SYNTAX.begin} global/demo.func",
             "in_stub = True",
-            C.STUB_END,
-            f"{C.STUB_TY_MAP} x -> y",
+            C.PYTHON_SYNTAX.end,
+            f"{C.PYTHON_SYNTAX.ty_map} x -> y",
         ]
     )
     path = tmp_path / "demo.py"
@@ -120,15 +138,15 @@ def test_fileinfo_from_file_parses_blocks(tmp_path: Path) -> None:
     assert stub.lineno_start == 2
     assert stub.lineno_end == 4
     assert stub.lines == [
-        f"{C.STUB_BEGIN} global/demo.func",
+        f"{C.PYTHON_SYNTAX.begin} global/demo.func",
         "in_stub = True",
-        C.STUB_END,
+        C.PYTHON_SYNTAX.end,
     ]
 
     assert ty_map.kind == "ty-map"
     assert ty_map.param == "x -> y"
     assert ty_map.lineno_start == ty_map.lineno_end == 5
-    assert ty_map.lines == [f"{C.STUB_TY_MAP} x -> y"]
+    assert ty_map.lines == [f"{C.PYTHON_SYNTAX.ty_map} x -> y"]
 
 
 def test_fileinfo_from_file_error_paths(tmp_path: Path) -> None:
@@ -136,8 +154,8 @@ def test_fileinfo_from_file_error_paths(tmp_path: Path) -> None:
     nested.write_text(
         "\n".join(
             [
-                f"{C.STUB_BEGIN} global/outer",
-                f"{C.STUB_BEGIN} global/inner",
+                f"{C.PYTHON_SYNTAX.begin} global/outer",
+                f"{C.PYTHON_SYNTAX.begin} global/inner",
             ]
         ),
         encoding="utf-8",
@@ -146,12 +164,12 @@ def test_fileinfo_from_file_error_paths(tmp_path: Path) -> None:
         FileInfo.from_file(nested)
 
     unmatched_end = tmp_path / "unmatched.py"
-    unmatched_end.write_text(C.STUB_END + "\n", encoding="utf-8")
+    unmatched_end.write_text(C.PYTHON_SYNTAX.end + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Unmatched"):
         FileInfo.from_file(unmatched_end)
 
     unclosed = tmp_path / "unclosed.py"
-    unclosed.write_text(f"{C.STUB_BEGIN} global/method\n", encoding="utf-8")
+    unclosed.write_text(f"{C.PYTHON_SYNTAX.begin} global/method\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Unclosed stub block"):
         FileInfo.from_file(unclosed)
 
@@ -165,7 +183,7 @@ def test_funcinfo_gen_variants() -> None:
 
     schema_no_args = NamedTypeSchema("demo.no_args", TypeSchema("Callable", ()))
     func = FuncInfo(schema=schema_no_args, is_member=False)
-    assert func.gen(ty_map, indent=2) == "  def no_args(*args: Any) -> Any: ..."
+    assert render_func_signature(func, ty_map, indent=2) == "  def no_args(*args: Any) -> Any: ..."
     assert called == ["Any"]
 
     schema_member = NamedTypeSchema(
@@ -181,12 +199,15 @@ def test_funcinfo_gen_variants() -> None:
     )
     member_func = FuncInfo(schema=schema_member, is_member=True)
     assert (
-        member_func.gen(_identity_ty_map, indent=0) == "def method(self, _1: float, /) -> str: ..."
+        render_func_signature(member_func, _identity_ty_map, indent=0)
+        == "def method(self, _1: float, /) -> str: ..."
     )
 
     schema_bad = NamedTypeSchema("bad", TypeSchema("int"))
     with pytest.raises(ValueError):
-        FuncInfo(schema=schema_bad, is_member=False).gen(_identity_ty_map, indent=0)
+        render_func_signature(
+            FuncInfo(schema=schema_bad, is_member=False), _identity_ty_map, indent=0
+        )
 
 
 def test_objectinfo_gen_fields_and_methods() -> None:
@@ -218,13 +239,13 @@ def test_objectinfo_gen_fields_and_methods() -> None:
         ],
     )
 
-    assert info.gen_fields(ty_map, indent=2) == [
+    assert render_object_fields(info, ty_map, indent=2) == [
         "  field_a: Sequence[int]",
         "  field_b: Mapping[str, float]",
     ]
     assert ty_calls.count("list") == 1 and ty_calls.count("dict") == 1
 
-    methods = info.gen_methods(_identity_ty_map, indent=2)
+    methods = render_object_methods(info, _identity_ty_map, indent=2)
     assert methods == [
         "  @staticmethod",
         "  def static() -> int: ...",
@@ -285,7 +306,7 @@ def test_objectinfo_gen_fields_container_types() -> None:
         ],
         methods=[],
     )
-    assert info.gen_fields(_type_suffix, indent=0) == [
+    assert render_object_fields(info, _type_suffix, indent=0) == [
         "arr: Sequence[int]",
         "lst: MutableSequence[str]",
         "mp: Mapping[str, int]",
@@ -299,7 +320,7 @@ def test_generate_global_funcs_updates_block() -> None:
         param=("demo", "mockpkg"),
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} global/demo@mockpkg", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} global/demo@mockpkg", C.PYTHON_SYNTAX.end],
     )
     funcs = [
         FuncInfo(
@@ -312,19 +333,19 @@ def test_generate_global_funcs_updates_block() -> None:
     ]
     opts = Options(indent=2)
     imports: list[ImportItem] = []
-    generate_global_funcs(code, funcs, _default_ty_map(), imports, opts)
+    generate_python_global_funcs(code, funcs, _default_ty_map(), imports, opts)
     assert imports == [
         ImportItem("mockpkg.init_ffi_api", alias="_FFI_INIT_FUNC"),
         ImportItem("typing.TYPE_CHECKING"),
     ]
     assert code.lines == [
-        f"{C.STUB_BEGIN} global/demo@mockpkg",
+        f"{C.PYTHON_SYNTAX.begin} global/demo@mockpkg",
         "# fmt: off",
         '_FFI_INIT_FUNC("demo", __name__)',
         "if TYPE_CHECKING:",
         "  def add_one(_0: int, /) -> int: ...",
         "# fmt: on",
-        C.STUB_END,
+        C.PYTHON_SYNTAX.end,
     ]
 
 
@@ -334,11 +355,11 @@ def test_generate_global_funcs_noop_on_empty_list() -> None:
         param=("empty", ""),
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} global/empty", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} global/empty", C.PYTHON_SYNTAX.end],
     )
     imports: list[ImportItem] = []
-    generate_global_funcs(code, [], _default_ty_map(), imports, Options())
-    assert code.lines == [f"{C.STUB_BEGIN} global/empty", C.STUB_END]
+    generate_python_global_funcs(code, [], _default_ty_map(), imports, Options())
+    assert code.lines == [f"{C.PYTHON_SYNTAX.begin} global/empty", C.PYTHON_SYNTAX.end]
     assert imports == []
 
 
@@ -348,7 +369,7 @@ def test_generate_global_funcs_respects_custom_import_from() -> None:
         param=("demo", "custom.mod"),
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} global/demo@custom.mod", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} global/demo@custom.mod", C.PYTHON_SYNTAX.end],
     )
     funcs = [
         FuncInfo(
@@ -360,7 +381,7 @@ def test_generate_global_funcs_respects_custom_import_from() -> None:
         )
     ]
     imports: list[ImportItem] = []
-    generate_global_funcs(code, funcs, _default_ty_map(), imports, Options(indent=0))
+    generate_python_global_funcs(code, funcs, _default_ty_map(), imports, Options(indent=0))
     assert ImportItem("custom.mod.init_ffi_api", alias="_FFI_INIT_FUNC") in imports
 
 
@@ -371,7 +392,7 @@ def test_generate_global_funcs_aliases_colliding_type() -> None:
         param=("demo", "mockpkg"),
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} global/demo@mockpkg", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} global/demo@mockpkg", C.PYTHON_SYNTAX.end],
     )
     # Function "demo.Foo" returns type "demo.Foo" — name collision
     funcs = [
@@ -386,7 +407,7 @@ def test_generate_global_funcs_aliases_colliding_type() -> None:
     ty_map = _default_ty_map()
     ty_map["demo.Foo"] = "somepkg.Foo"
     imports: list[ImportItem] = []
-    generate_global_funcs(code, funcs, ty_map, imports, Options(indent=4))
+    generate_python_global_funcs(code, funcs, ty_map, imports, Options(indent=4))
     # The type import should use an alias to avoid shadowing the function
     assert ImportItem("somepkg.Foo", type_checking_only=True, alias="_Foo") in imports
     # The function annotation should use the alias
@@ -399,7 +420,7 @@ def test_generate_object_fields_only_block() -> None:
         param="demo.TypeDerived",
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} object/demo.TypeDerived", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} object/demo.TypeDerived", C.PYTHON_SYNTAX.end],
     )
     opts = Options(indent=4)
     imports: list[ImportItem] = []
@@ -412,7 +433,7 @@ def test_generate_object_fields_only_block() -> None:
         type_key="demo.TypeDerived",
         parent_type_key="demo.Parent",
     )
-    generate_object(
+    generate_python_object(
         code,
         _default_ty_map(),
         imports,
@@ -422,11 +443,14 @@ def test_generate_object_fields_only_block() -> None:
     assert imports == []
 
     expected = [
-        f"{C.STUB_BEGIN} object/demo.TypeDerived",
+        f"{C.PYTHON_SYNTAX.begin} object/demo.TypeDerived",
         " " * code.indent + "# fmt: off",
-        *[(" " * code.indent) + line for line in info.gen_fields(_type_suffix, indent=0)],
+        *[
+            (" " * code.indent) + line
+            for line in render_object_fields(info, _type_suffix, indent=0)
+        ],
         " " * code.indent + "# fmt: on",
-        C.STUB_END,
+        C.PYTHON_SYNTAX.end,
     ]
     assert code.lines == expected
 
@@ -437,7 +461,7 @@ def test_generate_object_with_methods() -> None:
         param="demo.IntPair",
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} object/demo.IntPair", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} object/demo.IntPair", C.PYTHON_SYNTAX.end],
     )
     opts = Options(indent=4)
     imports: list[ImportItem] = []
@@ -458,11 +482,11 @@ def test_generate_object_with_methods() -> None:
         type_key="demo.IntPair",
         parent_type_key="demo.Parent",
     )
-    generate_object(code, _default_ty_map(), imports, opts, info)
+    generate_python_object(code, _default_ty_map(), imports, opts, info)
     assert set(imports) == {ImportItem("typing.TYPE_CHECKING")}
 
-    assert code.lines[0] == f"{C.STUB_BEGIN} object/demo.IntPair"
-    assert code.lines[-1] == C.STUB_END
+    assert code.lines[0] == f"{C.PYTHON_SYNTAX.begin} object/demo.IntPair"
+    assert code.lines[-1] == C.PYTHON_SYNTAX.end
     assert "# fmt: off" in code.lines[1]
     assert any("if TYPE_CHECKING:" in line for line in code.lines)
     method_lines = [line for line in code.lines if "def __ffi_init__" in line or "def sum" in line]
@@ -477,7 +501,7 @@ def test_generate_import_section_groups_modules() -> None:
         param="",
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} import", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} import", C.PYTHON_SYNTAX.end],
     )
     imports = [
         ImportItem("typing.Any", type_checking_only=True),
@@ -486,10 +510,10 @@ def test_generate_import_section_groups_modules() -> None:
         ImportItem("custom.mod.Type", type_checking_only=True),
     ]
     opts = Options(indent=4)
-    generate_import_section(code, imports, opts)
+    generate_python_import_section(code, imports, opts)
 
     expected_prefix = [
-        f"{C.STUB_BEGIN} import",
+        f"{C.PYTHON_SYNTAX.begin} import",
         "# fmt: off",
         "# isort: off",
         "from __future__ import annotations",
@@ -501,7 +525,7 @@ def test_generate_import_section_groups_modules() -> None:
     assert "    from demo_pkg import Tensor" in code.lines
     assert "    from custom.mod import Type" in code.lines
     assert "    from typing import Any" in code.lines
-    assert code.lines[-2:] == ["# fmt: on", C.STUB_END]
+    assert code.lines[-2:] == ["# fmt: on", C.PYTHON_SYNTAX.end]
 
 
 def test_generate_import_section_no_imports_noop() -> None:
@@ -510,10 +534,10 @@ def test_generate_import_section_no_imports_noop() -> None:
         param="",
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} import", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} import", C.PYTHON_SYNTAX.end],
     )
     before = list(code.lines)
-    generate_import_section(code, [], Options())
+    generate_python_import_section(code, [], Options())
     assert code.lines == before
 
 
@@ -523,19 +547,19 @@ def test_generate_all_builds_sorted_and_deduped_list() -> None:
         param="all",
         lineno_start=1,
         lineno_end=2,
-        lines=["    " + C.STUB_BEGIN + " global/all", C.STUB_END],
+        lines=["    " + C.PYTHON_SYNTAX.begin + " global/all", C.PYTHON_SYNTAX.end],
     )
-    generate_all(
+    generate_python_all(
         code,
         names={"tvm_ffi.foo", "bar", "pkg.baz", "bar"},  # duplicates stripped
         opt=Options(indent=2),
     )
     assert code.lines == [
-        "    " + C.STUB_BEGIN + " global/all",
+        "    " + C.PYTHON_SYNTAX.begin + " global/all",
         '    "bar",',
         '    "baz",',
         '    "foo",',
-        C.STUB_END,
+        C.PYTHON_SYNTAX.end,
     ]
 
 
@@ -545,10 +569,10 @@ def test_generate_all_noop_on_empty_names() -> None:
         param="all-empty",
         lineno_start=1,
         lineno_end=2,
-        lines=[C.STUB_BEGIN + " global/all-empty", C.STUB_END],
+        lines=[C.PYTHON_SYNTAX.begin + " global/all-empty", C.PYTHON_SYNTAX.end],
     )
     before = list(code.lines)
-    generate_all(code, names=set(), opt=Options())
+    generate_python_all(code, names=set(), opt=Options())
     assert code.lines == before
 
 
@@ -558,19 +582,19 @@ def test_generate_all_uses_isort_style_ordering() -> None:
         param="all-mixed",
         lineno_start=1,
         lineno_end=2,
-        lines=[C.STUB_BEGIN + " global/all-mixed", C.STUB_END],
+        lines=[C.PYTHON_SYNTAX.begin + " global/all-mixed", C.PYTHON_SYNTAX.end],
     )
     names = {"foo", "Bar", "LIB", "baz", "Alpha", "CONST"}
-    generate_all(code, names=names, opt=Options(indent=0))
+    generate_python_all(code, names=names, opt=Options(indent=0))
     assert code.lines == [
-        C.STUB_BEGIN + " global/all-mixed",
+        C.PYTHON_SYNTAX.begin + " global/all-mixed",
         '"CONST",',
         '"LIB",',
         '"Alpha",',
         '"Bar",',
         '"baz",',
         '"foo",',
-        C.STUB_END,
+        C.PYTHON_SYNTAX.end,
     ]
 
 
@@ -581,21 +605,23 @@ def test_stage_3_adds_LIB_when_load_lib_imported(tmp_path: Path) -> None:
         param=("testing", ""),
         lineno_start=2,
         lineno_end=3,
-        lines=[f"{C.STUB_BEGIN} global/testing", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} global/testing", C.PYTHON_SYNTAX.end],
     )
     import_obj_block = CodeBlock(
         kind="import-object",
         param=("tvm_ffi.libinfo.load_lib_module", "False", "_FFI_LOAD_LIB"),
         lineno_start=1,
         lineno_end=1,
-        lines=[f"{C.STUB_IMPORT_OBJECT} tvm_ffi.libinfo.load_lib_module;False;_FFI_LOAD_LIB"],
+        lines=[
+            f"{C.PYTHON_SYNTAX.import_object} tvm_ffi.libinfo.load_lib_module;False;_FFI_LOAD_LIB"
+        ],
     )
     all_block = CodeBlock(
         kind="__all__",
         param="",
         lineno_start=4,
         lineno_end=5,
-        lines=[f"{C.STUB_BEGIN} __all__", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} __all__", C.PYTHON_SYNTAX.end],
     )
     file_info = FileInfo(
         path=path,
@@ -626,20 +652,20 @@ def test_generate_export_builds_all_extension() -> None:
         param="ffi_api",
         lineno_start=1,
         lineno_end=2,
-        lines=[f"{C.STUB_BEGIN} export/ffi_api", C.STUB_END],
+        lines=[f"{C.PYTHON_SYNTAX.begin} export/ffi_api", C.PYTHON_SYNTAX.end],
     )
-    generate_export(code)
+    generate_python_export(code)
     full_text = "\n".join(code.lines)
     assert "from .ffi_api import *" in full_text
     assert "ffi_api__all__" in full_text
 
 
 def test_generate_init_with_and_without_existing_export_block() -> None:
-    code_no_blocks = generate_init([], "demo")
+    code_no_blocks = generate_python_init([], "demo")
     assert "Package demo." in code_no_blocks
-    assert f"{C.STUB_BEGIN} export/_ffi_api" in code_no_blocks
+    assert f"{C.PYTHON_SYNTAX.begin} export/_ffi_api" in code_no_blocks
 
-    code_with_export = generate_init(
+    code_with_export = generate_python_init(
         [
             CodeBlock(
                 kind="export",
@@ -656,7 +682,7 @@ def test_generate_init_with_and_without_existing_export_block() -> None:
 
 def test_generate_ffi_api_without_objects_includes_sections() -> None:
     init_cfg = InitConfig(pkg="pkg", shared_target="pkg_shared", prefix="pkg.")
-    code = generate_ffi_api(
+    code = generate_python_ffi_api(
         [],
         _default_ty_map(),
         "demo.mod",
@@ -664,9 +690,9 @@ def test_generate_ffi_api_without_objects_includes_sections() -> None:
         init_cfg,
         is_root=False,
     )
-    assert f"{C.STUB_BEGIN} import-section" in code
-    assert f"{C.STUB_BEGIN} global/demo.mod" in code
-    assert C.STUB_BEGIN + " __all__" in code
+    assert f"{C.PYTHON_SYNTAX.begin} import-section" in code
+    assert f"{C.PYTHON_SYNTAX.begin} global/demo.mod" in code
+    assert C.PYTHON_SYNTAX.begin + " __all__" in code
     assert "LIB =" not in code
 
 
@@ -679,7 +705,7 @@ def test_generate_ffi_api_with_objects_imports_parents() -> None:
         parent_type_key="demo.Parent",
     )
     parent_key = obj_info.parent_type_key
-    code = generate_ffi_api(
+    code = generate_python_ffi_api(
         [],
         _default_ty_map(),
         "demo",
@@ -687,11 +713,11 @@ def test_generate_ffi_api_with_objects_imports_parents() -> None:
         init_cfg,
         is_root=False,
     )
-    assert C.STUB_IMPORT_OBJECT in code  # register_object prompt
-    assert f"{C.STUB_BEGIN} object/{obj_info.type_key}" in code
+    assert C.PYTHON_SYNTAX.import_object in code  # register_object prompt
+    assert f"{C.PYTHON_SYNTAX.begin} object/{obj_info.type_key}" in code
     assert parent_key is not None
     parent_import_prompt = (
-        f"{C.STUB_IMPORT_OBJECT} {parent_key};False;_{parent_key.replace('.', '_')}"
+        f"{C.PYTHON_SYNTAX.import_object} {parent_key};False;_{parent_key.replace('.', '_')}"
     )
     assert parent_import_prompt in code
 
@@ -741,3 +767,758 @@ def test_stage_2_filters_prefix_and_marks_root(
     sub_text = sub_api.read_text(encoding="utf-8")
     assert 'LIB = _FFI_LOAD_LIB("demo-pkg", "demo_shared")' in root_text
     assert "LIB =" not in sub_text
+
+
+# ---------------------------------------------------------------------------
+# Rust backend: constant tables (rust_backend/consts.py)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("origin", "rust"),
+    [
+        # scalars / primitives (type_traits.rs) -- bare, no import
+        ("int", "i64"),
+        ("float", "f64"),
+        ("bool", "bool"),
+        ("None", "()"),
+        ("Optional", "Option"),  # std prelude, no import
+        # core / containers -- fully qualified so `use` can be derived
+        ("str", "tvm_ffi::String"),  # NOT std::string::String
+        ("Any", "tvm_ffi::Any"),
+        ("Callable", "tvm_ffi::Function"),
+        ("Array", "tvm_ffi::Array"),  # crate's own Array<T>, NOT Vec
+        ("Object", "tvm_ffi::Object"),
+        ("Tensor", "tvm_ffi::Tensor"),
+        ("Shape", "tvm_ffi::Shape"),
+        ("Device", "tvm_ffi::DLDevice"),  # dlpack DLDevice, NOT a `Device` type
+        ("dtype", "tvm_ffi::DLDataType"),  # dlpack DLDataType, NOT a `DataType` type
+        ("DataType", "tvm_ffi::DLDataType"),
+        # builtin object type keys
+        ("ffi.String", "tvm_ffi::String"),
+        ("ffi.Bytes", "tvm_ffi::Bytes"),
+        ("ffi.Module", "tvm_ffi::Module"),
+        ("ffi.Error", "tvm_ffi::Error"),
+        ("ffi.Function", "tvm_ffi::Function"),
+    ],
+)
+def test_rust_ty_map_defaults(origin: str, rust: str) -> None:
+    assert RC.RUST_TY_MAP_DEFAULTS[origin] == rust
+
+
+def test_rust_array_is_not_vec() -> None:
+    # Guard against regressing to the (wrong) Vec/HashMap assumption.
+    assert not any("Vec" in v for v in RC.RUST_TY_MAP_DEFAULTS.values())
+    assert not any("HashMap" in v for v in RC.RUST_TY_MAP_DEFAULTS.values())
+
+
+def test_rust_crate_types_are_fully_qualified() -> None:
+    # Non-primitive crate types must carry the `tvm_ffi::` path so the import
+    # collector can emit `use tvm_ffi::...`. Primitives/prelude stay bare.
+    bare_ok = {"i64", "f64", "bool", "()", "Option"}
+    for origin, rust in RC.RUST_TY_MAP_DEFAULTS.items():
+        if rust in bare_ok:
+            assert "::" not in rust, origin
+        else:
+            assert rust.startswith("tvm_ffi::"), (origin, rust)
+
+
+@pytest.mark.parametrize("origin", ["Map", "Dict", "List", "Union"])
+def test_rust_unsupported_origins(origin: str) -> None:
+    assert origin in RC.RUST_UNSUPPORTED_ORIGINS
+    # An unsupported origin must never also have a (bogus) default mapping.
+    assert origin not in RC.RUST_TY_MAP_DEFAULTS
+
+
+def test_rust_mod_map_ffi_to_crate_root() -> None:
+    assert RC.RUST_MOD_MAP["ffi"] == "tvm_ffi"
+
+
+# ---------------------------------------------------------------------------
+# Rust backend: use modelling (rust_backend/imports.py)
+# ---------------------------------------------------------------------------
+
+
+def test_rustuse_keeps_qualified_path() -> None:
+    u = RustUse("tvm_ffi::Array")
+    assert u.path == "tvm_ffi::Array"
+    assert u.leaf == "Array"
+    assert u.full_name == "tvm_ffi::Array"
+    assert u.name_in_scope == "Array"
+    assert u.as_use_line() == "use tvm_ffi::Array;"
+
+
+def test_rustuse_normalizes_dotted_ffi_name() -> None:
+    # leading `ffi` segment rewritten via RUST_MOD_MAP, dots -> ::
+    assert RustUse("ffi.String").path == "tvm_ffi::String"
+    # unmapped crate prefix is preserved, dots still -> ::
+    u = RustUse("my_pkg.sub.Foo")
+    assert u.path == "my_pkg::sub::Foo"
+    assert u.leaf == "Foo"
+    assert u.as_use_line() == "use my_pkg::sub::Foo;"
+
+
+def test_rustuse_alias() -> None:
+    u = RustUse("tvm_ffi::Array", alias="_Array")
+    assert u.name_in_scope == "_Array"
+    assert u.as_use_line() == "use tvm_ffi::Array as _Array;"
+
+
+@pytest.mark.parametrize("bare", ["i64", "f64", "bool", "()", "Option"])
+def test_rustuse_bare_types_need_no_use(bare: str) -> None:
+    u = RustUse(bare)
+    assert u.path == bare
+    assert u.leaf == bare
+    assert u.as_use_line() == ""
+
+
+def test_rustuse_is_hashable_and_dedups() -> None:
+    a = RustUse("tvm_ffi::Array")
+    b = RustUse("tvm_ffi::Array")
+    assert a == b
+    assert len({a, b}) == 1
+
+
+def test_rustimports_default_empty() -> None:
+    imp = RustImports()
+    assert imp.items == []
+    imp.items.append(RustUse("tvm_ffi::Tensor"))
+    assert imp.items[0].leaf == "Tensor"
+
+
+# ---------------------------------------------------------------------------
+# Rust backend: type renderer (rust_backend/codegen.py)
+# ---------------------------------------------------------------------------
+
+
+def _rust_render(schema: TypeSchema) -> tuple[str, RustImports]:
+    """Render `schema` with a fresh collector; return (text, imports)."""
+    imports = RustImports()
+    ty_render = build_ty_render(RC.RUST_TY_MAP_DEFAULTS, imports)
+    return render_rust_type(schema, ty_render), imports
+
+
+def test_render_primitive_no_import() -> None:
+    text, imports = _rust_render(TypeSchema("int"))
+    assert text == "i64"
+    assert imports.items == []  # primitives need no `use`
+
+
+def test_render_optional() -> None:
+    text, _ = _rust_render(TypeSchema("Optional", (TypeSchema("int"),)))
+    assert text == "Option<i64>"
+
+
+def test_render_array_records_use() -> None:
+    text, imports = _rust_render(TypeSchema("Array", (TypeSchema("int"),)))
+    assert text == "Array<i64>"
+    assert RustUse("tvm_ffi::Array") in imports.items
+
+
+def test_render_callable_is_function() -> None:
+    text, imports = _rust_render(TypeSchema("Callable", (TypeSchema("int"),)))
+    assert text == "Function"
+    assert RustUse("tvm_ffi::Function") in imports.items
+
+
+def test_render_tuple() -> None:
+    assert _rust_render(TypeSchema("tuple"))[0] == "()"
+    text, _ = _rust_render(TypeSchema("tuple", (TypeSchema("int"), TypeSchema("float"))))
+    assert text == "(i64, f64)"
+
+
+def test_render_object_leaf_records_use() -> None:
+    # `tvm_ffi::String` is rendered fully-qualified inline (RUST_NO_IMPORT_FULLPATH)
+    # and records no `use`, so it can't shadow `std::string::String` in the module
+    # (which would break `#[derive(ObjectRef)]`'s `type_str() -> String`).
+    text, imports = _rust_render(TypeSchema("ffi.String"))
+    assert text == "tvm_ffi::String"
+    assert RustUse("tvm_ffi::String") not in imports.items
+
+
+def test_render_nested() -> None:
+    schema = TypeSchema("Optional", (TypeSchema("Array", (TypeSchema("int"),)),))
+    text, imports = _rust_render(schema)
+    assert text == "Option<Array<i64>>"
+    assert RustUse("tvm_ffi::Array") in imports.items
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        TypeSchema("Union", (TypeSchema("int"), TypeSchema("str"))),
+        TypeSchema("Map", (TypeSchema("str"), TypeSchema("int"))),
+        TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))),
+        TypeSchema("List", (TypeSchema("int"),)),
+    ],
+)
+def test_render_unsupported_raises(schema: TypeSchema) -> None:
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _rust_render(schema)
+    assert exc.value.origin == schema.origin
+
+
+def test_render_unsupported_nested_raises() -> None:
+    # Map buried inside an Array still bubbles up.
+    schema = TypeSchema("Array", (TypeSchema("Map", (TypeSchema("str"), TypeSchema("int"))),))
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _rust_render(schema)
+    assert exc.value.origin == "Map"
+
+
+def test_rust_backend_render_type_delegates() -> None:
+    imports = RustImports()
+    ty_render = build_ty_render(RC.RUST_TY_MAP_DEFAULTS, imports)
+    out = RustBackend().render_type(TypeSchema("Optional", (TypeSchema("int"),)), ty_render)
+    assert out == "Option<i64>"
+
+
+def test_ty_render_dedups_same_path() -> None:
+    imports = RustImports()
+    tr = build_ty_render(RC.RUST_TY_MAP_DEFAULTS, imports)
+    assert tr("Array") == "Array"
+    assert tr("Array") == "Array"  # same path again -> reuse binding
+    assert imports.items == [RustUse("tvm_ffi::Array")]  # recorded exactly once
+
+
+def test_ty_render_aliases_same_leaf_different_path() -> None:
+    imports = RustImports()
+    tr = build_ty_render({"A": "crate_a::Foo", "B": "crate_b::Foo", "C": "crate_c::Foo"}, imports)
+    assert tr("A") == "Foo"  # first claims the bare leaf
+    assert tr("B") == "Foo2"  # collision -> aliased
+    assert tr("C") == "Foo3"  # next collision
+    lines = [u.as_use_line() for u in imports.items]
+    assert lines == [
+        "use crate_a::Foo;",
+        "use crate_b::Foo as Foo2;",
+        "use crate_c::Foo as Foo3;",
+    ]
+
+
+def test_ty_render_bare_types_not_tracked() -> None:
+    imports = RustImports()
+    tr = build_ty_render(RC.RUST_TY_MAP_DEFAULTS, imports)
+    assert tr("int") == "i64"
+    assert tr("Optional") == "Option"  # prelude, bare
+    assert imports.items == []
+
+
+def test_ty_render_seeds_from_existing_imports() -> None:
+    # A pre-seeded `use` (e.g. from an import-object directive) must be respected:
+    # a different path with the same leaf gets aliased rather than colliding.
+    imports = RustImports(items=[RustUse("crate_a::Foo")])
+    tr = build_ty_render({"B": "crate_b::Foo"}, imports)
+    assert tr("B") == "Foo2"
+
+
+# ---------------------------------------------------------------------------
+# Rust backend: object generation (rust_backend/codegen.py)
+# ---------------------------------------------------------------------------
+
+
+def _rust_object_block(key: str) -> CodeBlock:
+    return CodeBlock(
+        kind="object",
+        param=key,
+        lineno_start=1,
+        lineno_end=2,
+        lines=[f"// tvm-ffi-stubgen(begin): object/{key}", "// tvm-ffi-stubgen(end)"],
+    )
+
+
+def _gen_rust_object(info: ObjectInfo) -> tuple[str, RustImports]:
+    block = _rust_object_block(info.type_key or "x")
+    imports = RustImports()
+    generate_rust_object(block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), info)
+    return "\n".join(block.lines), imports
+
+
+def _expr_info(*, value_frozen: bool = False) -> ObjectInfo:
+    """Root `Expr`: field `value: i64`, static `test() -> i64`, init(i64)."""
+    return ObjectInfo(
+        fields=[NamedTypeSchema("value", TypeSchema("int"), frozen=value_frozen)],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema("test", TypeSchema("Callable", (TypeSchema("int"),))),
+                is_member=False,
+            )
+        ],
+        type_key="cpp_rust_test.Expr",
+        parent_type_key="ffi.Object",
+        init_fields=[
+            InitFieldInfo("value", NamedTypeSchema("value", TypeSchema("int")), False, False)
+        ],
+        has_init=True,
+    )
+
+
+def _add_info() -> ObjectInfo:
+    """Return derived `Add` info with fields, method, and constructor metadata."""
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("a", TypeSchema("cpp_rust_test.Expr")),
+            NamedTypeSchema("b", TypeSchema("cpp_rust_test.Expr")),
+        ],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema(
+                    "update",
+                    TypeSchema("Callable", (TypeSchema("None"), TypeSchema("cpp_rust_test.Add"))),
+                ),
+                is_member=True,
+            )
+        ],
+        type_key="cpp_rust_test.Add",
+        parent_type_key="cpp_rust_test.Expr",
+        init_fields=[
+            InitFieldInfo(
+                "a", NamedTypeSchema("a", TypeSchema("cpp_rust_test.Expr")), False, False
+            ),
+            InitFieldInfo(
+                "b", NamedTypeSchema("b", TypeSchema("cpp_rust_test.Expr")), False, False
+            ),
+            InitFieldInfo("value", NamedTypeSchema("value", TypeSchema("int")), False, False),
+        ],
+        has_init=True,
+    )
+
+
+def test_rust_object_root_struct_and_impl() -> None:
+    text, imports = _gen_rust_object(_expr_info())
+    # data struct embeds the root Object as `base`
+    assert "#[repr(C)]" in text
+    assert "struct ExprObj {" in text
+    assert "    base: Object," in text
+    assert "    pub value: i64," in text
+    # ObjectCore impl
+    assert 'const TYPE_KEY: &\'static str = "cpp_rust_test.Expr";' in text
+    assert "        lookup_type_index(Self::TYPE_KEY)" in text
+    assert "        Object::object_header_mut(&mut this.base)" in text
+    # ref + Deref/DerefMut (value is def_rw -> mutable class)
+    assert "#[derive(DeriveObjectRef, Clone)]" in text
+    assert "struct Expr {" in text
+    assert "    data: ObjectArc<ExprObj>," in text
+    assert "impl Deref for Expr {" in text
+    assert "impl DerefMut for Expr {" in text
+    # new via __ffi_init__
+    # generated types/functions are `pub` (decision Q2)
+    assert "pub struct ExprObj {" in text
+    assert "pub struct Expr {" in text
+    assert "pub fn new(value: i64) -> Result<Self> {" in text
+    assert "pub fn test() -> Result<i64> {" in text
+    assert "fn new(value: i64) -> Result<Self> {" in text
+    assert 'let ctor = get_type_method(ExprObj::TYPE_KEY, "__ffi_init__")?;' in text
+    # uniform packed-call convention: args -> &[AnyView], return via try_into
+    assert "Ok(ctor.call_packed(&[AnyView::from(&value)])?.try_into()?)" in text
+    # static method: no self
+    assert "fn test() -> Result<i64> {" in text
+    assert 'let f = get_type_method(ExprObj::TYPE_KEY, "test")?;' in text
+    assert "Ok(f.call_packed(&[])?.try_into()?)" in text
+    uses = {u.as_use_line() for u in imports.items}
+    assert "use tvm_ffi::object::Object;" in uses
+    assert "use std::ops::DerefMut;" in uses
+
+
+def test_rust_object_derived_embeds_parent() -> None:
+    text, _ = _gen_rust_object(_add_info())
+    assert "struct AddObj {" in text
+    assert "    base: ExprObj," in text  # parent Obj embedded, not Object
+    assert "    pub a: Expr," in text
+    assert "        ExprObj::object_header_mut(&mut this.base)" in text
+    # derived Obj also derefs to its embedded base
+    assert "impl Deref for AddObj {" in text
+    assert "    type Target = ExprObj;" in text
+    # instance method: &mut self receiver (mutable class); self is packed as `&*self`
+    assert "fn update(&mut self) -> Result<()> {" in text
+    assert "Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)" in text
+    assert "fn new(a: Expr, b: Expr, value: i64) -> Result<Self> {" in text
+
+
+def test_rust_object_immutable_has_no_derefmut() -> None:
+    text, _ = _gen_rust_object(_expr_info(value_frozen=True))  # def_ro -> immutable
+    assert "impl Deref for Expr {" in text
+    assert "DerefMut" not in text
+    assert "fn test() -> Result<i64> {" in text  # static unaffected
+
+
+def test_rust_method_any_return_stays_any_not_anyview() -> None:
+    # Q5: a top-level `Any` *return* stays owning `Any` (a borrow has no lifetime
+    # source coming back out of an FFI call); only top-level `Any` *params* become
+    # the non-owning `AnyView`. Regression for return type being rendered as AnyView.
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("value", TypeSchema("int"), frozen=False)],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema(
+                    # Callable(return=Any, self=Self, param=Any)
+                    "probe",
+                    TypeSchema(
+                        "Callable",
+                        (TypeSchema("Any"), TypeSchema("demo.Boxed"), TypeSchema("Any")),
+                    ),
+                ),
+                is_member=True,
+            )
+        ],
+        type_key="demo.Boxed",
+        parent_type_key="ffi.Object",
+    )
+    text, imports = _gen_rust_object(info)
+    # return -> owning Any; param -> non-owning AnyView
+    assert "pub fn probe(&mut self, _0: AnyView) -> Result<Any> {" in text
+    assert "Result<AnyView>" not in text  # the bug would have produced this
+    # All methods use the uniform `call_packed` convention (which natively speaks
+    # `AnyView` args and an `Any` return -- the only convention that can). An
+    # `Any` return is forwarded directly, with no trailing `try_into`.
+    assert "into_typed_fn!" not in text
+    assert "f.call_packed(&[AnyView::from(&*self), _0])" in text
+    # owning Any return must record its `use`
+    assert RustUse("tvm_ffi::Any") in imports.items
+    assert RustUse("tvm_ffi::AnyView") in imports.items
+
+
+def test_rust_object_mixed_fields_warns_and_immutable(capsys: pytest.CaptureFixture[str]) -> None:
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("ro", TypeSchema("int"), frozen=True),
+            NamedTypeSchema("rw", TypeSchema("int"), frozen=False),
+        ],
+        methods=[],
+        type_key="demo.Mixed",
+        parent_type_key="ffi.Object",
+    )
+    text, _ = _gen_rust_object(info)
+    out = capsys.readouterr().out
+    assert "mixed read-only/read-write" in out
+    assert "DerefMut" not in text  # treated as immutable
+
+
+def test_rust_object_skipped_on_unsupported(capsys: pytest.CaptureFixture[str]) -> None:
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("cfg", TypeSchema("Map", (TypeSchema("str"), TypeSchema("int")))),
+        ],
+        methods=[],
+        type_key="demo.HasMap",
+        parent_type_key="ffi.Object",
+    )
+    block = _rust_object_block("demo.HasMap")
+    imports = RustImports(items=[RustUse("tvm_ffi::Tensor")])
+    generate_rust_object(block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), info)
+    # block emptied to just the markers; imports untouched (no partial leakage)
+    assert block.lines == [
+        "// tvm-ffi-stubgen(begin): object/demo.HasMap",
+        "// tvm-ffi-stubgen(end)",
+    ]
+    assert imports.items == [RustUse("tvm_ffi::Tensor")]
+    assert "[Skipped] object demo.HasMap" in capsys.readouterr().out
+
+
+def _rust_import_block() -> CodeBlock:
+    return CodeBlock(
+        kind="import-section",
+        param="",
+        lineno_start=1,
+        lineno_end=2,
+        lines=["// tvm-ffi-stubgen(begin): import-section", "// tvm-ffi-stubgen(end)"],
+    )
+
+
+def test_rust_import_section_renders_dedups_sorts() -> None:
+    block = _rust_import_block()
+    imports = RustImports(
+        items=[
+            RustUse("tvm_ffi::Tensor"),
+            RustUse("tvm_ffi::object::ObjectArc"),
+            RustUse("tvm_ffi::Tensor"),  # duplicate -> collapsed
+            RustUse("crate_b::Foo", alias="Foo2"),
+        ]
+    )
+    generate_rust_import_section(block, imports, Options(), defined_types=set())
+    assert block.lines == [
+        "// tvm-ffi-stubgen(begin): import-section",
+        "use crate_b::Foo as Foo2;",
+        "use tvm_ffi::Tensor;",
+        "use tvm_ffi::object::ObjectArc;",
+        "// tvm-ffi-stubgen(end)",
+    ]
+
+
+def test_rust_import_section_filters_defined_types() -> None:
+    block = _rust_import_block()
+    imports = RustImports(items=[RustUse("cpp_rust_test::Expr"), RustUse("tvm_ffi::Tensor")])
+    # Expr is defined in this file -> its `use` must be dropped.
+    generate_rust_import_section(block, imports, Options(), defined_types={"cpp_rust_test::Expr"})
+    assert block.lines == [
+        "// tvm-ffi-stubgen(begin): import-section",
+        "use tvm_ffi::Tensor;",
+        "// tvm-ffi-stubgen(end)",
+    ]
+
+
+def test_rust_import_section_empty() -> None:
+    block = _rust_import_block()
+    generate_rust_import_section(block, RustImports(), Options(), defined_types=set())
+    assert block.lines == [
+        "// tvm-ffi-stubgen(begin): import-section",
+        "// tvm-ffi-stubgen(end)",
+    ]
+
+
+def test_rust_backend_wired() -> None:
+    be = get_backend("rust")
+    assert isinstance(be, Backend)
+    imp = be.new_imports()
+    assert isinstance(imp, RustImports)
+    be.add_imported_object(imp, "cpp_rust_test.Expr", "False", "")
+    assert imp.items == [RustUse("cpp_rust_test::Expr")]
+    assert be.canonical_type_name("cpp_rust_test.Expr") == "cpp_rust_test::Expr"
+    assert be.extra_export_names(imp) == set()
+    # object block delegates to generate_rust_object
+    block = _rust_object_block("cpp_rust_test.Expr")
+    be.generate_object_block(
+        block, RC.RUST_TY_MAP_DEFAULTS.copy(), be.new_imports(), Options(), _expr_info()
+    )
+    assert "struct ExprObj {" in "\n".join(block.lines)
+    # all/export blocks are no-ops (deferred); must not raise
+    be.generate_all_block(_rust_object_block("x"), {"Foo"}, Options())
+    be.generate_export_block(_rust_object_block("x"))
+
+
+def test_rust_stage3_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rs = tmp_path / "demo.rs"
+    rs.write_text(
+        "\n".join(
+            [
+                f"{C.RUST_SYNTAX.begin} object/cpp_rust_test.Expr",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} import-section",
+                C.RUST_SYNTAX.end,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    info = FileInfo.from_file(rs)
+    assert info is not None
+    # Avoid needing a loaded shared library: feed a constructed ObjectInfo.
+    monkeypatch.setattr(stub_cli, "object_info_from_type_key", lambda key: _expr_info())
+
+    _stage_3(
+        info,
+        Options(dry_run=True),
+        RC.RUST_TY_MAP_DEFAULTS.copy(),
+        {},
+        backend=RustBackend(),
+    )
+    text = "\n".join(info.lines)
+    # object block filled
+    assert "struct ExprObj {" in text
+    assert "impl Expr {" in text
+    assert 'get_type_method(ExprObj::TYPE_KEY, "__ffi_init__")' in text
+    # import-section filled with the machinery `use`s
+    assert "use tvm_ffi::object::ObjectArc;" in text
+    assert "use tvm_ffi::object::ObjectCore;" in text
+    # Expr defines itself -> no self `use`
+    assert "use cpp_rust_test::Expr;" not in text
+
+
+def test_rust_default_ty_map_is_real() -> None:
+    # Regression: default_ty_map must be the real table, not an empty placeholder.
+    m = RustBackend().default_ty_map()
+    assert m["int"] == "i64"
+    assert m["None"] == "()"
+
+
+def test_rust_new_uses_ffi_init_schema_order() -> None:
+    # __ffi_init__ schema arg order (a, b, value) is authoritative and differs
+    # from the parent-first init_fields order (value, a, b).
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("a", TypeSchema("demo.Expr")),
+            NamedTypeSchema("b", TypeSchema("demo.Expr")),
+        ],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema(
+                    "__ffi_init__",
+                    TypeSchema(
+                        "Callable",
+                        (
+                            TypeSchema("Object"),  # return (constructed object)
+                            TypeSchema("demo.Expr"),
+                            TypeSchema("demo.Expr"),
+                            TypeSchema("int"),
+                        ),
+                    ),
+                ),
+                is_member=True,
+            )
+        ],
+        type_key="demo.Add",
+        parent_type_key="demo.Expr",
+        init_fields=[
+            InitFieldInfo("value", NamedTypeSchema("value", TypeSchema("int")), False, False),
+            InitFieldInfo("a", NamedTypeSchema("a", TypeSchema("demo.Expr")), False, False),
+            InitFieldInfo("b", NamedTypeSchema("b", TypeSchema("demo.Expr")), False, False),
+        ],
+        has_init=True,
+    )
+    text, _ = _gen_rust_object(info)
+    assert "fn new(_0: Expr, _1: Expr, _2: i64) -> Result<Self> {" in text
+    assert (
+        "Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), "
+        "AnyView::from(&_2)])?.try_into()?)"
+    ) in text
+    # __ffi_init__ becomes `new`, not a regular method (only referenced once).
+    assert text.count("__ffi_init__") == 1
+
+
+def test_rust_api_filenames() -> None:
+    be = RustBackend()
+    assert be.api_filename() == "mod.rs"
+    assert be.init_filename() == "mod.rs"
+    assert be.generate_init_file([], "demo", "mod") == ""
+
+
+def test_rust_api_file_scaffold() -> None:
+    text = RustBackend().generate_api_file(
+        [], {}, "demo", [_expr_info()], InitConfig("p", "l", "demo."), is_root=True
+    )
+    assert "#![allow(dead_code, unused_imports)]" in text
+    # helpers now live in a marker block (filled by stage_3), not inline
+    assert f"{C.RUST_SYNTAX.begin} helpers" in text
+    assert "fn lookup_type_index(" not in text  # the scaffold only emits the marker
+    assert f"{C.RUST_SYNTAX.begin} import-section" in text
+    assert f"{C.RUST_SYNTAX.begin} object/cpp_rust_test.Expr" in text
+    # no global / __all__ / export markers for Rust
+    assert "global/" not in text
+    assert "__all__" not in text
+    assert "export/" not in text
+
+
+def test_rust_helpers_block_filled() -> None:
+    block = CodeBlock(
+        kind="helpers",
+        param="",
+        lineno_start=1,
+        lineno_end=2,
+        lines=[f"{C.RUST_SYNTAX.begin} helpers", C.RUST_SYNTAX.end],
+    )
+    RustBackend().generate_helpers_block(block, Options())
+    text = "\n".join(block.lines)
+    assert "fn lookup_type_index(type_key: &'static str) -> i32 {" in text
+    assert "fn get_type_method(" in text
+    # idempotent re-fill keeps a single copy
+    RustBackend().generate_helpers_block(block, Options())
+    assert "\n".join(block.lines).count("fn lookup_type_index(") == 1
+
+
+def test_rust_helpers_block_scaffold_added_to_existing_file() -> None:
+    # Regression for #3: a pre-existing (non-empty) file without helpers still
+    # gets a helpers marker appended on --init (not only when brand-new).
+    existing = [
+        CodeBlock(kind=None, param="", lineno_start=1, lineno_end=1, lines=["// hand-written"]),
+    ]
+    text = RustBackend().generate_api_file(
+        existing, {}, "demo", [], InitConfig("p", "l", "demo."), is_root=True
+    )
+    assert f"{C.RUST_SYNTAX.begin} helpers" in text
+    assert "#![allow" not in text  # header only for a brand-new file
+
+
+def test_rust_finalize_module_tree(tmp_path: Path) -> None:
+    # Two sibling binding modules under `a`, plus an intermediate `a` with no types.
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    (tmp_path / "a" / "b" / "mod.rs").write_text("// bindings b\n", encoding="utf-8")
+    (tmp_path / "a" / "c").mkdir(parents=True)
+    (tmp_path / "a" / "c" / "mod.rs").write_text("// bindings c\n", encoding="utf-8")
+
+    finalize_rust_module_tree(tmp_path, {"a.b", "a.c"})
+
+    # root declares the top-level module; `a/mod.rs` (created) declares its children
+    assert "pub mod a;" in (tmp_path / "mod.rs").read_text(encoding="utf-8")
+    a_mod = (tmp_path / "a" / "mod.rs").read_text(encoding="utf-8")
+    assert "pub mod b;" in a_mod and "pub mod c;" in a_mod
+    # leaf binding files are untouched
+    assert "// bindings b" in (tmp_path / "a" / "b" / "mod.rs").read_text(encoding="utf-8")
+
+    # idempotent: re-running adds no duplicates
+    finalize_rust_module_tree(tmp_path, {"a.b", "a.c"})
+    assert (tmp_path / "a" / "mod.rs").read_text(encoding="utf-8").count("pub mod b;") == 1
+
+
+def test_rust_stage3_prunes_stale_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Regression for #5: a block whose type is no longer registered is deleted.
+    rs = tmp_path / "demo.rs"
+    rs.write_text(
+        "\n".join(
+            [
+                f"{C.RUST_SYNTAX.begin} object/demo.Gone",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} object/demo.Kept",
+                C.RUST_SYNTAX.end,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    info = FileInfo.from_file(rs)
+    assert info is not None
+    monkeypatch.setattr(stub_cli, "object_info_from_type_key", lambda key: _expr_info())
+    _stage_3(
+        info,
+        Options(dry_run=True),
+        RC.RUST_TY_MAP_DEFAULTS.copy(),
+        {},
+        backend=RustBackend(),
+        registered_type_keys={"demo.Kept"},  # demo.Gone is stale
+    )
+    text = "\n".join(info.lines)
+    assert "object/demo.Gone" not in text  # stale block removed entirely
+    assert "object/demo.Kept" in text  # surviving block kept + filled
+    assert "struct ExprObj {" in text
+    assert "[Removed] stale object block demo.Gone" in capsys.readouterr().out
+
+
+def test_python_backend_does_not_prune_objects() -> None:
+    # Python object blocks live inside a class body -> must NOT be pruned.
+    assert PythonBackend().standalone_object_blocks is False
+    assert RustBackend().standalone_object_blocks is True
+
+
+def test_rust_global_funcs_block_is_noop() -> None:
+    # Decision 5: Rust does not generate global functions; the block is untouched.
+    lines = ["// tvm-ffi-stubgen(begin): global/demo", "// tvm-ffi-stubgen(end)"]
+    block = CodeBlock(
+        kind="global", param=("demo", ""), lineno_start=1, lineno_end=2, lines=list(lines)
+    )
+    funcs = [
+        FuncInfo(
+            NamedTypeSchema("demo.f", TypeSchema("Callable", (TypeSchema("int"),))), is_member=False
+        )
+    ]
+    imports = RustImports()
+    RustBackend().generate_global_funcs_block(
+        block, funcs, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options()
+    )
+    assert block.lines == lines
+    assert imports.items == []
+
+
+def test_rust_object_no_init_no_methods_has_no_impl() -> None:
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("value", TypeSchema("int"))],
+        methods=[],
+        type_key="demo.Plain",
+        parent_type_key="ffi.Object",
+        has_init=False,
+    )
+    text, _ = _gen_rust_object(info)
+    assert "struct PlainObj {" in text
+    assert "impl Plain {" not in text  # no new, no methods -> no impl block
+    assert "fn new" not in text
