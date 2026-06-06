@@ -1048,10 +1048,13 @@ def test_rust_object_root_struct_and_impl() -> None:
     assert "struct ExprObj {" in text
     assert "    base: Object," in text
     assert "    pub value: i64," in text
-    # ObjectCore impl
-    assert 'const TYPE_KEY: &\'static str = "cpp_rust_test.Expr";' in text
-    assert "        lookup_type_index(Self::TYPE_KEY)" in text
-    assert "        Object::object_header_mut(&mut this.base)" in text
+    # ObjectCore impl is folded into the `#[derive(Object)]` proc macro: the stub
+    # only emits the derive + `#[type_key]` attr, not a hand-written impl.
+    assert "#[derive(DeriveObject)]" in text
+    assert '#[type_key = "cpp_rust_test.Expr"]' in text
+    assert "unsafe impl ObjectCore" not in text
+    assert "lookup_type_index" not in text
+    assert "object_header_mut" not in text
     # ref + Deref/DerefMut (value is def_rw -> mutable class)
     assert "#[derive(DeriveObjectRef, Clone)]" in text
     assert "struct Expr {" in text
@@ -1065,12 +1068,12 @@ def test_rust_object_root_struct_and_impl() -> None:
     assert "pub fn new(value: i64) -> Result<Self> {" in text
     assert "pub fn test() -> Result<i64> {" in text
     assert "fn new(value: i64) -> Result<Self> {" in text
-    assert 'let ctor = get_type_method(ExprObj::TYPE_KEY, "__ffi_init__")?;' in text
+    assert 'let ctor = get_type_method(ExprObj::type_index(), "__ffi_init__")?;' in text
     # uniform packed-call convention: args -> &[AnyView], return via try_into
     assert "Ok(ctor.call_packed(&[AnyView::from(&value)])?.try_into()?)" in text
     # static method: no self
     assert "fn test() -> Result<i64> {" in text
-    assert 'let f = get_type_method(ExprObj::TYPE_KEY, "test")?;' in text
+    assert 'let f = get_type_method(ExprObj::type_index(), "test")?;' in text
     assert "Ok(f.call_packed(&[])?.try_into()?)" in text
     uses = {u.as_use_line() for u in imports.items}
     assert "use tvm_ffi::object::Object;" in uses
@@ -1082,7 +1085,9 @@ def test_rust_object_derived_embeds_parent() -> None:
     assert "struct AddObj {" in text
     assert "    base: ExprObj," in text  # parent Obj embedded, not Object
     assert "    pub a: Expr," in text
-    assert "        ExprObj::object_header_mut(&mut this.base)" in text
+    # object_header_mut is derived by the `#[derive(Object)]` macro from the
+    # first field (`base: ExprObj`), so the stub no longer hand-writes it.
+    assert "object_header_mut" not in text
     # derived Obj also derefs to its embedded base
     assert "impl Deref for AddObj {" in text
     assert "    type Target = ExprObj;" in text
@@ -1297,7 +1302,7 @@ def test_rust_stage3_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     # object block filled
     assert "struct ExprObj {" in text
     assert "impl Expr {" in text
-    assert 'get_type_method(ExprObj::TYPE_KEY, "__ffi_init__")' in text
+    assert 'get_type_method(ExprObj::type_index(), "__ffi_init__")' in text
     # import-section filled with the machinery `use`s
     assert "use tvm_ffi::object::ObjectArc;" in text
     assert "use tvm_ffi::object::ObjectCore;" in text
@@ -1389,11 +1394,13 @@ def test_rust_helpers_block_filled() -> None:
     )
     RustGenerator().generate_helpers_block(block, Options())
     text = "\n".join(block.lines)
-    assert "fn lookup_type_index(type_key: &'static str) -> i32 {" in text
-    assert "fn get_type_method(" in text
+    # the type-index hashmap helper is gone; only `get_type_method` remains and it
+    # now takes a resolved `type_index: i32` (from each object's static).
+    assert "fn lookup_type_index(" not in text
+    assert "fn get_type_method(\n    type_index: i32," in text
     # idempotent re-fill keeps a single copy
     RustGenerator().generate_helpers_block(block, Options())
-    assert "\n".join(block.lines).count("fn lookup_type_index(") == 1
+    assert "\n".join(block.lines).count("fn get_type_method(") == 1
 
 
 def test_rust_helpers_block_scaffold_added_to_existing_file() -> None:

@@ -58,7 +58,7 @@ pub fn derive_object(input: proc_macro::TokenStream) -> TokenStream {
                                 &type_key_arg, &mut tindex
                             );
                             if ret != 0 {
-                                proc_macro_error::abort!("Failed to get type index for type key: {}", #type_key);
+                                panic!("Failed to get type index for type key: {}", #type_key);
                             }
                             tindex
                         }

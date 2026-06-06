@@ -92,8 +92,8 @@ class _ObjectRenderer:
         _use(self.imports, "std::ops::Deref")
         _use(self.imports, "tvm_ffi::object::ObjectArc")
         _use(self.imports, "tvm_ffi::object::ObjectCore")
+        _use(self.imports, "tvm_ffi::derive::Object", alias="DeriveObject")
         _use(self.imports, "tvm_ffi::derive::ObjectRef", alias="DeriveObjectRef")
-        _use(self.imports, "tvm_ffi::tvm_ffi_sys::TVMFFIObject")
         if self.is_root:
             _use(self.imports, "tvm_ffi::object::Object")
         if self.mutable:
@@ -101,25 +101,20 @@ class _ObjectRenderer:
 
         leaf, obj_struct, base_type = self.leaf, self.obj_struct, self.base_type
         lines: list[str] = []
-        lines += ["#[repr(C)]", f"pub struct {obj_struct} {{", f"    base: {base_type},"]
+        # The `ObjectCore` impl (TYPE_KEY / per-class static `type_index` /
+        # `object_header_mut`) is folded into the `#[derive(Object)]` proc macro,
+        # which derives `object_header_mut` from the first field and caches the
+        # type index in a per-type static -- no shared hashmap lookup.
+        lines += [
+            "#[repr(C)]",
+            "#[derive(DeriveObject)]",
+            f'#[type_key = "{self.info.type_key}"]',
+            f"pub struct {obj_struct} {{",
+            f"    base: {base_type},",
+        ]
         for field in self.info.fields:
             lines.append(f"    pub {_rust_ident(field.name)}: {self.render_field(field)},")
         lines += ["}", ""]
-
-        lines += [
-            f"unsafe impl ObjectCore for {obj_struct} {{",
-            f'    const TYPE_KEY: &\'static str = "{self.info.type_key}";',
-            "",
-            "    fn type_index() -> i32 {",
-            "        lookup_type_index(Self::TYPE_KEY)",
-            "    }",
-            "",
-            "    unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject {",
-            f"        {base_type}::object_header_mut(&mut this.base)",
-            "    }",
-            "}",
-            "",
-        ]
 
         lines += [
             "#[repr(C)]",
@@ -184,7 +179,9 @@ class _ObjectRenderer:
         if params:
             _use(self.imports, "tvm_ffi::AnyView")
         packed = _packed_args_expr(params, is_member=False)
-        getter = f'    let ctor = get_type_method({self.obj_struct}::TYPE_KEY, "__ffi_init__")?;'
+        getter = (
+            f'    let ctor = get_type_method({self.obj_struct}::type_index(), "__ffi_init__")?;'
+        )
         return [
             f"pub fn new({sig}) -> Result<Self> {{",
             *_packed_call_lines("ctor", getter, packed, "Self"),
@@ -211,7 +208,7 @@ class _ObjectRenderer:
         if method.is_member or params:
             _use(self.imports, "tvm_ffi::AnyView")
         packed = _packed_args_expr(params, method.is_member)
-        getter = f'    let f = get_type_method({self.obj_struct}::TYPE_KEY, "{ffi_name}")?;'
+        getter = f'    let f = get_type_method({self.obj_struct}::type_index(), "{ffi_name}")?;'
         header = f"pub fn {rust_name}({', '.join(sig_parts)}) -> Result<{ret}> {{"
         return [header, *_packed_call_lines("f", getter, packed, ret), "}"]
 
@@ -328,35 +325,19 @@ def generate_rust_import_section(
 
 #: Shared per-file helper functions. Written fully-qualified with
 #: zero `use`s so they never clash with the import-section block (which carries
-#: every object-driven `use`). `lookup_type_index` resolves+caches a type index;
-#: `get_type_method` pulls a reflected method off the type's method table.
-_RUST_HELPERS = """fn lookup_type_index(type_key: &'static str) -> i32 {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<&'static str, i32>>,
-    > = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some(v) = cache.lock().unwrap().get(type_key) {
-        return *v;
-    }
-    let arg = unsafe { tvm_ffi::tvm_ffi_sys::TVMFFIByteArray::from_str(type_key) };
-    let mut tindex = 0;
-    let ret = unsafe { tvm_ffi::tvm_ffi_sys::TVMFFITypeKeyToIndex(&arg, &mut tindex) };
-    assert_eq!(ret, 0, "type key `{type_key}` is not registered");
-    cache.lock().unwrap().insert(type_key, tindex);
-    tindex
-}
-
-fn get_type_method(
-    type_key: &'static str,
+#: every object-driven `use`). `get_type_method` pulls a reflected method off the
+#: type's method table; the type index is resolved by each object's
+#: `#[derive(Object)]`-generated per-class static (no shared hashmap lookup).
+_RUST_HELPERS = """fn get_type_method(
+    type_index: i32,
     method_name: &str,
 ) -> tvm_ffi::Result<tvm_ffi::Function> {
-    let type_index = lookup_type_index(type_key);
     unsafe {
         let info = tvm_ffi::tvm_ffi_sys::TVMFFIGetTypeInfo(type_index);
         if info.is_null() {
             return Err(tvm_ffi::Error::new(
                 tvm_ffi::TYPE_ERROR,
-                &format!("no type info for `{type_key}`"),
+                &format!("no type info for type_index `{type_index}`"),
                 "",
             ));
         }
@@ -369,7 +350,9 @@ fn get_type_method(
                 ) {
                     return Err(tvm_ffi::Error::new(
                         tvm_ffi::TYPE_ERROR,
-                        &format!("method `{method_name}` on `{type_key}` is not a Function"),
+                        &format!(
+                            "method `{method_name}` on type_index `{type_index}` is not a Function"
+                        ),
                         "",
                     ));
                 }
@@ -379,7 +362,7 @@ fn get_type_method(
     }
     Err(tvm_ffi::Error::new(
         tvm_ffi::TYPE_ERROR,
-        &format!("method `{method_name}` not found on `{type_key}`"),
+        &format!("method `{method_name}` not found on type_index `{type_index}`"),
         "",
     ))
 }"""
