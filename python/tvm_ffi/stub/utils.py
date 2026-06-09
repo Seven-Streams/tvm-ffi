@@ -27,7 +27,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
-from tvm_ffi.core import TypeInfo, TypeSchema, _lookup_type_attr
+from tvm_ffi.core import MISSING, TypeInfo, TypeSchema, _lookup_type_attr
 
 from . import consts as C
 
@@ -93,16 +93,27 @@ class NamedTypeSchema(TypeSchema):
     method/init schemas leave it at the default ``False``. Backends that care
     about mutability (e.g. the Rust backend's mutable-vs-immutable class shape)
     read it; the Python backend ignores it.
+
+    ``size`` is the field's in-memory byte width from reflection
+    (``TVMFFIFieldInfo.size`` = ``sizeof(T)``), or ``None`` when the schema does
+    not describe an object field (method args/returns carry no width). The type
+    schema alone cannot distinguish e.g. ``int32_t`` from ``int64_t`` (both are
+    ``{"type": "int"}``); backends that lay fields out directly (the Rust
+    ``#[repr(C)]`` structs) need ``size`` to pick a width-correct type.
     """
 
     name: str
     frozen: bool = False
+    size: int | None = None
 
-    def __init__(self, name: str, schema: TypeSchema, frozen: bool = False) -> None:
-        """Initialize a `NamedTypeSchema` with the given name, schema and read-only flag."""
+    def __init__(
+        self, name: str, schema: TypeSchema, frozen: bool = False, size: int | None = None
+    ) -> None:
+        """Initialize a `NamedTypeSchema` with the given name, schema and field metadata."""
         super().__init__(origin=schema.origin, args=schema.args)
         self.name = name
         self.frozen = frozen
+        self.size = size
 
 
 @dataclasses.dataclass
@@ -129,6 +140,23 @@ class InitFieldInfo:
 
 
 @dataclasses.dataclass
+class FieldInit:
+    """Per-own-field init/default metadata, used by native (FFI-free) construction.
+
+    One entry per *own* field of a type (parent fields live on the parent). It
+    records the default needed to populate a non-init field in a native Rust
+    struct literal. ``default`` is the concrete value (or :data:`MISSING`);
+    ``has_factory`` flags a mutable default produced by a factory function -- not
+    statically renderable, so it forces the FFI fallback.
+    """
+
+    name: str
+    has_default: bool
+    default: Any
+    has_factory: bool
+
+
+@dataclasses.dataclass
 class ObjectInfo:
     """Information of an object type, including its fields and methods."""
 
@@ -138,6 +166,14 @@ class ObjectInfo:
     parent_type_key: str | None = None
     init_fields: list[InitFieldInfo] = dataclasses.field(default_factory=list)
     has_init: bool = False
+    own_field_inits: list[FieldInit] = dataclasses.field(default_factory=list)
+    no_native: bool = False
+    """Opt-out: the type's C++ ``__ffi_init__`` must be dispatched (no native build).
+
+    Set by the ``__ffi_no_native__`` type attribute. Use it for types whose C++
+    constructor does more than field assignment (validation, side effects,
+    derived fields) -- native construction would silently skip that logic.
+    """
 
     @staticmethod
     def from_type_info(type_info: TypeInfo) -> ObjectInfo:
@@ -146,10 +182,15 @@ class ObjectInfo:
         if type_info.parent_type_info is not None:
             parent_type_key = type_info.parent_type_info.type_key
 
-        # Detect __ffi_init__ from TypeMethod or TypeAttrColumn.
-        has_init = any(m.name == "__ffi_init__" for m in type_info.methods)
-        if not has_init:
-            has_init = _lookup_type_attr(type_info.type_index, "__ffi_init__") is not None
+        # Detect __ffi_init__ from either source: a TypeMethod (explicit C++
+        # `refl::init<...>`) or a type-attr column (the auto-generated
+        # field-binding init, `BindFieldArgs`).
+        has_init_method = any(m.name == "__ffi_init__" for m in type_info.methods)
+        has_init = has_init_method or (
+            _lookup_type_attr(type_info.type_index, "__ffi_init__") is not None
+        )
+        # Opt-out marker: `refl::TypeAttrDef<T>().attr("__ffi_no_native__", true)`.
+        no_native = bool(_lookup_type_attr(type_info.type_index, "__ffi_no_native__"))
 
         # Walk parent chain (parent-first) to collect all init-eligible fields.
         init_fields: list[InitFieldInfo] = []
@@ -169,6 +210,7 @@ class ObjectInfo:
                             schema=NamedTypeSchema(
                                 name=field.name,
                                 schema=_parse_type_schema(field.metadata["type_schema"]),
+                                size=field.size,
                             ),
                             kw_only=field.c_kw_only,
                             has_default=field.c_has_default,
@@ -181,6 +223,7 @@ class ObjectInfo:
                     name=field.name,
                     schema=_parse_type_schema(field.metadata["type_schema"]),
                     frozen=field.frozen,
+                    size=field.size,
                 )
                 for field in type_info.fields
             ],
@@ -198,4 +241,14 @@ class ObjectInfo:
             parent_type_key=parent_type_key,
             init_fields=init_fields,
             has_init=has_init,
+            no_native=no_native,
+            own_field_inits=[
+                FieldInit(
+                    name=field.name,
+                    has_default=field.c_has_default,
+                    default=field.c_default,
+                    has_factory=field.c_default_factory is not MISSING,
+                )
+                for field in type_info.fields
+            ],
         )

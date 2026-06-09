@@ -43,6 +43,7 @@ from tvm_ffi.stub.python_generator.utils import ImportItem
 from tvm_ffi.stub.rust_generator import consts as RC
 from tvm_ffi.stub.rust_generator.codegen import (
     UnsupportedTypeError,
+    _render_default,
     finalize_rust_module_tree,
     generate_rust_import_section,
     generate_rust_object,
@@ -51,6 +52,7 @@ from tvm_ffi.stub.rust_generator.codegen import (
 from tvm_ffi.stub.rust_generator.generator import RustGenerator
 from tvm_ffi.stub.rust_generator.utils import RustImports, RustUse
 from tvm_ffi.stub.utils import (
+    FieldInit,
     FuncInfo,
     InitConfig,
     InitFieldInfo,
@@ -992,7 +994,13 @@ def _gen_rust_object(info: ObjectInfo) -> tuple[str, RustImports]:
 
 
 def _expr_info(*, value_frozen: bool = False) -> ObjectInfo:
-    """Root `Expr`: field `value: i64`, static `test() -> i64`, init(i64)."""
+    """Root `Expr`: field `value: i64`, static `test() -> i64`, init(i64).
+
+    Marked ``no_native`` so it stays the canonical *FFI-new* fixture: native
+    construction is now used whenever possible, so the opt-out is what keeps the
+    structural/CLI tests below exercising the ``__ffi_init__`` dispatch path. The
+    native path is covered separately by the ``_native_*`` fixtures.
+    """
     return ObjectInfo(
         fields=[NamedTypeSchema("value", TypeSchema("int"), frozen=value_frozen)],
         methods=[
@@ -1007,6 +1015,7 @@ def _expr_info(*, value_frozen: bool = False) -> ObjectInfo:
             InitFieldInfo("value", NamedTypeSchema("value", TypeSchema("int")), False, False)
         ],
         has_init=True,
+        no_native=True,
     )
 
 
@@ -1041,6 +1050,251 @@ def _add_info() -> ObjectInfo:
     )
 
 
+def _native_point_info() -> ObjectInfo:
+    """Root auto-init `Point`: init fields x, y -> native `ObjectArc::new`."""
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("x", TypeSchema("int")),
+            NamedTypeSchema("y", TypeSchema("int")),
+        ],
+        methods=[],
+        type_key="cpp_rust_test.Point",
+        parent_type_key="ffi.Object",
+        init_fields=[
+            InitFieldInfo("x", NamedTypeSchema("x", TypeSchema("int")), False, False),
+            InitFieldInfo("y", NamedTypeSchema("y", TypeSchema("int")), False, False),
+        ],
+        has_init=True,
+        own_field_inits=[
+            FieldInit("x", has_default=False, default=None, has_factory=False),
+            FieldInit("y", has_default=False, default=None, has_factory=False),
+        ],
+    )
+
+
+def _native_config_info() -> ObjectInfo:
+    """Root auto-init `Config`: init field `scale` + `init(false)` defaulted fields."""
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("scale", TypeSchema("int")),
+            NamedTypeSchema("offset", TypeSchema("int")),
+            NamedTypeSchema("verbose", TypeSchema("bool")),
+            NamedTypeSchema("label", TypeSchema("ffi.String")),
+        ],
+        methods=[],
+        type_key="cpp_rust_test.Config",
+        parent_type_key="ffi.Object",
+        init_fields=[
+            InitFieldInfo("scale", NamedTypeSchema("scale", TypeSchema("int")), False, False),
+        ],
+        has_init=True,
+        own_field_inits=[
+            FieldInit("scale", has_default=False, default=None, has_factory=False),
+            FieldInit("offset", has_default=True, default=7, has_factory=False),
+            FieldInit("verbose", has_default=True, default=True, has_factory=False),
+            FieldInit("label", has_default=True, default="none", has_factory=False),
+        ],
+    )
+
+
+def test_rust_native_root_construction() -> None:
+    text, _ = _gen_rust_object(_native_point_info())
+    # Auto-init root -> native: `ffi_new` allocates via `ObjectArc::new` with a
+    # single inline struct literal -- no `__ffi_init__` round-trip, no builder helper.
+    assert "pub fn ffi_new(x: i64, y: i64) -> Result<Self> {" in text
+    assert "data: ObjectArc::new(PointObj {" in text
+    assert "base: Object::new()," in text
+    assert "__ffi_build" not in text
+    assert "__ffi_init__" not in text
+    assert "get_type_method" not in text
+
+
+def test_rust_native_defaults_rendered() -> None:
+    text, _ = _gen_rust_object(_native_config_info())
+    # Only the init field is a parameter; `init(false)` fields are filled inline
+    # from their statically rendered defaults (int / bool / str).
+    assert "pub fn ffi_new(scale: i64) -> Result<Self> {" in text
+    assert "data: ObjectArc::new(ConfigObj {" in text
+    assert "offset: 7," in text
+    assert "verbose: true," in text
+    assert 'label: tvm_ffi::String::from("none"),' in text
+    assert "__ffi_build" not in text
+    assert "__ffi_init__" not in text
+
+
+def _native_narrow_info() -> ObjectInfo:
+    """Root auto-init `Pixel`: narrow scalar fields (int32/int8/float) + an int method.
+
+    Field schemas carry reflection's ``sizeof(T)`` so the renderer can emit the
+    width-correct ``#[repr(C)]`` field types; the method's ``int`` stays
+    schema-erased (no size) and must keep the packed-``Any`` default ``i64``.
+    """
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("x", TypeSchema("int"), size=4),
+            NamedTypeSchema("flag", TypeSchema("int"), size=1),
+            NamedTypeSchema("weight", TypeSchema("float"), size=4),
+            NamedTypeSchema("big", TypeSchema("int"), size=8),
+            NamedTypeSchema("ratio", TypeSchema("float"), size=4),
+        ],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema(
+                    "get_x",
+                    TypeSchema("Callable", (TypeSchema("int"), TypeSchema("cpp_rust_test.Pixel"))),
+                ),
+                is_member=True,
+            )
+        ],
+        type_key="cpp_rust_test.Pixel",
+        parent_type_key="ffi.Object",
+        init_fields=[
+            InitFieldInfo("x", NamedTypeSchema("x", TypeSchema("int"), size=4), False, False),
+        ],
+        has_init=True,
+        own_field_inits=[
+            FieldInit("x", has_default=False, default=None, has_factory=False),
+            FieldInit("flag", has_default=True, default=1, has_factory=False),
+            FieldInit("weight", has_default=True, default=2.5, has_factory=False),
+            FieldInit("big", has_default=True, default=9, has_factory=False),
+            FieldInit("ratio", has_default=True, default=float("inf"), has_factory=False),
+        ],
+    )
+
+
+def test_rust_scalar_fields_width_narrowed() -> None:
+    text, _ = _gen_rust_object(_native_narrow_info())
+    # Struct fields are laid out directly -> width-correct primitives by `size`.
+    assert "pub x: i32," in text
+    assert "pub flag: i8," in text
+    assert "pub weight: f32," in text
+    assert "pub big: i64," in text
+    # The native ctor parameter binds straight into the struct -> same width.
+    assert "pub fn ffi_new(x: i32) -> Result<Self> {" in text
+    # Bare literal defaults rely on struct-literal inference (no width suffix).
+    assert "flag: 1," in text
+    assert "weight: 2.5," in text
+    # A non-finite default renders as a typed constant matching the narrowed width.
+    assert "ratio: f32::INFINITY," in text
+    # Method args/returns travel as packed Any (v_int64) -> stay i64.
+    assert "pub fn get_x(&mut self) -> Result<i64> {" in text
+
+
+def _explicit_init_point_info() -> ObjectInfo:
+    """Like `_native_point_info` but an EXPLICIT `refl::init<i64, i64>` (a method)."""
+    info = _native_point_info()
+    info.methods = [
+        FuncInfo(
+            NamedTypeSchema(
+                "__ffi_init__",
+                TypeSchema(
+                    "Callable",
+                    (TypeSchema("cpp_rust_test.Point"), TypeSchema("int"), TypeSchema("int")),
+                ),
+            ),
+            is_member=False,
+        )
+    ]
+    return info
+
+
+def test_rust_native_explicit_init_field_binding() -> None:
+    # Explicit `refl::init<i64, i64>` whose arity (2) matches the init-field count
+    # (a, b) -> field-binding shape -> native, no FFI `__ffi_init__` dispatch.
+    text, _ = _gen_rust_object(_explicit_init_point_info())
+    assert "pub fn ffi_new(x: i64, y: i64) -> Result<Self> {" in text
+    assert "data: ObjectArc::new(PointObj {" in text
+    assert "__ffi_build" not in text
+    assert "__ffi_init__" not in text
+
+
+def test_rust_native_explicit_init_arity_mismatch_still_native() -> None:
+    # Explicit init arity (1) != init-field count (2): the C++ ctor derives a field
+    # (the `Circle(radius)` shape). Native is still emitted -- `ffi_new` binds ALL
+    # init fields (x, y), silently bypassing the derive. A user who needs the
+    # faithful semantics hand-writes a `new` (outside the markers) over `ffi_new`.
+    info = _explicit_init_point_info()
+    info.methods = [
+        FuncInfo(
+            NamedTypeSchema(
+                "__ffi_init__",
+                TypeSchema("Callable", (TypeSchema("cpp_rust_test.Point"), TypeSchema("int"))),
+            ),
+            is_member=False,
+        )
+    ]
+    text, _ = _gen_rust_object(info)
+    assert "pub fn ffi_new(x: i64, y: i64) -> Result<Self> {" in text
+    assert "data: ObjectArc::new(PointObj {" in text
+    assert "__ffi_init__" not in text
+
+
+def test_rust_native_opt_out_forces_ffi() -> None:
+    # `no_native` (the `__ffi_no_native__` attr) keeps a field-binding type on FFI.
+    info = _explicit_init_point_info()
+    info.no_native = True
+    text, _ = _gen_rust_object(info)
+    assert "__ffi_build" not in text
+    assert 'get_type_method(PointObj::type_index(), "__ffi_init__")' in text
+
+
+def test_rust_native_excluded_for_optional_field() -> None:
+    # A top-level `Optional` field renders to std `Option<T>`, whose layout differs
+    # from C++ `ffi::Optional<T>`; native writes would corrupt it -> FFI fallback.
+    info = _explicit_init_point_info()
+    info.fields = [
+        NamedTypeSchema("x", TypeSchema("int")),
+        NamedTypeSchema("y", TypeSchema("Optional", (TypeSchema("int"),))),
+    ]
+    text, _ = _gen_rust_object(info)
+    assert "__ffi_build" not in text
+    assert 'get_type_method(PointObj::type_index(), "__ffi_init__")' in text
+
+
+def _fake_render_type(schema: TypeSchema) -> str:
+    """Width-erased stand-in for the renderer passed to `_render_default` in tests."""
+    return {"float": "f64", "ffi.String": "tvm_ffi::String"}.get(schema.origin, "T")
+
+
+@pytest.mark.parametrize(
+    ("default", "schema", "expected"),
+    [
+        (7, TypeSchema("int"), "7"),
+        (True, TypeSchema("bool"), "true"),
+        (False, TypeSchema("bool"), "false"),
+        (1.5, TypeSchema("float"), "1.5"),
+        (1.0, TypeSchema("float"), "1.0"),
+        ("none", TypeSchema("ffi.String"), 'tvm_ffi::String::from("none")'),
+        # non-finite floats have no bare literal -> typed constants from render_type
+        (float("inf"), TypeSchema("float"), "f64::INFINITY"),
+        (float("-inf"), TypeSchema("float"), "f64::NEG_INFINITY"),
+        (float("nan"), TypeSchema("float"), "f64::NAN"),
+    ],
+)
+def test_render_default_renderable_kinds(
+    default: object, schema: TypeSchema, expected: str
+) -> None:
+    fi = FieldInit("f", has_default=True, default=default, has_factory=False)
+    assert _render_default(fi, NamedTypeSchema("f", schema), _fake_render_type) == expected
+
+
+@pytest.mark.parametrize(
+    ("fi", "schema"),
+    [
+        # factory default (mutable container) -> not statically renderable
+        (FieldInit("f", True, [], True), TypeSchema("Array", (TypeSchema("int"),))),
+        # no default at all
+        (FieldInit("f", False, None, False), TypeSchema("int")),
+        # None default -> never renderable (an Optional field would need it, but
+        # Optional fields already force the FFI fallback via RUST_NATIVE_UNSAFE_ORIGINS)
+        (FieldInit("f", True, None, False), TypeSchema("int")),
+        (FieldInit("f", True, None, False), TypeSchema("Optional", (TypeSchema("int"),))),
+    ],
+)
+def test_render_default_unrenderable_returns_none(fi: FieldInit, schema: TypeSchema) -> None:
+    assert _render_default(fi, NamedTypeSchema("f", schema), _fake_render_type) is None
+
+
 def test_rust_object_root_struct_and_impl() -> None:
     text, imports = _gen_rust_object(_expr_info())
     # data struct embeds the root Object as `base`
@@ -1065,9 +1319,9 @@ def test_rust_object_root_struct_and_impl() -> None:
     # generated types/functions are `pub` (decision Q2)
     assert "pub struct ExprObj {" in text
     assert "pub struct Expr {" in text
-    assert "pub fn new(value: i64) -> Result<Self> {" in text
+    assert "pub fn ffi_new(value: i64) -> Result<Self> {" in text
     assert "pub fn test() -> Result<i64> {" in text
-    assert "fn new(value: i64) -> Result<Self> {" in text
+    assert "fn ffi_new(value: i64) -> Result<Self> {" in text
     assert 'let ctor = get_type_method(ExprObj::type_index(), "__ffi_init__")?;' in text
     # uniform packed-call convention: args -> &[AnyView], return via try_into
     assert "Ok(ctor.call_packed(&[AnyView::from(&value)])?.try_into()?)" in text
@@ -1094,7 +1348,7 @@ def test_rust_object_derived_embeds_parent() -> None:
     # instance method: &mut self receiver (mutable class); self is packed as `&*self`
     assert "fn update(&mut self) -> Result<()> {" in text
     assert "Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)" in text
-    assert "fn new(a: Expr, b: Expr, value: i64) -> Result<Self> {" in text
+    assert "fn ffi_new(a: Expr, b: Expr, value: i64) -> Result<Self> {" in text
 
 
 def test_rust_object_immutable_has_no_derefmut() -> None:
@@ -1352,7 +1606,7 @@ def test_rust_new_uses_ffi_init_schema_order() -> None:
         has_init=True,
     )
     text, _ = _gen_rust_object(info)
-    assert "fn new(_0: Expr, _1: Expr, _2: i64) -> Result<Self> {" in text
+    assert "fn ffi_new(_0: Expr, _1: Expr, _2: i64) -> Result<Self> {" in text
     assert (
         "Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), "
         "AnyView::from(&_2)])?.try_into()?)"

@@ -332,15 +332,12 @@ the generated binding looks like (boilerplate trimmed):
 .. code-block:: rust
 
    #[repr(C)]
+   #[derive(Object)]
+   #[type_key = "my_ffi_extension.IntPair"]
    pub struct IntPairObj {
        base: Object,   // parent embedded as the first field
        a: i64,
        b: i64,
-   }
-
-   unsafe impl ObjectCore for IntPairObj {
-       const TYPE_KEY: &'static str = "my_ffi_extension.IntPair";
-       // ...
    }
 
    #[repr(C)]
@@ -350,14 +347,42 @@ the generated binding looks like (boilerplate trimmed):
    }
 
    impl IntPair {
-       /// Constructed via the reflected `__ffi_init__` method.
-       pub fn new(a: i64, b: i64) -> Result<Self> { /* ... */ }
-       pub fn sum(&self) -> Result<i64> { /* ... */ }
+       /// Native (FFI-free) construction: allocates the struct and binds fields directly.
+       pub fn ffi_new(a: i64, b: i64) -> Result<Self> { /* ... */ }
+       pub fn sum(&mut self) -> Result<i64> { /* ... */ }
    }
+
+Scalar fields are rendered width-correct from reflection's per-field size: an ``int32_t``
+C++ field becomes ``i32`` in the ``#[repr(C)]`` struct (method arguments and returns travel
+through the packed-``Any`` convention and stay ``i64``/``f64``).
 
 Mutability follows the C++ field flags: if **all** fields are writable the wrapper gets
 ``DerefMut`` and ``&mut self`` methods; if all are read-only it gets ``Deref`` only. A class
 with a mix of writable and read-only fields is treated as immutable (with a warning).
+
+Constructors: ``ffi_new``
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The generated constructor is named ``ffi_new`` and takes one parameter per init-eligible
+field, in declaration order. Whenever possible it constructs the object **natively** -- a
+direct Rust allocation that writes every field, with no FFI round-trip. This deliberately
+bypasses the C++ constructor body: validation, derived fields, or side effects in an
+explicit ``refl::init<...>`` constructor are **not** replayed. When you need the faithful
+C++ semantics, hand-write a ``new`` outside the stubgen markers (anywhere in the crate)
+that wraps ``ffi_new``; regeneration never touches code outside the markers.
+
+A type can opt out of native construction by setting the ``__ffi_no_native__`` type
+attribute on the C++ side:
+
+.. code-block:: cpp
+
+   refl::TypeAttrDef<MyObj>().attr("__ffi_no_native__", true);
+
+Use this for types whose constructor/destructor must run on the C++ side (side effects,
+resource management). The generated ``ffi_new`` then dispatches the reflected
+``__ffi_init__`` through the FFI instead. The same FFI fallback is chosen automatically
+when native construction cannot faithfully lay out the object (e.g. an ``Optional`` or
+tuple field, or a non-init field without a statically renderable default).
 
 Mounting the Module Tree
 ~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -70,6 +70,26 @@ RUST_TY_MAP_DEFAULTS = {
     "ffi.Function": "tvm_ffi::Function",
 }
 
+#: Width-correct Rust scalar for a *directly laid-out* struct field, keyed by
+#: ``(ffi origin, sizeof(T))``. The FFI type schema erases integer/float widths
+#: (``int32_t`` and ``int64_t`` are both ``{"type":"int"}``), which is fine for
+#: the packed-``Any`` calling convention (everything travels as ``v_int64`` /
+#: ``v_float64``) but NOT for the generated ``#[repr(C)]`` structs, whose fields
+#: are read/written at their real offsets. Reflection records ``sizeof(T)`` per
+#: field (``TVMFFIFieldInfo.size``), which this map turns back into the
+#: width-correct primitive. Signedness is NOT recorded, so unsigned C++ fields
+#: render as the same-width signed type (an ``i32`` read of a ``uint32_t`` field
+#: misreads values >= 2^31 -- exactly mirroring the core setter's unchecked
+#: ``static_cast`` truncation semantics).
+RUST_SCALAR_BY_SIZE = {
+    ("int", 1): "i8",
+    ("int", 2): "i16",
+    ("int", 4): "i32",
+    ("int", 8): "i64",
+    ("float", 4): "f32",
+    ("float", 8): "f64",
+}
+
 #: Rust paths that must be rendered **fully qualified inline** and emit **no**
 #: ``use``. The sole case is ``tvm_ffi::String``: importing it (``use
 #: tvm_ffi::String;``) shadows the prelude ``std::string::String`` for the whole
@@ -77,6 +97,16 @@ RUST_TY_MAP_DEFAULTS = {
 #: then resolves to ``tvm_ffi::String`` and fails the trait signature). Rendering
 #: it as ``tvm_ffi::String`` inline avoids the shadow entirely.
 RUST_NO_IMPORT_FULLPATH = frozenset({"tvm_ffi::String"})
+
+#: FFI origins whose Rust render type is NOT memory-identical to the C++ field
+#: type, so a *native* (FFI-free) struct-literal write would store the wrong bytes.
+#: ``Optional`` renders to std ``Option<T>`` (layout != C++ ``ffi::Optional<T>``)
+#: and ``tuple`` to a Rust tuple (!= ``ffi::Tuple``). The FFI ``__ffi_init__`` path
+#: converts each arg through a field setter (``.cast<T>()``), so it is unaffected;
+#: native construction has no such conversion, so a type with any such *top-level*
+#: field origin falls back to FFI. (Nested uses -- e.g. ``Array<Optional<T>>`` --
+#: are stored inside the container's own FFI-encoded heap and stay safe.)
+RUST_NATIVE_UNSAFE_ORIGINS = frozenset({"Optional", "tuple"})
 
 #: FFI origins the Rust crate cannot represent. ``render_type`` raises a sentinel
 #: ``UnsupportedTypeError`` on these (defined in the Rust codegen module); the

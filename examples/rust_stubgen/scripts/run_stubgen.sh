@@ -62,7 +62,6 @@ echo "==> [2/3] generate Rust bindings with tvm-ffi-stubgen (CLI)"
 # directory, stubgen must run with --init-* to recreate the scaffolding; a plain
 # (non-init) run only refreshes existing directive blocks. The --init-* values
 # mirror the CMake STUB_* options in CMakeLists.txt.
-rm -rf "$GENERATED_DIR"
 tvm-ffi-stubgen "$GENERATED_DIR" \
   --target rust \
   --dlls "$LIB_PATH" \

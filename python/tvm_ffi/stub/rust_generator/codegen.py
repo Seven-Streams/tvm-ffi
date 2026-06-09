@@ -24,9 +24,12 @@ directive handling and source assembly.
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
+import math
+from typing import TYPE_CHECKING, Callable
 
 from .. import consts as C
+from ..lib_state import object_info_from_type_key
+from . import consts as C_RUST
 from .utils import (
     RustImports,
     UnsupportedTypeError,
@@ -45,7 +48,134 @@ if TYPE_CHECKING:
     from tvm_ffi.core import TypeSchema
 
     from ..file_utils import CodeBlock
-    from ..utils import FuncInfo, ObjectInfo, Options
+    from ..utils import FieldInit, FuncInfo, NamedTypeSchema, ObjectInfo, Options
+
+
+# --- native (FFI-free) construction eligibility & default rendering ----------
+
+
+def _rust_str_lit(value: str) -> str:
+    """Render a Python string as a double-quoted Rust string literal (escaped)."""
+    body = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    return f'"{body}"'
+
+
+def _render_scalar_default(value: object) -> str | None:
+    """Render a bool/int/float default as a Rust literal, or ``None`` otherwise.
+
+    Bare int/float/bool literals rely on struct-literal type inference (no width
+    suffix needed). ``bool`` must precede ``int`` (Python ``bool`` is an ``int``
+    subclass).
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return repr(int(value))
+    if isinstance(value, float):
+        text = repr(float(value))  # non-finite floats are handled by the caller
+        if not any(c in text for c in ".eE"):  # ensure a float literal (e.g. `1` -> `1.0`)
+            text += ".0"
+        return text
+    return None
+
+
+def _render_default(
+    fi: FieldInit,
+    schema: NamedTypeSchema,
+    render_type: Callable[[NamedTypeSchema], str],
+) -> str | None:
+    """Render a field's default as a Rust expression, or ``None`` if not renderable.
+
+    Only *trivially constructible* defaults are renderable: a concrete scalar or
+    string. A factory default (mutable container), a ``None`` default, or a
+    missing/object default returns ``None`` -> the caller falls back to the FFI
+    ``__ffi_init__`` path. (A ``None`` default could only fill an ``Optional``
+    field, and any ``Optional`` field already forces the FFI fallback -- see
+    :data:`~.consts.RUST_NATIVE_UNSAFE_ORIGINS`.)
+
+    Non-finite floats have no bare literal (``inf`` does not compile) and render
+    as the typed constants ``<ty>::INFINITY`` / ``NEG_INFINITY`` / ``NAN``, so
+    ``render_type`` must produce the *width-correct* scalar type for directly
+    laid-out fields (``f32`` vs ``f64`` -- i.e. ``render_struct_field``).
+    """
+    if fi.has_factory or not fi.has_default or fi.default is None:
+        return None
+    value = fi.default
+    if isinstance(value, str):
+        return f"{render_type(schema)}::from({_rust_str_lit(value)})"
+    if isinstance(value, float) and not math.isfinite(value):
+        ty = render_type(schema)
+        if math.isnan(value):
+            return f"{ty}::NAN"
+        return f"{ty}::INFINITY" if value > 0 else f"{ty}::NEG_INFINITY"
+    return _render_scalar_default(value)
+
+
+def _info_native_eligible(info: ObjectInfo) -> bool:
+    """Decide whether ``info`` can be constructed natively (no FFI ``__ffi_init__``).
+
+    Both construction paths are emitted as ``ffi_new`` (the generated constructor;
+    a user who wants faithful C++ semantics hand-writes ``new``, outside the
+    markers, delegating to ``ffi_new``). The native path allocates the struct
+    directly and binds every flattened init field (``info.init_fields``) from a
+    constructor parameter, in declaration order, with own non-init fields taking a
+    rendered default. The ``param_i`` <-> ``field_i`` correspondence is **assumed**,
+    not verified: a C++ constructor that validates, derives extra fields, or has
+    side effects is silently bypassed -- that is the opted-in behavior.
+
+    Native is therefore used whenever it is *possible*. It falls back to the FFI
+    ``__ffi_init__`` path only when native construction genuinely cannot reproduce
+    the object: the type opts out (``no_native``); an own field's top-level type is
+    not memory-safe to write natively (``Optional`` / ``tuple`` -- see
+    :data:`~.consts.RUST_NATIVE_UNSAFE_ORIGINS`); a parent is itself non-native; or
+    an own non-init field lacks a statically renderable default.
+    """
+    if (
+        not info.has_init
+        or info.no_native
+        or any(f.origin in C_RUST.RUST_NATIVE_UNSAFE_ORIGINS for f in info.fields)
+    ):
+        return False
+    parent = info.parent_type_key
+    if parent not in (None, "ffi.Object") and not _native_eligible(parent):
+        return False
+    # `fields` and `own_field_inits` are built from the same `type_info.fields`
+    # list, so direct indexing is safe (a mismatch is a bug -> fail fast).
+    schema_of = {f.name: f for f in info.fields}
+    init_names = {f.name for f in info.init_fields}
+    for fi in info.own_field_inits:
+        if fi.name in init_names:
+            continue  # own init field -> constructor parameter
+        if _render_default(fi, schema_of[fi.name], lambda _: "T") is None:
+            return False
+    return True
+
+
+def _native_eligible(type_key: str) -> bool:
+    """Type-key keyed wrapper of :func:`_info_native_eligible` (parent recursion).
+
+    A parent that cannot be characterized (lookup or schema parsing fails) is
+    reported and treated as non-native -- the child then dispatches the FFI
+    ``__ffi_init__``, which works regardless. Deliberately uncached: ancestor
+    chains are short, and a cache would pin the first answer for the lifetime
+    of the process (stale across registry changes, e.g. between test cases).
+    """
+    try:
+        info = object_info_from_type_key(type_key)
+    except Exception as e:  # any failure means "cannot prove native-safe"
+        print(
+            f"{C.TERM_YELLOW}[Warning] cannot resolve type {type_key!r} for native "
+            f"construction ({type(e).__name__}: {e}); using the FFI constructor"
+            f"{C.TERM_RESET}"
+        )
+        return False
+    return _info_native_eligible(info)
 
 
 @dataclasses.dataclass
@@ -77,6 +207,19 @@ class _ObjectRenderer:
     def render_field(self, schema: TypeSchema) -> str:
         """Render a field/return type (owning form: a top-level ``Any`` is ``Any``)."""
         return render_rust_type(schema, self._ty_render)
+
+    def render_struct_field(self, schema: NamedTypeSchema) -> str:
+        """Render a directly-laid-out struct field type, width-correct for scalars.
+
+        The ``#[repr(C)]`` struct (and the native ``ffi_new`` parameters that bind
+        straight into it) accesses fields at their real C++ offsets, so an
+        ``int32_t`` field must render as ``i32``, not the schema-erased default
+        ``i64``. The width comes from reflection's per-field ``sizeof(T)``
+        (:attr:`NamedTypeSchema.size`); schemas without one (or non-scalar
+        origins) fall through to the ordinary :meth:`render_field`.
+        """
+        narrowed = C_RUST.RUST_SCALAR_BY_SIZE.get((schema.origin, schema.size))
+        return narrowed if narrowed is not None else self.render_field(schema)
 
     def render_param(self, schema: TypeSchema) -> str:
         """Render an argument type (a top-level ``Any`` is the non-owning ``AnyView``)."""
@@ -113,7 +256,7 @@ class _ObjectRenderer:
             f"    base: {base_type},",
         ]
         for field in self.info.fields:
-            lines.append(f"    pub {_rust_ident(field.name)}: {self.render_field(field)},")
+            lines.append(f"    pub {_rust_ident(field.name)}: {self.render_struct_field(field)},")
         lines += ["}", ""]
 
         lines += [
@@ -149,9 +292,14 @@ class _ObjectRenderer:
 
         _use(self.imports, "tvm_ffi::Result")
 
+        # Native (FFI-free) construction whenever possible (the whole inheritance
+        # chain must be eligible -- see `_info_native_eligible`). Otherwise the
+        # reflected `__ffi_init__` is dispatched as before.
+        native = _info_native_eligible(self.info)
+
         inner: list[str] = []
         if self.info.has_init:
-            inner += self._new_fn(init_method)
+            inner += self._new_fn_native() if native else self._new_fn(init_method)
             if methods:
                 inner.append("")
         for i, method in enumerate(methods):
@@ -166,8 +314,78 @@ class _ObjectRenderer:
             "",
         ]
 
+    def _struct_literal_lines(self, info: ObjectInfo) -> list[str]:
+        """Render the inline nested ``<Obj> { .. }`` struct literal for ``info``.
+
+        Mirrors the crate's own native construction idiom (e.g.
+        ``TensorObjFromNDAlloc { base: TensorObj { object: Object::new(), .. } }``
+        in ``collections/tensor.rs``): one nested struct literal, the parent
+        embedded inline as ``base`` (bottoming out at ``Object::new()`` at the
+        root). Own init fields bind from the in-scope ``ffi_new`` parameters (which
+        carry the field names); own non-init fields take their rendered defaults.
+        Returned as lines: ``["<Obj> {", "    base: ..", .., "}"]``.
+        """
+        leaf = info.type_key.rsplit(".", 1)[-1]  # type: ignore[union-attr]
+        obj_struct = f"{leaf}Obj"
+        parent_key = info.parent_type_key
+
+        lines = [f"{obj_struct} {{"]
+        if parent_key in (None, "ffi.Object"):
+            lines.append("    base: Object::new(),")
+        else:
+            parent = self._struct_literal_lines(object_info_from_type_key(parent_key))
+            lines.append(f"    base: {parent[0]}")
+            lines += [f"    {pl}" for pl in parent[1:-1]]
+            lines.append(f"    {parent[-1]},")  # close the embedded parent + `,`
+
+        init_names = {f.name for f in info.init_fields}
+        field_inits = {f.name: f for f in info.own_field_inits}
+        for field in info.fields:
+            ident = _rust_ident(field.name)
+            if field.name in init_names:
+                lines.append(f"    {ident},")  # shorthand: param name == field name
+            else:
+                # `render_struct_field`, not `render_field`: a non-finite float
+                # default renders as a typed constant (`f32::INFINITY`), which
+                # must match the width-narrowed field type.
+                default = _render_default(field_inits[field.name], field, self.render_struct_field)
+                lines.append(f"    {ident}: {default},")
+        lines.append("}")
+        return lines
+
+    def _new_fn_native(self) -> list[str]:
+        """Emit `fn ffi_new(..) -> Result<Self>` that allocates the object natively.
+
+        No FFI round-trip: a single inline nested struct literal (built by
+        :meth:`_struct_literal_lines`) is handed to `ObjectArc::new`, which writes
+        the object header + Rust deleter. The `Result` wrapper is kept for
+        signature parity with the FFI path -- the body is infallible (`Ok(..)`).
+
+        Named ``ffi_new`` (not ``new``): it binds fields directly and bypasses any
+        C++ constructor logic (validation / derived fields / side effects). A user
+        who needs the faithful semantics hand-writes ``new`` (outside the stubgen
+        markers) delegating to this ``ffi_new``.
+        """
+        params = [
+            (_rust_ident(f.name), self.render_struct_field(f.schema)) for f in self.info.init_fields
+        ]
+        sig = ", ".join(f"{n}: {t}" for n, t in params)
+        # `Object::new()` bottoms out the (possibly inlined-parent) literal, so the
+        # `Object` import is needed for any native type, not just a root one.
+        _use(self.imports, "tvm_ffi::object::Object")
+        literal = self._struct_literal_lines(self.info)
+        return [
+            f"pub fn ffi_new({sig}) -> Result<Self> {{",
+            "    Ok(Self {",
+            f"        data: ObjectArc::new({literal[0]}",
+            *[f"        {line}" for line in literal[1:-1]],
+            f"        {literal[-1]}),",
+            "    })",
+            "}",
+        ]
+
     def _new_fn(self, init_method: FuncInfo | None) -> list[str]:
-        """Emit `fn new(...) -> Result<Self>` calling reflected `__ffi_init__`."""
+        """Emit `fn ffi_new(...) -> Result<Self>` calling reflected `__ffi_init__`."""
         if init_method is not None:
             arg_schemas = list(init_method.schema.args[1:]) if init_method.schema.args else []
             params = [(f"_{i}", self.render_param(s)) for i, s in enumerate(arg_schemas)]
@@ -183,7 +401,7 @@ class _ObjectRenderer:
             f'    let ctor = get_type_method({self.obj_struct}::type_index(), "__ffi_init__")?;'
         )
         return [
-            f"pub fn new({sig}) -> Result<Self> {{",
+            f"pub fn ffi_new({sig}) -> Result<Self> {{",
             *_packed_call_lines("ctor", getter, packed, "Self"),
             "}",
         ]
@@ -222,10 +440,10 @@ def generate_rust_object(
 ) -> None:
     """Emit a Rust ``struct``/``impl`` binding for an ``object/<key>`` block.
 
-    Emits the standard binding shape: ``<T>Obj`` (``#[repr(C)]`` with the parent
-    embedded as ``base``), an ``ObjectCore`` impl, the ``<T>`` ref (wrapping
+    Emits the standard binding shape: ``<T>Obj`` (``#[repr(C)]``,
+    ``#[derive(Object)]``, parent embedded as ``base``), the ``<T>`` ref (wrapping
     ``ObjectArc``), ``Deref``/``DerefMut`` (the latter only for mutable classes),
-    and ``impl <T>`` with a ``new`` constructor + reflected methods. On an
+    and ``impl <T>`` with an ``ffi_new`` constructor + reflected methods. On an
     :class:`UnsupportedTypeError` the whole object is skipped with a warning.
     """
     assert len(code.lines) >= 2

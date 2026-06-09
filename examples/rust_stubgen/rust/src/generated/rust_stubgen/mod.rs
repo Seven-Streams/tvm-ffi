@@ -104,9 +104,14 @@ impl DerefMut for IntPair {
 }
 
 impl IntPair {
-    pub fn new(_0: i64, _1: i64) -> Result<Self> {
-        let ctor = get_type_method(IntPairObj::type_index(), "__ffi_init__")?;
-        Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1)])?.try_into()?)
+    pub fn ffi_new(a: i64, b: i64) -> Result<Self> {
+        Ok(Self {
+            data: ObjectArc::new(IntPairObj {
+                base: Object::new(),
+                a,
+                b,
+            }),
+        })
     }
 
     pub fn sum(&mut self) -> Result<i64> {

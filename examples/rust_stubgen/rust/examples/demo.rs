@@ -29,9 +29,9 @@ fn main() -> Result<()> {
     // dlopen the C++ library once so the reflection registry is populated.
     ensure_loaded();
 
-    // Construct via the reflected `__ffi_init__` constructor.
-    let mut p = IntPair::new(3, 4)?;
-    println!("IntPair::new(3, 4) -> a={}, b={}", p.a, p.b);
+    // Construct via the generated `ffi_new` constructor (native, FFI-free).
+    let mut p = IntPair::ffi_new(3, 4)?;
+    println!("IntPair::ffi_new(3, 4) -> a={}, b={}", p.a, p.b);
     assert_eq!((p.a, p.b), (3, 4));
 
     // Call an instance method.
