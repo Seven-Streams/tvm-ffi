@@ -100,20 +100,32 @@ class NamedTypeSchema(TypeSchema):
     schema alone cannot distinguish e.g. ``int32_t`` from ``int64_t`` (both are
     ``{"type": "int"}``); backends that lay fields out directly (the Rust
     ``#[repr(C)]`` structs) need ``size`` to pick a width-correct type.
+
+    ``offset`` is the field's byte offset within the object from reflection
+    (``TVMFFIFieldInfo.offset``), or ``None`` outside object fields. Reflection
+    stores fields in *registration* order, which need not match memory order;
+    backends that lay fields out directly must order by ``offset``.
     """
 
     name: str
     frozen: bool = False
     size: int | None = None
+    offset: int | None = None
 
     def __init__(
-        self, name: str, schema: TypeSchema, frozen: bool = False, size: int | None = None
+        self,
+        name: str,
+        schema: TypeSchema,
+        frozen: bool = False,
+        size: int | None = None,
+        offset: int | None = None,
     ) -> None:
         """Initialize a `NamedTypeSchema` with the given name, schema and field metadata."""
         super().__init__(origin=schema.origin, args=schema.args)
         self.name = name
         self.frozen = frozen
         self.size = size
+        self.offset = offset
 
 
 @dataclasses.dataclass
@@ -224,6 +236,7 @@ class ObjectInfo:
                     schema=_parse_type_schema(field.metadata["type_schema"]),
                     frozen=field.frozen,
                     size=field.size,
+                    offset=field.offset,
                 )
                 for field in type_info.fields
             ],

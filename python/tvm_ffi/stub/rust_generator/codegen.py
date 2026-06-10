@@ -201,6 +201,55 @@ def _has_native_child(type_key: str) -> bool:
     return False
 
 
+def _layout_fields(fields: list[NamedTypeSchema]) -> list[NamedTypeSchema]:
+    """Own fields in C++ memory order (reflection ``offset``), not registration order.
+
+    Reflection stores fields in *registration* order (the ``def_field`` call
+    sequence), which need not match the C++ declaration (memory) order. The
+    generated ``#[repr(C)]`` struct lays fields out positionally, so it must
+    emit them sorted by their recorded byte offset. Fields without an offset
+    (synthetic ``ObjectInfo``s in tests) keep registration order.
+    """
+    if any(f.offset is None for f in fields):
+        return list(fields)
+    return sorted(fields, key=lambda f: f.offset)
+
+
+def _warn_offset_mismatch(type_key: str | None, fields: list[NamedTypeSchema]) -> None:
+    """Warn when ``#[repr(C)]`` cannot reproduce the recorded field offsets.
+
+    Walks the offset-sorted fields and recomputes where ``#[repr(C)]`` would
+    place each one: the previous field's end, rounded up to the field's
+    alignment. Reflection records ``size`` but not ``alignof``, so alignment is
+    approximated as the largest power of two dividing ``size``, capped at 8 --
+    exact for scalars (align == size) and pointer-based renders, but it
+    over-estimates composite FFI structs (``DLDevice`` is size 8 / align 4,
+    ``DLDataType`` size 4 / align 2), which can yield a false-positive warning
+    for a perfectly valid layout. A mismatch means the generated struct *may*
+    read/write that field at the wrong address (e.g. an unregistered C++ member
+    leaves a hole the Rust layout won't reproduce); the binding is still
+    emitted, so only warn. Fields without offset/size metadata cannot be
+    checked and are skipped.
+    """
+    prev_end: int | None = None
+    for field in fields:
+        if field.offset is None or field.size is None or field.size <= 0:
+            return
+        if prev_end is not None:
+            align = min(8, field.size & -field.size)
+            placed = (prev_end + align - 1) // align * align
+            if placed != field.offset:
+                print(
+                    f"{C.TERM_YELLOW}[Warning] object {type_key}: field "
+                    f"{field.name!r} is at C++ offset {field.offset}, but the "
+                    f"generated #[repr(C)] layout places it at offset {placed}; "
+                    f"the Rust struct may not match the C++ object layout"
+                    f"{C.TERM_RESET}"
+                )
+        # Resync to the recorded offset so one hole yields one warning.
+        prev_end = field.offset + field.size
+
+
 @dataclasses.dataclass
 class _ObjectRenderer:
     """Renders one ``object/<key>`` block into Rust source lines.
@@ -278,7 +327,7 @@ class _ObjectRenderer:
             f"pub struct {obj_struct} {{",
             f"    base: {base_type},",
         ]
-        for field in self.info.fields:
+        for field in _layout_fields(self.info.fields):
             lines.append(f"    pub {_rust_ident(field.name)}: {self.render_struct_field(field)},")
         lines += ["}", ""]
 
@@ -380,7 +429,9 @@ class _ObjectRenderer:
             lines.append("    base,")  # shorthand: the `base` parameter
         init_names = {f.name for f in self.info.init_fields}
         field_inits = {f.name: f for f in self.info.own_field_inits}
-        for field in self.info.fields:
+        # Struct-literal entries bind by name, so order is semantically free;
+        # memory order is used to mirror the struct definition.
+        for field in _layout_fields(self.info.fields):
             ident = _rust_ident(field.name)
             if field.name in init_names:
                 lines.append(f"    {ident},")  # shorthand: param name == field name
@@ -550,6 +601,7 @@ def generate_rust_object(
             f"{C.TERM_YELLOW}[Warning] object {type_key}: mixed read-only/read-write "
             f"fields; treating the whole type as read-only{C.TERM_RESET}"
         )
+    _warn_offset_mismatch(type_key, _layout_fields(obj_info.fields))
 
     # Writeback note: copy only `items` -- the next object block re-seeds a fresh
     # `local` from it and rebuilds the trackers, so `imports`'s own (now stale)

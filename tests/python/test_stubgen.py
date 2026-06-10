@@ -1181,6 +1181,50 @@ def test_rust_scalar_fields_width_narrowed() -> None:
     assert "pub fn get_x(&mut self) -> Result<i64> {" in text
 
 
+def _scrambled_layout_info(*, gap: bool = False) -> ObjectInfo:
+    """Fields REGISTERED out of memory order: beta@24, gamma@32, alpha@16.
+
+    Declaration (memory) order is ``alpha: i32 @16, beta: i64 @24 (4 bytes of
+    padding), gamma: i32 @32`` -- ``#[repr(C)]`` reproduces exactly this layout
+    when the fields are emitted by offset. With ``gap=True``, ``gamma`` moves to
+    offset 40 (as if an unregistered C++ member sat at 32..40), which no
+    ``#[repr(C)]`` ordering can reproduce -> the offset warning must fire.
+    """
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("beta", TypeSchema("int"), size=8, offset=24),
+            NamedTypeSchema("gamma", TypeSchema("int"), size=4, offset=40 if gap else 32),
+            NamedTypeSchema("alpha", TypeSchema("int"), size=4, offset=16),
+        ],
+        methods=[],
+        type_key="cpp_rust_test.Scrambled",
+        parent_type_key="ffi.Object",
+    )
+
+
+def test_rust_struct_fields_sorted_by_offset(capsys: pytest.CaptureFixture[str]) -> None:
+    text, _ = _gen_rust_object(_scrambled_layout_info())
+    # The struct lays fields out positionally -> memory (offset) order, not
+    # registration order.
+    alpha, beta, gamma = (text.index(f"pub {n}:") for n in ("alpha", "beta", "gamma"))
+    assert alpha < beta < gamma
+    # The repr(C) layout (with its natural alignment padding after `alpha`)
+    # matches the recorded offsets -> no warning.
+    assert "[Warning]" not in capsys.readouterr().out
+
+
+def test_rust_struct_offset_gap_warns(capsys: pytest.CaptureFixture[str]) -> None:
+    text, _ = _gen_rust_object(_scrambled_layout_info(gap=True))
+    # The binding is still emitted (warning, not an error) ...
+    assert "pub struct ScrambledObj {" in text
+    # ... but the unreproducible hole at 32..40 is reported: repr(C) places
+    # `gamma` right after `beta` (offset 32), reflection says 40.
+    out = capsys.readouterr().out
+    assert "[Warning] object cpp_rust_test.Scrambled" in out
+    assert "'gamma' is at C++ offset 40" in out
+    assert "places it at offset 32" in out
+
+
 def _explicit_init_point_info() -> ObjectInfo:
     """Like `_native_point_info` but an EXPLICIT `refl::init<i64, i64>` (a method)."""
     info = _native_point_info()
