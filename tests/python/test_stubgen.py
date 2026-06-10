@@ -40,6 +40,7 @@ from tvm_ffi.stub.python_generator.codegen import (
     render_object_methods,
 )
 from tvm_ffi.stub.python_generator.utils import ImportItem
+from tvm_ffi.stub.rust_generator import codegen as rust_codegen
 from tvm_ffi.stub.rust_generator import consts as RC
 from tvm_ffi.stub.rust_generator.codegen import (
     UnsupportedTypeError,
@@ -1100,11 +1101,12 @@ def _native_config_info() -> ObjectInfo:
 def test_rust_native_root_construction() -> None:
     text, _ = _gen_rust_object(_native_point_info())
     # Auto-init root -> native: `ffi_new` allocates via `ObjectArc::new` with a
-    # single inline struct literal -- no `__ffi_init__` round-trip, no builder helper.
+    # single inline struct literal -- no `__ffi_init__` round-trip. A root type
+    # without native children gets no bare-struct builder (`impl PointObj`).
     assert "pub fn ffi_new(x: i64, y: i64) -> Result<Self> {" in text
     assert "data: ObjectArc::new(PointObj {" in text
     assert "base: Object::new()," in text
-    assert "__ffi_build" not in text
+    assert "impl PointObj {" not in text
     assert "__ffi_init__" not in text
     assert "get_type_method" not in text
 
@@ -1118,7 +1120,6 @@ def test_rust_native_defaults_rendered() -> None:
     assert "offset: 7," in text
     assert "verbose: true," in text
     assert 'label: tvm_ffi::String::from("none"),' in text
-    assert "__ffi_build" not in text
     assert "__ffi_init__" not in text
 
 
@@ -1204,7 +1205,6 @@ def test_rust_native_explicit_init_field_binding() -> None:
     text, _ = _gen_rust_object(_explicit_init_point_info())
     assert "pub fn ffi_new(x: i64, y: i64) -> Result<Self> {" in text
     assert "data: ObjectArc::new(PointObj {" in text
-    assert "__ffi_build" not in text
     assert "__ffi_init__" not in text
 
 
@@ -1234,7 +1234,7 @@ def test_rust_native_opt_out_forces_ffi() -> None:
     info = _explicit_init_point_info()
     info.no_native = True
     text, _ = _gen_rust_object(info)
-    assert "__ffi_build" not in text
+    assert "impl PointObj {" not in text  # no bare-struct builder on the FFI path
     assert 'get_type_method(PointObj::type_index(), "__ffi_init__")' in text
 
 
@@ -1247,8 +1247,65 @@ def test_rust_native_excluded_for_optional_field() -> None:
         NamedTypeSchema("y", TypeSchema("Optional", (TypeSchema("int"),))),
     ]
     text, _ = _gen_rust_object(info)
-    assert "__ffi_build" not in text
+    assert "impl PointObj {" not in text  # no bare-struct builder on the FFI path
     assert 'get_type_method(PointObj::type_index(), "__ffi_init__")' in text
+
+
+def _native_point3d_info() -> ObjectInfo:
+    """Build the derived `Point3D : Point` fixture: own init field `z` (x / y on the parent)."""
+    return ObjectInfo(
+        fields=[NamedTypeSchema("z", TypeSchema("int"))],
+        methods=[],
+        type_key="cpp_rust_test.Point3D",
+        parent_type_key="cpp_rust_test.Point",
+        init_fields=[
+            InitFieldInfo("x", NamedTypeSchema("x", TypeSchema("int")), False, False),
+            InitFieldInfo("y", NamedTypeSchema("y", TypeSchema("int")), False, False),
+            InitFieldInfo("z", NamedTypeSchema("z", TypeSchema("int")), False, False),
+        ],
+        has_init=True,
+        own_field_inits=[FieldInit("z", has_default=False, default=None, has_factory=False)],
+    )
+
+
+def _patch_native_point_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand in for the live registry: just the Point / Point3D fixture pair."""
+    fixtures = {
+        "cpp_rust_test.Point": _native_point_info,
+        "cpp_rust_test.Point3D": _native_point3d_info,
+    }
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key]())
+    monkeypatch.setattr(rust_codegen, "GetRegisteredTypeKeys", lambda: list(fixtures))
+
+
+def test_rust_native_derived_takes_base_param(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A derived native type does NOT flatten ancestor init fields: its `ffi_new`
+    # takes the already-built parent value as one `base: <Parent>Obj` parameter
+    # followed by the OWN init fields only, bound in an inline struct literal.
+    _patch_native_point_registry(monkeypatch)
+    text, _ = _gen_rust_object(_native_point3d_info())
+    assert "pub fn ffi_new(base: PointObj, z: i64) -> Result<Self> {" in text
+    assert "data: ObjectArc::new(Point3DObj {" in text
+    assert "            base," in text
+    # Point3D has no native children -> no bare-struct builder on its own Obj.
+    assert "impl Point3DObj {" not in text
+    # No flattened ancestor params, no FFI dispatch.
+    assert "ffi_new(x: i64, y: i64, z: i64)" not in text
+    assert "__ffi_init__" not in text
+
+
+def test_rust_native_parent_gets_bare_struct_builder(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A type some native child derives from additionally gets the bare-struct
+    # builder `impl <T>Obj { fn ffi_new(..) -> Self }` -- the only way a caller
+    # can produce the child's `base` argument. The ref-level `ffi_new` keeps the
+    # ordinary inline-literal shape (it does not delegate to the builder).
+    _patch_native_point_registry(monkeypatch)
+    text, _ = _gen_rust_object(_native_point_info())
+    assert "impl PointObj {" in text
+    assert "pub fn ffi_new(x: i64, y: i64) -> Self {" in text
+    assert "pub fn ffi_new(x: i64, y: i64) -> Result<Self> {" in text
+    assert "data: ObjectArc::new(PointObj {" in text
+    assert "base: Object::new()," in text
 
 
 def _fake_render_type(schema: TypeSchema) -> str:

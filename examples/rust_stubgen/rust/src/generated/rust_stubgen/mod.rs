@@ -103,14 +103,20 @@ impl DerefMut for IntPair {
     }
 }
 
+impl IntPairObj {
+    pub fn ffi_new(a: i64, b: i64) -> Self {
+        Self {
+            base: Object::new(),
+            a,
+            b,
+        }
+    }
+}
+
 impl IntPair {
     pub fn ffi_new(a: i64, b: i64) -> Result<Self> {
         Ok(Self {
-            data: ObjectArc::new(IntPairObj {
-                base: Object::new(),
-                a,
-                b,
-            }),
+            data: ObjectArc::new(IntPairObj::ffi_new(a, b)),
         })
     }
 

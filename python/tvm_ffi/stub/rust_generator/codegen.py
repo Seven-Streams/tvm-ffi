@@ -27,6 +27,8 @@ import dataclasses
 import math
 from typing import TYPE_CHECKING, Callable
 
+from tvm_ffi._ffi_api import GetRegisteredTypeKeys
+
 from .. import consts as C
 from ..lib_state import object_info_from_type_key
 from . import consts as C_RUST
@@ -123,8 +125,9 @@ def _info_native_eligible(info: ObjectInfo) -> bool:
     Both construction paths are emitted as ``ffi_new`` (the generated constructor;
     a user who wants faithful C++ semantics hand-writes ``new``, outside the
     markers, delegating to ``ffi_new``). The native path allocates the struct
-    directly and binds every flattened init field (``info.init_fields``) from a
-    constructor parameter, in declaration order, with own non-init fields taking a
+    directly: a derived type's ``ffi_new`` takes the already-built parent value as
+    a single ``base: <Parent>Obj`` parameter (a root type omits it) followed by
+    the *own* init fields, in declaration order, with own non-init fields taking a
     rendered default. The ``param_i`` <-> ``field_i`` correspondence is **assumed**,
     not verified: a C++ constructor that validates, derives extra fields, or has
     side effects is silently bypassed -- that is the opted-in behavior.
@@ -133,7 +136,8 @@ def _info_native_eligible(info: ObjectInfo) -> bool:
     ``__ffi_init__`` path only when native construction genuinely cannot reproduce
     the object: the type opts out (``no_native``); an own field's top-level type is
     not memory-safe to write natively (``Optional`` / ``tuple`` -- see
-    :data:`~.consts.RUST_NATIVE_UNSAFE_ORIGINS`); a parent is itself non-native; or
+    :data:`~.consts.RUST_NATIVE_UNSAFE_ORIGINS`); a parent is itself non-native
+    (then no ``<Parent>Obj::ffi_new`` exists to build the ``base`` argument); or
     an own non-init field lacks a statically renderable default.
     """
     if (
@@ -176,6 +180,25 @@ def _native_eligible(type_key: str) -> bool:
         )
         return False
     return _info_native_eligible(info)
+
+
+def _has_native_child(type_key: str) -> bool:
+    """Whether any *registered* type derives from ``type_key`` and is itself native.
+
+    Such a child's native ``ffi_new`` takes ``base: <Self>Obj``, and the only way
+    a caller can produce that bare value is this type's ``<Self>Obj::ffi_new``
+    builder -- so the builder is emitted exactly for these parent types. Every
+    other type (in particular an ordinary root that nobody derives from) keeps
+    the builder-free shape: a single ``impl`` on the ref with the inline literal.
+    """
+    for child_key in GetRegisteredTypeKeys():
+        try:
+            child = object_info_from_type_key(child_key)
+        except Exception:
+            continue  # unrelated registry entries must not break this object
+        if child.parent_type_key == type_key and _info_native_eligible(child):
+            return True
+    return False
 
 
 @dataclasses.dataclass
@@ -272,13 +295,22 @@ class _ObjectRenderer:
         if not self.is_root:
             lines += _deref_impl(obj_struct, base_type, "base", self.mutable)
 
-        lines += self._impl_block()
+        # Native (FFI-free) construction whenever possible (the whole inheritance
+        # chain must be eligible -- see `_info_native_eligible`). Otherwise the
+        # reflected `__ffi_init__` is dispatched as before. The bare-struct
+        # builder is an extra that only types with native children need (their
+        # `base` argument is constructible no other way); everything else keeps
+        # the single-`impl`, builder-free shape.
+        native = _info_native_eligible(self.info)
+        if native and _has_native_child(self.info.type_key or ""):
+            lines += self._obj_new_fn_native()
+        lines += self._impl_block(native)
 
         if lines and lines[-1] == "":
             lines.pop()
         return lines
 
-    def _impl_block(self) -> list[str]:
+    def _impl_block(self, native: bool) -> list[str]:
         """Emit `impl <T> { new; methods }`; empty list when there's nothing to emit."""
         init_method = next(
             (m for m in self.info.methods if m.schema.name.rsplit(".", 1)[-1] == "__ffi_init__"),
@@ -291,11 +323,6 @@ class _ObjectRenderer:
             return []
 
         _use(self.imports, "tvm_ffi::Result")
-
-        # Native (FFI-free) construction whenever possible (the whole inheritance
-        # chain must be eligible -- see `_info_native_eligible`). Otherwise the
-        # reflected `__ffi_init__` is dispatched as before.
-        native = _info_native_eligible(self.info)
 
         inner: list[str] = []
         if self.info.has_init:
@@ -314,33 +341,46 @@ class _ObjectRenderer:
             "",
         ]
 
-    def _struct_literal_lines(self, info: ObjectInfo) -> list[str]:
-        """Render the inline nested ``<Obj> { .. }`` struct literal for ``info``.
+    def _native_params(self) -> list[tuple[str, str]]:
+        """Native ``ffi_new`` parameter list: ``base`` (derived only) + own init fields.
+
+        Unlike the FFI path (which must pass every flattened ancestor init field
+        through ``__ffi_init__``), the native signature takes the already-built
+        parent value as a single ``base: <Parent>Obj`` parameter -- a root type
+        omits it (its base is always ``Object::new()``). The caller builds the
+        ``base`` argument with the parent's own ``<Parent>Obj::ffi_new``.
+        """
+        params: list[tuple[str, str]] = []
+        if not self.is_root:
+            params.append(("base", self.base_type))
+        init_names = {f.name for f in self.info.init_fields}
+        params += [
+            (_rust_ident(f.name), self.render_struct_field(f))
+            for f in self.info.fields
+            if f.name in init_names
+        ]
+        return params
+
+    def _struct_literal_lines(self) -> list[str]:
+        """Render the flat inline ``<Obj> { .. }`` struct literal for this object.
 
         Mirrors the crate's own native construction idiom (e.g.
         ``TensorObjFromNDAlloc { base: TensorObj { object: Object::new(), .. } }``
-        in ``collections/tensor.rs``): one nested struct literal, the parent
-        embedded inline as ``base`` (bottoming out at ``Object::new()`` at the
-        root). Own init fields bind from the in-scope ``ffi_new`` parameters (which
-        carry the field names); own non-init fields take their rendered defaults.
-        Returned as lines: ``["<Obj> {", "    base: ..", .., "}"]``.
+        in ``collections/tensor.rs``). A root bottoms out at ``Object::new()``; a
+        derived type binds the in-scope ``base`` parameter (field-init shorthand)
+        -- ancestors are never inlined. Own init fields bind from the in-scope
+        ``ffi_new`` parameters (which carry the field names); own non-init fields
+        take their rendered defaults. Returned as lines:
+        ``["<Obj> {", "    base: ..", .., "}"]``.
         """
-        leaf = info.type_key.rsplit(".", 1)[-1]  # type: ignore[union-attr]
-        obj_struct = f"{leaf}Obj"
-        parent_key = info.parent_type_key
-
-        lines = [f"{obj_struct} {{"]
-        if parent_key in (None, "ffi.Object"):
+        lines = [f"{self.obj_struct} {{"]
+        if self.is_root:
             lines.append("    base: Object::new(),")
         else:
-            parent = self._struct_literal_lines(object_info_from_type_key(parent_key))
-            lines.append(f"    base: {parent[0]}")
-            lines += [f"    {pl}" for pl in parent[1:-1]]
-            lines.append(f"    {parent[-1]},")  # close the embedded parent + `,`
-
-        init_names = {f.name for f in info.init_fields}
-        field_inits = {f.name: f for f in info.own_field_inits}
-        for field in info.fields:
+            lines.append("    base,")  # shorthand: the `base` parameter
+        init_names = {f.name for f in self.info.init_fields}
+        field_inits = {f.name: f for f in self.info.own_field_inits}
+        for field in self.info.fields:
             ident = _rust_ident(field.name)
             if field.name in init_names:
                 lines.append(f"    {ident},")  # shorthand: param name == field name
@@ -353,10 +393,31 @@ class _ObjectRenderer:
         lines.append("}")
         return lines
 
+    def _obj_new_fn_native(self) -> list[str]:
+        """Emit ``impl <T>Obj { pub fn ffi_new(..) -> Self }`` -- the bare-struct builder.
+
+        Builds the struct *value* only (no allocation), with the same signature
+        as the ref-level ``ffi_new``. Emitted ONLY for types some native child
+        derives from (see :func:`_has_native_child`): its output is what the
+        child's ``ffi_new`` takes as ``base``. Types without native children
+        never get this extra ``impl``.
+        """
+        params = self._native_params()
+        sig = ", ".join(f"{n}: {t}" for n, t in params)
+        literal = self._struct_literal_lines()
+        return [
+            f"impl {self.obj_struct} {{",
+            f"    pub fn ffi_new({sig}) -> Self {{",
+            *[f"        {line}" for line in literal],
+            "    }",
+            "}",
+            "",
+        ]
+
     def _new_fn_native(self) -> list[str]:
         """Emit `fn ffi_new(..) -> Result<Self>` that allocates the object natively.
 
-        No FFI round-trip: a single inline nested struct literal (built by
+        No FFI round-trip: a single inline struct literal (built by
         :meth:`_struct_literal_lines`) is handed to `ObjectArc::new`, which writes
         the object header + Rust deleter. The `Result` wrapper is kept for
         signature parity with the FFI path -- the body is infallible (`Ok(..)`).
@@ -366,14 +427,9 @@ class _ObjectRenderer:
         who needs the faithful semantics hand-writes ``new`` (outside the stubgen
         markers) delegating to this ``ffi_new``.
         """
-        params = [
-            (_rust_ident(f.name), self.render_struct_field(f.schema)) for f in self.info.init_fields
-        ]
+        params = self._native_params()
         sig = ", ".join(f"{n}: {t}" for n, t in params)
-        # `Object::new()` bottoms out the (possibly inlined-parent) literal, so the
-        # `Object` import is needed for any native type, not just a root one.
-        _use(self.imports, "tvm_ffi::object::Object")
-        literal = self._struct_literal_lines(self.info)
+        literal = self._struct_literal_lines()
         return [
             f"pub fn ffi_new({sig}) -> Result<Self> {{",
             "    Ok(Self {",
