@@ -39,7 +39,6 @@ from .utils import (
     _deref_impl,
     _packed_args_expr,
     _packed_call_lines,
-    _rust_ident,
     render_rust_type,
 )
 
@@ -59,15 +58,13 @@ _STR_ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r", "\t": "\\t"}
 
 
 def _rust_str_lit(value: str) -> str:
-    r"""Render a Python string as a double-quoted Rust string literal (escaped).
+    r"""Render a Python string as a double-quoted Rust string literal.
 
-    Control characters without a short escape render as ``\u{..}`` -- embedding
-    them raw would produce an invalid (or silently corrupted) literal.
+    Only the escapes a reasonable default needs (``\`` ``"`` ``\n`` ``\r``
+    ``\t``) are handled; other control characters are passed through verbatim
+    (a default containing them is not supported).
     """
-    body = "".join(
-        _STR_ESCAPES.get(ch, f"\\u{{{ord(ch):x}}}" if ord(ch) < 0x20 or ch == "\x7f" else ch)
-        for ch in value
-    )
+    body = "".join(_STR_ESCAPES.get(ch, ch) for ch in value)
     return f'"{body}"'
 
 
@@ -137,17 +134,13 @@ def _info_native_eligible(info: ObjectInfo) -> bool:
 
     Native is therefore used whenever it is *possible*. It falls back to the FFI
     ``__ffi_init__`` path only when native construction genuinely cannot reproduce
-    the object: the type opts out (``no_native``); an own field's top-level type is
-    not memory-safe to write natively (``Optional`` / ``tuple`` -- see
-    :data:`~.consts.RUST_NATIVE_UNSAFE_ORIGINS`); a parent is itself non-native
-    (then no ``<Parent>Obj::ffi_new`` exists to build the ``base`` argument); or
-    an own non-init field lacks a statically renderable default.
+    the object: an own field's top-level type is not memory-safe to write natively
+    (``Optional`` / ``tuple`` -- see :data:`~.consts.RUST_NATIVE_UNSAFE_ORIGINS`);
+    a parent is itself non-native (then no ``<Parent>Obj::ffi_new`` exists to
+    build the ``base`` argument); or an own non-init field lacks a statically
+    renderable default.
     """
-    if (
-        not info.has_init
-        or info.no_native
-        or any(f.origin in C_RUST.RUST_NATIVE_UNSAFE_ORIGINS for f in info.fields)
-    ):
+    if not info.has_init or any(f.origin in C_RUST.RUST_NATIVE_UNSAFE_ORIGINS for f in info.fields):
         return False
     parent = info.parent_type_key
     if parent not in (None, "ffi.Object") and not _native_eligible(parent):
@@ -317,21 +310,25 @@ class _ObjectRenderer:
 
     def body(self) -> list[str]:
         """Build the Rust source lines for the object (raises on unsupported types)."""
-        # Boilerplate `use`s the generated items rely on. The emitted text must
-        # reference the *returned* in-scope names: when a field type recorded
-        # earlier in the same file already claimed a leaf (e.g. `use
-        # tvm_ffi::Object;`), the boilerplate `use` is aliased (`Object2`) and a
-        # bare leaf in the text would bind the wrong type.
-        deref = self.imports.record("std::ops::Deref")
-        object_arc = self.imports.record("tvm_ffi::object::ObjectArc")
-        # `ObjectCore` only needs to be in scope (aliased or not) so the
-        # generated `<T>Obj::type_index()` trait-method calls resolve.
-        self.imports.record("tvm_ffi::object::ObjectCore")
-        derive_object = self.imports.record("tvm_ffi::derive::Object", alias="DeriveObject")
-        derive_ref = self.imports.record("tvm_ffi::derive::ObjectRef", alias="DeriveObjectRef")
+        # Boilerplate `use`s the generated items rely on, recorded through the
+        # same collector as field types: a pathological user type whose leaf
+        # collides with one of them raises and skips the object (see
+        # `RustImports.record`). The derive macros carry fixed aliases -- their
+        # leaves collide with `tvm_ffi::Object`/`ObjectRef` by construction.
+        self.imports.record("std::ops::Deref")
+        # `ObjectCore` only needs to be in scope so the generated
+        # `<T>Obj::type_index()` trait-method calls resolve.
+        self.imports.record("tvm_ffi::ObjectCore")
+        self.imports.record("tvm_ffi::ObjectArc")
+        self.imports.record("tvm_ffi::derive::Object", alias="DeriveObject")
+        self.imports.record("tvm_ffi::derive::ObjectRef", alias="DeriveObjectRef")
         if self.is_root:
-            self.base_type = self.imports.record("tvm_ffi::object::Object")
-        derefmut = self.imports.record("std::ops::DerefMut") if self.mutable else ""
+            # The crate-root re-export: the same path the ty_map uses for
+            # `Object`/`ffi.Object` fields, so such a field dedups against the
+            # boilerplate instead of colliding with it.
+            self.base_type = self.imports.record("tvm_ffi::Object")
+        if self.mutable:
+            self.imports.record("std::ops::DerefMut")
 
         leaf, obj_struct, base_type = self.leaf, self.obj_struct, self.base_type
         lines: list[str] = []
@@ -341,27 +338,27 @@ class _ObjectRenderer:
         # type index in a per-type static -- no shared hashmap lookup.
         lines += [
             "#[repr(C)]",
-            f"#[derive({derive_object})]",
+            "#[derive(DeriveObject)]",
             f'#[type_key = "{self.info.type_key}"]',
             f"pub struct {obj_struct} {{",
             f"    base: {base_type},",
         ]
         for field in _layout_fields(self.info.fields):
-            lines.append(f"    pub {_rust_ident(field.name)}: {self.render_struct_field(field)},")
+            lines.append(f"    pub {field.name}: {self.render_struct_field(field)},")
         lines += ["}", ""]
 
         lines += [
             "#[repr(C)]",
-            f"#[derive({derive_ref}, Clone)]",
+            "#[derive(DeriveObjectRef, Clone)]",
             f"pub struct {leaf} {{",
-            f"    data: {object_arc}<{obj_struct}>,",
+            f"    data: ObjectArc<{obj_struct}>,",
             "}",
             "",
         ]
 
-        lines += _deref_impl(leaf, obj_struct, "data", deref, derefmut)
+        lines += _deref_impl(leaf, obj_struct, "data", self.mutable)
         if not self.is_root:
-            lines += _deref_impl(obj_struct, base_type, "base", deref, derefmut)
+            lines += _deref_impl(obj_struct, base_type, "base", self.mutable)
 
         # Native (FFI-free) construction whenever possible (the whole inheritance
         # chain must be eligible -- see `_info_native_eligible`). Otherwise the
@@ -421,9 +418,7 @@ class _ObjectRenderer:
             params.append(("base", self.base_type))
         init_names = {f.name for f in self.info.init_fields}
         params += [
-            (_rust_ident(f.name), self.render_struct_field(f))
-            for f in self.info.fields
-            if f.name in init_names
+            (f.name, self.render_struct_field(f)) for f in self.info.fields if f.name in init_names
         ]
         return params
 
@@ -441,8 +436,8 @@ class _ObjectRenderer:
         """
         lines = [f"{self.obj_struct} {{"]
         if self.is_root:
-            # For a root, `base_type` is the in-scope (possibly aliased) name of
-            # `tvm_ffi::object::Object`, recorded in :meth:`body`.
+            # For a root, `base_type` is the in-scope name of `tvm_ffi::Object`,
+            # recorded in :meth:`body`.
             lines.append(f"    base: {self.base_type}::new(),")
         else:
             lines.append("    base,")  # shorthand: the `base` parameter
@@ -451,15 +446,14 @@ class _ObjectRenderer:
         # Struct-literal entries bind by name, so order is semantically free;
         # memory order is used to mirror the struct definition.
         for field in _layout_fields(self.info.fields):
-            ident = _rust_ident(field.name)
             if field.name in init_names:
-                lines.append(f"    {ident},")  # shorthand: param name == field name
+                lines.append(f"    {field.name},")  # shorthand: param name == field name
             else:
                 # `render_struct_field`, not `render_field`: a non-finite float
                 # default renders as a typed constant (`f32::INFINITY`), which
                 # must match the width-narrowed field type.
                 default = _render_default(field_inits[field.name], field, self.render_struct_field)
-                lines.append(f"    {ident}: {default},")
+                lines.append(f"    {field.name}: {default},")
         lines.append("}")
         return lines
 
@@ -500,12 +494,11 @@ class _ObjectRenderer:
         params = self._native_params()
         sig = ", ".join(f"{n}: {t}" for n, t in params)
         literal = self._struct_literal_lines()
-        result = self.imports.record("tvm_ffi::Result")
-        object_arc = self.imports.record("tvm_ffi::object::ObjectArc")
+        self.imports.record("tvm_ffi::Result")
         return [
-            f"pub fn ffi_new({sig}) -> {result}<Self> {{",
+            f"pub fn ffi_new({sig}) -> Result<Self> {{",
             "    Ok(Self {",
-            f"        data: {object_arc}::new({literal[0]}",
+            f"        data: ObjectArc::new({literal[0]}",
             *[f"        {line}" for line in literal[1:-1]],
             f"        {literal[-1]}),",
             "    })",
@@ -518,16 +511,15 @@ class _ObjectRenderer:
             arg_schemas = list(init_method.schema.args[1:]) if init_method.schema.args else []
             params = [(f"_{i}", self.render_param(s)) for i, s in enumerate(arg_schemas)]
         else:
-            params = [
-                (_rust_ident(f.name), self.render_param(f.schema)) for f in self.info.init_fields
-            ]
+            params = [(f.name, self.render_param(f.schema)) for f in self.info.init_fields]
         sig = ", ".join(f"{n}: {t}" for n, t in params)
-        result = self.imports.record("tvm_ffi::Result")
-        anyview = self.imports.record("tvm_ffi::AnyView") if params else "AnyView"
-        packed = _packed_args_expr(params, is_member=False, anyview=anyview)
+        self.imports.record("tvm_ffi::Result")
+        if params:
+            self.imports.record("tvm_ffi::AnyView")
+        packed = _packed_args_expr(params, is_member=False)
         getter = self._cached_getter_lines("ctor", "__ffi_init__")
         return [
-            f"pub fn ffi_new({sig}) -> {result}<Self> {{",
+            f"pub fn ffi_new({sig}) -> Result<Self> {{",
             *_packed_call_lines("ctor", getter, packed, "Self"),
             "}",
         ]
@@ -551,7 +543,6 @@ class _ObjectRenderer:
     def _method_fn(self, method: FuncInfo) -> list[str]:
         """Emit one reflected method (instance or static) on `impl <T>`."""
         ffi_name = method.schema.name.rsplit(".", 1)[-1]
-        rust_name = _rust_ident(ffi_name)
         args = method.schema.args or ()
         # Return type uses the owning render (a top-level `Any` stays `Any`).
         ret = self.render_field(args[0]) if args else self._ty_render("Any")
@@ -565,14 +556,12 @@ class _ObjectRenderer:
             sig_parts = [self_recv, *[f"{n}: {t}" for n, t in params]]
         else:
             sig_parts = [f"{n}: {t}" for n, t in params]
-        result = self.imports.record("tvm_ffi::Result")
+        self.imports.record("tvm_ffi::Result")
         if method.is_member or params:
-            anyview = self.imports.record("tvm_ffi::AnyView")
-        else:
-            anyview = "AnyView"
-        packed = _packed_args_expr(params, method.is_member, anyview=anyview)
+            self.imports.record("tvm_ffi::AnyView")
+        packed = _packed_args_expr(params, method.is_member)
         getter = self._cached_getter_lines("f", ffi_name)
-        header = f"pub fn {rust_name}({', '.join(sig_parts)}) -> {result}<{ret}> {{"
+        header = f"pub fn {ffi_name}({', '.join(sig_parts)}) -> Result<{ret}> {{"
         return [header, *_packed_call_lines("f", getter, packed, ret), "}"]
 
 
@@ -591,8 +580,9 @@ def generate_rust_object(
     and ``impl <T>`` with an ``ffi_new`` constructor + reflected methods.
 
     Raises :class:`~..utils.UnsupportedTypeError` when the object uses a type the
-    crate cannot represent; ``cli`` catches it and skips the block (the local
-    import collector below guarantees a raise leaves ``imports`` untouched).
+    crate cannot represent; ``cli`` catches it and skips the block. A raise may
+    leave already-recorded ``use``s behind in ``imports`` -- harmless, generated
+    files open with ``#![allow(unused_imports)]``.
     """
     assert len(code.lines) >= 2
     type_key = obj_info.type_key
@@ -608,12 +598,6 @@ def generate_rust_object(
         base_type = f"{parent_key.rsplit('.', 1)[-1]}Obj"
     mutable, mixed = _class_is_mutable(obj_info)
 
-    # Render into a local collector so a skip leaves `imports` untouched. Seeding
-    # from `imports.items` is enough to carry forward every prior `use`: a fresh
-    # `RustImports` rebuilds its collision trackers (`_binding_of`/`_used_names`)
-    # from `items` in `__post_init__`. `items` is the single source of truth, so
-    # the writeback below only needs to copy `items` back (see the writeback note).
-    local = RustImports(items=list(imports.items))
     renderer = _ObjectRenderer(
         info=obj_info,
         leaf=leaf,
@@ -621,7 +605,7 @@ def generate_rust_object(
         base_type=base_type,
         is_root=is_root,
         mutable=mutable,
-        imports=local,
+        imports=imports,
         ty_map=ty_map,
     )
 
@@ -634,10 +618,6 @@ def generate_rust_object(
         )
     _warn_offset_mismatch(type_key, _layout_fields(obj_info.fields))
 
-    # Writeback note: copy only `items` -- the next object block re-seeds a fresh
-    # `local` from it and rebuilds the trackers, so `imports`'s own (now stale)
-    # `_binding_of`/`_used_names` are never read again and need not be updated.
-    imports.items[:] = local.items
     indent = " " * code.indent
     code.lines = [
         code.lines[0],

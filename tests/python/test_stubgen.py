@@ -51,7 +51,7 @@ from tvm_ffi.stub.rust_generator.codegen import (
     render_rust_type,
 )
 from tvm_ffi.stub.rust_generator.generator import RustGenerator
-from tvm_ffi.stub.rust_generator.utils import RustImports, RustUse, _rust_ident
+from tvm_ffi.stub.rust_generator.utils import RustImports, RustUse
 from tvm_ffi.stub.utils import (
     FieldInit,
     FuncInfo,
@@ -930,22 +930,15 @@ def test_ty_render_dedups_same_path() -> None:
     assert imports.items == [RustUse("tvm_ffi::Array")]  # recorded exactly once
 
 
-def test_ty_render_aliases_same_leaf_different_path() -> None:
+def test_ty_render_same_leaf_different_path_raises() -> None:
+    # No auto-aliasing: two different paths wanting the same in-scope name only
+    # arise from pathological type names, declared unsupported -> the enclosing
+    # object is skipped (rename the type or hand-write the binding).
     imports = RustImports()
-    ty_map = {"A": "crate_a::Foo", "B": "crate_b::Foo", "C": "crate_c::Foo"}
-
-    def tr(origin: str) -> str:
-        return imports.record(ty_map.get(origin, origin))
-
-    assert tr("A") == "Foo"  # first claims the bare leaf
-    assert tr("B") == "Foo2"  # collision -> aliased
-    assert tr("C") == "Foo3"  # next collision
-    lines = [u.as_use_line() for u in imports.items]
-    assert lines == [
-        "use crate_a::Foo;",
-        "use crate_b::Foo as Foo2;",
-        "use crate_c::Foo as Foo3;",
-    ]
+    assert imports.record("crate_a::Foo") == "Foo"  # first claims the bare leaf
+    with pytest.raises(UnsupportedTypeError):
+        imports.record("crate_b::Foo")
+    assert imports.items == [RustUse("crate_a::Foo")]  # the loser is not recorded
 
 
 def test_ty_render_bare_types_not_tracked() -> None:
@@ -960,26 +953,13 @@ def test_ty_render_bare_types_not_tracked() -> None:
     assert imports.items == []
 
 
-def test_ty_render_seeds_from_existing_imports() -> None:
-    # A pre-seeded `use` (e.g. from an import-object directive) must be respected:
-    # a different path with the same leaf gets aliased rather than colliding.
+def test_ty_render_respects_existing_imports() -> None:
+    # A pre-recorded `use` (e.g. from an import-object directive) is respected:
+    # the same path reuses its binding; a same-leaf different path raises.
     imports = RustImports(items=[RustUse("crate_a::Foo")])
-    ty_map = {"B": "crate_b::Foo"}
-
-    def tr(origin: str) -> str:
-        return imports.record(ty_map.get(origin, origin))
-
-    assert tr("B") == "Foo2"
-
-
-def test_rustimports_prelude_leaf_gets_aliased() -> None:
-    # Bare prelude names (`Option`, `i64`, ...) render import-free and are
-    # pre-claimed: a type key whose leaf collides must be aliased -- a bare
-    # `use my_pkg::Option;` would silently shadow the prelude `Option` (and
-    # thereby every `Option<T>` field) for the whole module.
-    imp = RustImports()
-    assert imp.record("my_pkg.Option") == "Option2"
-    assert RustUse("my_pkg::Option", alias="Option2") in imp.items
+    assert imports.record("crate_a::Foo") == "Foo"
+    with pytest.raises(UnsupportedTypeError):
+        imports.record("crate_b::Foo")
 
 
 # ---------------------------------------------------------------------------
@@ -1007,10 +987,10 @@ def _gen_rust_object(info: ObjectInfo) -> tuple[str, RustImports]:
 def _expr_info(*, value_frozen: bool = False) -> ObjectInfo:
     """Root `Expr`: field `value: i64`, static `test() -> i64`, init(i64).
 
-    Marked ``no_native`` so it stays the canonical *FFI-new* fixture: native
-    construction is now used whenever possible, so the opt-out is what keeps the
-    structural/CLI tests below exercising the ``__ffi_init__`` dispatch path. The
-    native path is covered separately by the ``_native_*`` fixtures.
+    Native-eligible (root, field-binding init), so its ``ffi_new`` is the native
+    struct-literal form. The FFI ``__ffi_init__`` dispatch path is covered by the
+    derived fixtures (non-resolvable parent) and the ``Optional``-field exclusion
+    test below.
     """
     return ObjectInfo(
         fields=[NamedTypeSchema("value", TypeSchema("int"), frozen=value_frozen)],
@@ -1026,7 +1006,6 @@ def _expr_info(*, value_frozen: bool = False) -> ObjectInfo:
             InitFieldInfo("value", NamedTypeSchema("value", TypeSchema("int")), False, False)
         ],
         has_init=True,
-        no_native=True,
     )
 
 
@@ -1306,15 +1285,6 @@ def test_rust_native_explicit_init_arity_mismatch_still_native() -> None:
     assert "__ffi_init__" not in text
 
 
-def test_rust_native_opt_out_forces_ffi() -> None:
-    # `no_native` (the `__ffi_no_native__` attr) keeps a field-binding type on FFI.
-    info = _explicit_init_point_info()
-    info.no_native = True
-    text, _ = _gen_rust_object(info)
-    assert "impl PointObj {" not in text  # no bare-struct builder on the FFI path
-    assert 'get_type_method_cached(&CTOR, PointObj::type_index(), "__ffi_init__")' in text
-
-
 def test_rust_native_excluded_for_optional_field() -> None:
     # A top-level `Optional` field renders to std `Option<T>`, whose layout differs
     # from C++ `ffi::Optional<T>`; native writes would corrupt it -> FFI fallback.
@@ -1412,12 +1382,12 @@ def test_render_default_renderable_kinds(
     assert _render_default(fi, NamedTypeSchema("f", schema), _fake_render_type) == expected
 
 
-def test_render_default_string_escapes_control_chars() -> None:
-    # Control characters without a short escape must render as `\u{..}` --
-    # embedding them raw would corrupt the generated literal.
-    fi = FieldInit("f", has_default=True, default='a\x00"\nb\x7f', has_factory=False)
+def test_render_default_string_escapes_basics() -> None:
+    # The escapes a reasonable default needs: backslash, quote, \n, \r, \t.
+    # Exotic control characters are not supported and pass through verbatim.
+    fi = FieldInit("f", has_default=True, default='a"\n\tb\\', has_factory=False)
     out = _render_default(fi, NamedTypeSchema("f", TypeSchema("ffi.String")), _fake_render_type)
-    assert out == 'tvm_ffi::String::from("a\\u{0}\\"\\nb\\u{7f}")'
+    assert out == 'tvm_ffi::String::from("a\\"\\n\\tb\\\\")'
 
 
 @pytest.mark.parametrize(
@@ -1457,25 +1427,22 @@ def test_rust_object_root_struct_and_impl() -> None:
     assert "    data: ObjectArc<ExprObj>," in text
     assert "impl Deref for Expr {" in text
     assert "impl DerefMut for Expr {" in text
-    # new via __ffi_init__
+    # native ffi_new (root, field-binding init): inline struct literal, no FFI
     # generated types/functions are `pub` (decision Q2)
     assert "pub struct ExprObj {" in text
     assert "pub struct Expr {" in text
     assert "pub fn ffi_new(value: i64) -> Result<Self> {" in text
     assert "pub fn test() -> Result<i64> {" in text
-    assert "fn ffi_new(value: i64) -> Result<Self> {" in text
-    assert (
-        'let ctor = get_type_method_cached(&CTOR, ExprObj::type_index(), "__ffi_init__")?;' in text
-    )
-    assert "thread_local!(static CTOR: std::cell::OnceCell<tvm_ffi::Function>" in text
-    # uniform packed-call convention: args -> &[AnyView], return via try_into
-    assert "Ok(ctor.call_packed(&[AnyView::from(&value)])?.try_into()?)" in text
-    # static method: no self
+    assert "data: ObjectArc::new(ExprObj {" in text
+    assert "base: Object::new()," in text
+    assert "__ffi_init__" not in text
+    # static method: no self; uniform packed-call convention with cached getter
     assert "fn test() -> Result<i64> {" in text
+    assert "thread_local!(static F: std::cell::OnceCell<tvm_ffi::Function>" in text
     assert 'let f = get_type_method_cached(&F, ExprObj::type_index(), "test")?;' in text
     assert "Ok(f.call_packed(&[])?.try_into()?)" in text
     uses = {u.as_use_line() for u in imports.items}
-    assert "use tvm_ffi::object::Object;" in uses
+    assert "use tvm_ffi::Object;" in uses
     assert "use std::ops::DerefMut;" in uses
 
 
@@ -1503,13 +1470,12 @@ def test_rust_object_immutable_has_no_derefmut() -> None:
     assert "fn test() -> Result<i64> {" in text  # static unaffected
 
 
-def test_rust_object_field_collides_with_boilerplate_object_is_aliased() -> None:
+def test_rust_object_field_of_type_object_shares_boilerplate_use() -> None:
     # Regression for an E0252 "Object defined multiple times" collision: a root
-    # object's boilerplate records `tvm_ffi::object::Object` (the struct `base`),
-    # claiming the bare `Object` leaf. A field whose type is itself `ffi.Object`
-    # maps to a *different* path, `tvm_ffi::Object`, with the *same* leaf -- so it
-    # must be aliased (`use tvm_ffi::Object as Object2;`) instead of emitting a
-    # second `use ...::Object;` that would fail to compile.
+    # object's boilerplate `Object` (the struct `base`) and a field whose type
+    # is itself `ffi.Object` both record the crate-root re-export path
+    # `tvm_ffi::Object`, so they dedup to a single `use` -- no second
+    # `use ...::Object;` that would fail to compile.
     info = ObjectInfo(
         fields=[NamedTypeSchema("child", TypeSchema("ffi.Object"))],
         methods=[],
@@ -1518,40 +1484,24 @@ def test_rust_object_field_collides_with_boilerplate_object_is_aliased() -> None
     )
     text, imports = _gen_rust_object(info)
     assert "    base: Object," in text  # boilerplate Object as the struct base
-    assert "    pub child: Object2," in text  # field aliased to avoid the clash
-    uses = {u.as_use_line() for u in imports.items}
-    assert "use tvm_ffi::object::Object;" in uses
-    assert "use tvm_ffi::Object as Object2;" in uses
-    # The two `use`s bring distinct in-scope names: no duplicate bare `Object`.
-    assert "use tvm_ffi::Object;" not in uses
+    assert "    pub child: Object," in text  # the field binds the same type
+    uses = [u.as_use_line() for u in imports.items]
+    assert uses.count("use tvm_ffi::Object;") == 1
 
 
-def test_rust_boilerplate_aliased_when_field_claims_leaf_first() -> None:
-    # Reverse order of the collision above: within one file, a *derived* object
-    # (which records no root `Object` boilerplate) renders first, and its field
-    # claims the bare `Object` leaf via `use tvm_ffi::Object;`. A later *root*
-    # object's boilerplate `tvm_ffi::object::Object` is then the side that gets
-    # aliased -- and the emitted text must reference the alias: a bare `base:
-    # Object` would silently bind the field's `tvm_ffi::Object` ref type.
-    holder = ObjectInfo(
-        fields=[NamedTypeSchema("child", TypeSchema("ffi.Object"))],
+def test_rust_use_leaf_collision_skips_object() -> None:
+    # A genuinely different path wanting an already-taken leaf (a `their.Object`
+    # type key vs the boilerplate `tvm_ffi::Object`) is not auto-aliased: such
+    # names are declared unsupported, the object raises and cli skips its block
+    # (rename the type or hand-write the binding outside the markers).
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("child", TypeSchema("their.Object"))],
         methods=[],
         type_key="demo.Holder",
-        parent_type_key="demo.Base",  # derived: no root `Object` boilerplate
+        parent_type_key="ffi.Object",
     )
-    ty_map = RC.RUST_TY_MAP_DEFAULTS.copy()
-    imports = RustImports()
-    holder_block = _rust_object_block("demo.Holder")
-    generate_rust_object(holder_block, ty_map, imports, Options(), holder)
-    root_block = _rust_object_block("cpp_rust_test.Expr")
-    generate_rust_object(root_block, ty_map, imports, Options(), _expr_info())
-    root_text = "\n".join(root_block.lines)
-    assert "    pub child: Object," in "\n".join(holder_block.lines)  # field claimed the leaf
-    assert "    base: Object2," in root_text  # boilerplate emits its alias
-    assert "    base: Object," not in root_text
-    uses = {u.as_use_line() for u in imports.items}
-    assert "use tvm_ffi::Object;" in uses
-    assert "use tvm_ffi::object::Object as Object2;" in uses
+    with pytest.raises(UnsupportedTypeError):
+        _gen_rust_object(info)
 
 
 def test_rust_method_any_return_stays_any_not_anyview() -> None:
@@ -1617,9 +1567,11 @@ def _has_map_info() -> ObjectInfo:
     )
 
 
-def test_rust_object_unsupported_raises_without_leakage() -> None:
+def test_rust_object_unsupported_raises() -> None:
     # `generate_rust_object` propagates UnsupportedTypeError (cli catches it and
-    # resets the block); the raise must leave the import collector untouched.
+    # resets the block). Boilerplate `use`s recorded before the raise may stay
+    # behind in the collector -- harmless, generated files open with
+    # `#![allow(unused_imports)]`.
     block = _rust_object_block("demo.HasMap")
     imports = RustImports(items=[RustUse("tvm_ffi::Tensor")])
     with pytest.raises(UnsupportedTypeError) as exc:
@@ -1627,7 +1579,7 @@ def test_rust_object_unsupported_raises_without_leakage() -> None:
             block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), _has_map_info()
         )
     assert exc.value.origin == "Map"
-    assert imports.items == [RustUse("tvm_ffi::Tensor")]
+    assert RustUse("tvm_ffi::Tensor") in imports.items  # pre-seeded use kept
 
 
 def test_rust_stage3_skipped_type_not_counted_as_defined(
@@ -1704,26 +1656,6 @@ def test_rust_unknown_bare_origin_skips_object() -> None:
     with pytest.raises(UnsupportedTypeError) as exc:
         _gen_rust_object(info)
     assert exc.value.origin == "const char*"
-
-
-def test_rust_ident_keyword_escaping() -> None:
-    assert _rust_ident("value") == "value"
-    assert _rust_ident("type") == "r#type"
-    assert _rust_ident("try") == "r#try"  # reserved (2018) keyword
-    assert _rust_ident("yield") == "r#yield"  # reserved keyword
-    with pytest.raises(UnsupportedTypeError):  # cannot be a raw identifier
-        _rust_ident("crate")
-
-
-def test_rust_forbidden_ident_skips_object() -> None:
-    info = ObjectInfo(
-        fields=[NamedTypeSchema("crate", TypeSchema("int"))],
-        methods=[],
-        type_key="demo.Bad",
-        parent_type_key="ffi.Object",
-    )
-    with pytest.raises(UnsupportedTypeError):
-        _gen_rust_object(info)
 
 
 def _rust_import_block() -> CodeBlock:
@@ -1825,13 +1757,13 @@ def test_rust_stage3_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
         generator=RustGenerator(),
     )
     text = "\n".join(info.lines)
-    # object block filled
+    # object block filled (native ffi_new: root field-binding fixture)
     assert "struct ExprObj {" in text
     assert "impl Expr {" in text
-    assert 'get_type_method_cached(&CTOR, ExprObj::type_index(), "__ffi_init__")' in text
+    assert "data: ObjectArc::new(ExprObj {" in text
     # import-section filled with the machinery `use`s
-    assert "use tvm_ffi::object::ObjectArc;" in text
-    assert "use tvm_ffi::object::ObjectCore;" in text
+    assert "use tvm_ffi::ObjectArc;" in text
+    assert "use tvm_ffi::ObjectCore;" in text
     # Expr defines itself -> no self `use`
     assert "use cpp_rust_test::Expr;" not in text
 

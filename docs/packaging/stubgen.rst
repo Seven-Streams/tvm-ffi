@@ -377,18 +377,10 @@ explicit ``refl::init<...>`` constructor are **not** replayed. When you need the
 C++ semantics, hand-write a ``new`` outside the stubgen markers (anywhere in the crate)
 that wraps ``ffi_new``; regeneration never touches code outside the markers.
 
-A type can opt out of native construction by setting the ``__ffi_no_native__`` type
-attribute on the C++ side:
-
-.. code-block:: cpp
-
-   refl::TypeAttrDef<MyObj>().attr("__ffi_no_native__", true);
-
-Use this for types whose constructor/destructor must run on the C++ side (side effects,
-resource management). The generated ``ffi_new`` then dispatches the reflected
-``__ffi_init__`` through the FFI instead. The same FFI fallback is chosen automatically
-when native construction cannot faithfully lay out the object (e.g. an ``Optional`` or
-tuple field, or a non-init field without a statically renderable default).
+When native construction cannot faithfully lay out the object (e.g. an ``Optional`` or
+tuple field, or a non-init field without a statically renderable default), the generated
+``ffi_new`` dispatches the reflected ``__ffi_init__`` through the FFI instead, which runs
+the C++ constructor.
 
 Mounting the Module Tree
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -412,6 +404,14 @@ Limitations
   emitted ``use my_pkg::Foo;`` path does not exist in your crate. Keep an inheritance
   hierarchy and mutually-referencing types under a single prefix, or add the ``use`` by
   hand.
+- **Member names are emitted verbatim**: a field or method whose name is a Rust keyword
+  (``type``, ``match``, ...) or otherwise not a valid Rust identifier produces code that
+  does not compile. Rename the member, or hand-write that binding outside the markers.
+- **Import name collisions are not auto-aliased**: two ``use``\ s wanting the same
+  in-scope name (e.g. a type key whose leaf is ``Object``) skip the object with a
+  warning. Rename the type, or hand-write the binding outside the markers.
+- **String defaults** (native construction) escape only ``\``, ``"``, newline, carriage
+  return and tab; other control characters in a default value are not supported.
 
 .. _sec-stubgen-advanced:
 

@@ -95,82 +95,53 @@ class RustUse:
 
 @dataclasses.dataclass
 class RustImports:
-    """Import collector + alias-aware ``use`` registrar for Rust codegen.
+    """Import collector / ``use`` registrar for Rust codegen.
 
     The language-agnostic ``cli`` treats this as an opaque token: it asks the
     backend to create one, seed it from ``import-object`` directives, and later
     render it. Only the Rust backend reaches inside.
 
-    All ``use`` recording -- boilerplate *and* type-render
-    callbacks -- goes through the single :meth:`record` method,
-    so there is exactly one view of which leaf names are taken. The collision
-    trackers are rebuilt from :attr:`items` in ``__post_init__`` so that a seeded
-    copy (``RustImports(items=list(other.items))``) stays consistent: whoever
-    records a leaf name first keeps it, and a later, differently-pathed ``use``
-    of the same leaf is aliased (``use b::Foo as Foo2;``) rather than emitting a
-    duplicate ``use`` that fails to compile.
+    All ``use`` recording -- boilerplate *and* type-render callbacks -- goes
+    through the single :meth:`record` method, which dedups by full path. Two
+    *different* paths wanting the same in-scope name raise
+    :class:`UnsupportedTypeError` (the enclosing object is skipped with a
+    warning): such collisions only arise from pathological type names, which
+    the Rust backend declares unsupported rather than auto-aliasing.
     """
 
     items: list[RustUse] = dataclasses.field(default_factory=list)
-    #: in-scope name keyed by full ``::`` path -- dedup of repeat references.
-    _binding_of: dict[str, str] = dataclasses.field(
-        default_factory=dict, init=False, repr=False, compare=False
-    )
-    #: every identifier already bound into scope -- drives alias-on-collision.
-    _used_names: set[str] = dataclasses.field(
-        default_factory=set, init=False, repr=False, compare=False
-    )
-
-    def __post_init__(self) -> None:
-        """Rebuild the collision trackers from any pre-seeded ``items``.
-
-        Bare prelude names are pre-claimed: they render import-free, so any
-        same-leaf ``use`` must be the side that gets aliased.
-        """
-        self._used_names |= C.RUST_PRELUDE_NAMES
-        for use in self.items:
-            self._index(use)
-
-    def _index(self, use: RustUse) -> None:
-        """Register an already-appended ``use`` into the collision trackers."""
-        self._binding_of.setdefault(use.full_name, use.name_in_scope)
-        self._used_names.add(use.name_in_scope)
 
     def record(self, name: str, alias: str | None = None) -> str:
-        """Record a ``use`` (alias-aware, deduped) and return the in-scope name.
+        """Record a ``use`` (deduped by path) and return the in-scope name.
 
         * bare prelude/primitive types (``i64`` / ``bool`` / ``()`` / ``Option``)
           carry no ``::`` -> no ``use`` is recorded and the bare name is returned;
         * a path in :data:`~.consts.RUST_NO_IMPORT_FULLPATH` is rendered
           fully-qualified inline with no ``use`` (avoids shadowing a prelude name
           -- e.g. ``String`` vs ``std::string::String``);
-        * a path already recorded reuses its binding (possibly an alias) rather
-          than emitting a duplicate ``use``;
-        * if a *different* path wants a name already taken (e.g. boilerplate's
-          ``tvm_ffi::object::Object`` and a field's ``tvm_ffi::Object``), the
-          later one is aliased -- ``use tvm_ffi::Object as Object2;`` -- and the
-          alias is returned. This type-vs-type clash is the only ``use`` collision
-          that arises in Rust (function/method names live in a separate namespace,
-          and methods are scoped inside ``impl`` blocks, so they never shadow a
-          ``use``).
+        * a path already recorded reuses its binding rather than emitting a
+          duplicate ``use``;
+        * a *different* path wanting an in-scope name already taken raises
+          :class:`UnsupportedTypeError` -> the enclosing object is skipped.
+          Only pathological type names hit this (e.g. a type key whose leaf is
+          ``Object``); rename the type or hand-write the binding outside the
+          markers.
         """
         probe = RustUse(name, alias=alias)
         if not probe.as_use_line():
             return probe.leaf  # bare prelude/primitive: no import, no tracking.
         if probe.full_name in RUST_NO_IMPORT_FULLPATH:
             return probe.full_name  # rendered fully-qualified inline; no `use`.
-        full = probe.full_name
-        if full in self._binding_of:
-            return self._binding_of[full]  # same path already imported (maybe aliased).
+        # `items` stays small (a handful of `use`s per file): linear scans.
+        for item in self.items:
+            if item.full_name == probe.full_name:
+                return item.name_in_scope  # same path already imported.
         bound = probe.name_in_scope
-        if bound in self._used_names:
-            n = 2
-            while f"{probe.name_in_scope}{n}" in self._used_names:
-                n += 1
-            bound = f"{probe.name_in_scope}{n}"
-        use = probe if bound == probe.name_in_scope else RustUse(full, alias=bound)
-        self.items.append(use)
-        self._index(use)
+        if any(item.name_in_scope == bound for item in self.items):
+            raise UnsupportedTypeError(
+                name, f"`use` name {bound!r} collides with an existing import"
+            )
+        self.items.append(probe)
         return bound
 
 
@@ -200,16 +171,13 @@ def render_rust_type(schema: TypeSchema, ty_render: Callable[[str], str]) -> str
         raise UnsupportedTypeError(origin)
 
     if origin == "Optional":
-        # post_init guarantees exactly one arg.
-        inner_schema = next(iter(args), None)
-        if inner_schema is None:
-            raise ValueError("Optional type requires exactly one argument")
-        inner = render_rust_type(inner_schema, ty_render)
+        assert args  # TypeSchema's post_init guarantees exactly one arg.
+        inner = render_rust_type(args[0], ty_render)
         return f"{ty_render('Optional')}<{inner}>"
 
     if origin == "Array":
-        # post_init guarantees (Any,) when no element type is given.
-        elem = render_rust_type(args[0], ty_render) if args else ty_render("Any")
+        assert args  # TypeSchema's post_init fills a missing element type with (Any,).
+        elem = render_rust_type(args[0], ty_render)
         return f"{ty_render('Array')}<{elem}>"
 
     if origin == "Callable":
@@ -226,20 +194,6 @@ def render_rust_type(schema: TypeSchema, ty_render: Callable[[str], str]) -> str
     return ty_render(origin)
 
 
-def _rust_ident(name: str) -> str:
-    """Make ``name`` a usable Rust identifier (raw-escape keywords).
-
-    Raises :class:`UnsupportedTypeError` for the reserved names that cannot be
-    raw identifiers (``self``/``Self``/``super``/``crate``): no Rust spelling of
-    such a field/method exists, so the enclosing object is skipped.
-    """
-    if name in C.RUST_RAW_IDENT_FORBIDDEN:
-        raise UnsupportedTypeError(name, f"name {name!r} cannot be a Rust identifier")
-    if name in C.RUST_KEYWORDS:
-        return f"r#{name}"
-    return name
-
-
 def _class_is_mutable(info: ObjectInfo) -> tuple[bool, bool]:
     """Return (mutable, mixed) from the fields' read-only flags.
 
@@ -254,15 +208,10 @@ def _class_is_mutable(info: ObjectInfo) -> tuple[bool, bool]:
     return False, True
 
 
-def _deref_impl(ref: str, target: str, field: str, deref: str, derefmut: str) -> list[str]:
-    """Emit `Deref` (+ `DerefMut` unless ``derefmut`` is empty) for `ref` -> `target`.
-
-    ``deref``/``derefmut`` are the traits' in-scope (possibly aliased) names; the
-    method names stay ``deref``/``deref_mut`` regardless -- implementing an
-    aliased trait still defines its real methods.
-    """
+def _deref_impl(ref: str, target: str, field: str, mutable: bool) -> list[str]:
+    """Emit ``Deref`` (+ ``DerefMut`` when ``mutable``) for ``ref`` -> ``target``."""
     out = [
-        f"impl {deref} for {ref} {{",
+        f"impl Deref for {ref} {{",
         f"    type Target = {target};",
         f"    fn deref(&self) -> &{target} {{",
         f"        &self.{field}",
@@ -270,9 +219,9 @@ def _deref_impl(ref: str, target: str, field: str, deref: str, derefmut: str) ->
         "}",
         "",
     ]
-    if derefmut:
+    if mutable:
         out += [
-            f"impl {derefmut} for {ref} {{",
+            f"impl DerefMut for {ref} {{",
             f"    fn deref_mut(&mut self) -> &mut {target} {{",
             f"        &mut self.{field}",
             "    }",
@@ -282,17 +231,15 @@ def _deref_impl(ref: str, target: str, field: str, deref: str, derefmut: str) ->
     return out
 
 
-def _packed_args_expr(
-    params: list[tuple[str, str]], is_member: bool, anyview: str = "AnyView"
-) -> str:
+def _packed_args_expr(params: list[tuple[str, str]], is_member: bool) -> str:
     """Build the ``&[AnyView]`` element list for a packed call.
 
-    ``anyview`` is the in-scope (possibly aliased) name of ``tvm_ffi::AnyView``;
-    param types equal to it are passed through as-is.
+    A param whose type already rendered as ``AnyView`` (a top-level ``Any``
+    argument) is passed through as-is.
     """
-    parts = [f"{anyview}::from(&*self)"] if is_member else []
+    parts = ["AnyView::from(&*self)"] if is_member else []
     for name, ty in params:
-        parts.append(name if ty == anyview else f"{anyview}::from(&{name})")
+        parts.append(name if ty == "AnyView" else f"AnyView::from(&{name})")
     return ", ".join(parts)
 
 

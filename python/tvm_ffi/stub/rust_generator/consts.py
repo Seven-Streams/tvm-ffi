@@ -91,13 +91,6 @@ RUST_SCALAR_BY_SIZE = {
     ("float", 8): "f64",
 }
 
-#: Bare prelude/primitive names the generator renders without any ``use`` (the
-#: bare values above plus the width-narrowed scalars). They are pre-claimed in
-#: the import collector so a differently-pathed type with the same leaf (e.g. a
-#: ``my_pkg.Option`` type key) gets aliased instead of emitting a ``use`` that
-#: silently shadows the prelude name for the whole module.
-RUST_PRELUDE_NAMES = frozenset({"Option", "bool", "()", "i8", "i16", "i32", "i64", "f32", "f64"})
-
 #: Rust paths that must be rendered **fully qualified inline** and emit **no**
 #: ``use``. The sole case is ``tvm_ffi::String``: importing it (``use
 #: tvm_ffi::String;``) shadows the prelude ``std::string::String`` for the whole
@@ -129,17 +122,3 @@ RUST_UNSUPPORTED_ORIGINS = frozenset({"Map", "Dict", "List", "Union"})
 RUST_MOD_MAP = {
     "ffi": "tvm_ffi",
 }
-
-#: Rust strict + reserved keywords that, used as a generated field/method
-#: identifier, need a raw identifier (``r#name``). A few
-#: (``self``/``Self``/``super``/``crate``) cannot be raw identifiers; those make
-#: :func:`.utils._rust_ident` raise so the enclosing object is skipped.
-RUST_KEYWORDS = frozenset(
-    """as break const continue crate dyn else enum extern false fn for if impl in let loop
-    match mod move mut pub ref return static struct super trait true type unsafe use where while
-    async await self Self
-    abstract become box do final gen macro override priv try typeof unsized virtual yield""".split()
-)
-
-#: Rust reserved names that cannot be emitted as raw identifiers.
-RUST_RAW_IDENT_FORBIDDEN = frozenset({"self", "Self", "super", "crate"})

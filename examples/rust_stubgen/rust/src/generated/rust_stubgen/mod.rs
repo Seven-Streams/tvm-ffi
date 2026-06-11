@@ -81,12 +81,12 @@ fn get_type_method(
 use std::ops::Deref;
 use std::ops::DerefMut;
 use tvm_ffi::AnyView;
+use tvm_ffi::Object;
+use tvm_ffi::ObjectArc;
+use tvm_ffi::ObjectCore;
 use tvm_ffi::Result;
 use tvm_ffi::derive::Object as DeriveObject;
 use tvm_ffi::derive::ObjectRef as DeriveObjectRef;
-use tvm_ffi::object::Object;
-use tvm_ffi::object::ObjectArc;
-use tvm_ffi::object::ObjectCore;
 // tvm-ffi-stubgen(end)
 
 // tvm-ffi-stubgen(begin): object/rust_stubgen.IntPair

@@ -194,13 +194,6 @@ class ObjectInfo:
     init_fields: list[InitFieldInfo] = dataclasses.field(default_factory=list)
     has_init: bool = False
     own_field_inits: list[FieldInit] = dataclasses.field(default_factory=list)
-    no_native: bool = False
-    """Opt-out: the type's C++ ``__ffi_init__`` must be dispatched (no native build).
-
-    Set by the ``__ffi_no_native__`` type attribute. Use it for types whose C++
-    constructor does more than field assignment (validation, side effects,
-    derived fields) -- native construction would silently skip that logic.
-    """
 
     @staticmethod
     def from_type_info(type_info: TypeInfo) -> ObjectInfo:
@@ -216,8 +209,6 @@ class ObjectInfo:
         has_init = has_init_method or (
             _lookup_type_attr(type_info.type_index, "__ffi_init__") is not None
         )
-        # Opt-out marker: `refl::TypeAttrDef<T>().attr("__ffi_no_native__", true)`.
-        no_native = bool(_lookup_type_attr(type_info.type_index, "__ffi_no_native__"))
 
         # Walk parent chain (parent-first) to collect all init-eligible fields.
         init_fields: list[InitFieldInfo] = []
@@ -269,7 +260,6 @@ class ObjectInfo:
             parent_type_key=parent_type_key,
             init_fields=init_fields,
             has_init=has_init,
-            no_native=no_native,
             own_field_inits=[
                 FieldInit(
                     name=field.name,
