@@ -16,9 +16,8 @@
 # under the License.
 """Rust code generation for the ``tvm-ffi-stubgen`` tool.
 
-This module owns Rust codegen orchestration. Low-level rendering helpers live in
-``rust_generator.utils`` so the block-generation pipeline here stays focused on
-directive handling and source assembly.
+Codegen orchestration lives here; low-level rendering helpers live in
+``rust_generator.utils``.
 """
 
 from __future__ import annotations
@@ -58,11 +57,10 @@ _STR_ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r", "\t": "\\t"}
 
 
 def _rust_str_lit(value: str) -> str:
-    r"""Render a Python string as a double-quoted Rust string literal.
+    r"""Render a Python string as a Rust string literal.
 
-    Only the escapes a reasonable default needs (``\`` ``"`` ``\n`` ``\r``
-    ``\t``) are handled; other control characters are passed through verbatim
-    (a default containing them is not supported).
+    Escapes ``\`` ``"`` ``\n`` ``\r`` ``\t``; other control characters are not
+    supported and pass through verbatim.
     """
     body = "".join(_STR_ESCAPES.get(ch, ch) for ch in value)
     return f'"{body}"'
@@ -71,9 +69,7 @@ def _rust_str_lit(value: str) -> str:
 def _render_scalar_default(value: object) -> str | None:
     """Render a bool/int/float default as a Rust literal, or ``None`` otherwise.
 
-    Bare int/float/bool literals rely on struct-literal type inference (no width
-    suffix needed). ``bool`` must precede ``int`` (Python ``bool`` is an ``int``
-    subclass).
+    ``bool`` must be checked before ``int`` (Python ``bool`` subclasses ``int``).
     """
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -94,17 +90,10 @@ def _render_default(
 ) -> str | None:
     """Render a field's default as a Rust expression, or ``None`` if not renderable.
 
-    Only *trivially constructible* defaults are renderable: a concrete scalar or
-    string. A factory default (mutable container), a ``None`` default, or a
-    missing/object default returns ``None`` -> the caller falls back to the FFI
-    ``__ffi_init__`` path. (A ``None`` default could only fill an ``Optional``
-    field, and any ``Optional`` field already forces the FFI fallback -- see
-    :data:`~.consts.RUST_NATIVE_UNSAFE_ORIGINS`.)
-
-    Non-finite floats have no bare literal (``inf`` does not compile) and render
-    as the typed constants ``<ty>::INFINITY`` / ``NEG_INFINITY`` / ``NAN``, so
-    ``render_type`` must produce the *width-correct* scalar type for directly
-    laid-out fields (``f32`` vs ``f64`` -- i.e. ``render_struct_field``).
+    Only concrete scalar/string defaults render; anything else (factory, ``None``,
+    missing) returns ``None`` and the caller falls back to the FFI ``__ffi_init__``
+    path. Non-finite floats render as typed constants (``f32::INFINITY`` etc.), so
+    ``render_type`` must produce the width-correct scalar type.
     """
     if fi.has_factory or not fi.has_default or fi.default is None:
         return None
@@ -122,31 +111,19 @@ def _render_default(
 def _info_native_eligible(info: ObjectInfo) -> bool:
     """Decide whether ``info`` can be constructed natively (no FFI ``__ffi_init__``).
 
-    Both construction paths are emitted as ``ffi_new`` (the generated constructor;
-    a user who wants faithful C++ semantics hand-writes ``new``, outside the
-    markers, delegating to ``ffi_new``). The native path allocates the struct
-    directly: a derived type's ``ffi_new`` takes the already-built parent value as
-    a single ``base: <Parent>Obj`` parameter (a root type omits it) followed by
-    the *own* init fields, in declaration order, with own non-init fields taking a
-    rendered default. The ``param_i`` <-> ``field_i`` correspondence is **assumed**,
-    not verified: a C++ constructor that validates, derives extra fields, or has
-    side effects is silently bypassed -- that is the opted-in behavior.
-
-    Native is therefore used whenever it is *possible*. It falls back to the FFI
-    ``__ffi_init__`` path only when native construction genuinely cannot reproduce
-    the object: an own field's top-level type is not memory-safe to write natively
-    (``Optional`` / ``tuple`` -- see :data:`~.consts.RUST_NATIVE_UNSAFE_ORIGINS`);
-    a parent is itself non-native (then no ``<Parent>Obj::ffi_new`` exists to
-    build the ``base`` argument); or an own non-init field lacks a statically
-    renderable default.
+    The native ``ffi_new`` allocates the struct directly, binding fields from its
+    parameters and silently bypassing any C++ constructor logic -- that is the
+    opted-in behavior, so native is used whenever possible. The FFI path remains
+    only when an own field is not memory-safe to write natively
+    (:data:`~.consts.RUST_NATIVE_UNSAFE_ORIGINS`), a parent is itself non-native,
+    or an own non-init field has no renderable default.
     """
     if not info.has_init or any(f.origin in C_RUST.RUST_NATIVE_UNSAFE_ORIGINS for f in info.fields):
         return False
     parent = info.parent_type_key
     if parent not in (None, "ffi.Object") and not _native_eligible(parent):
         return False
-    # `fields` and `own_field_inits` are built from the same `type_info.fields`
-    # list, so direct indexing is safe (a mismatch is a bug -> fail fast).
+    # `fields` and `own_field_inits` share a source; a missing key is a bug.
     schema_of = {f.name: f for f in info.fields}
     init_names = {f.name for f in info.init_fields}
     for fi in info.own_field_inits:
@@ -158,13 +135,10 @@ def _info_native_eligible(info: ObjectInfo) -> bool:
 
 
 def _native_eligible(type_key: str) -> bool:
-    """Type-key keyed wrapper of :func:`_info_native_eligible` (parent recursion).
+    """Type-key wrapper of :func:`_info_native_eligible` (parent recursion).
 
-    A parent that cannot be characterized (lookup or schema parsing fails) is
-    reported and treated as non-native -- the child then dispatches the FFI
-    ``__ffi_init__``, which works regardless. Deliberately uncached: ancestor
-    chains are short, and a cache would pin the first answer for the lifetime
-    of the process (stale across registry changes, e.g. between test cases).
+    A type that cannot be resolved is warned about and treated as non-native.
+    Deliberately uncached: a cache would go stale across registry changes.
     """
     try:
         info = object_info_from_type_key(type_key)
@@ -179,13 +153,10 @@ def _native_eligible(type_key: str) -> bool:
 
 
 def _has_native_child(type_key: str) -> bool:
-    """Whether any *registered* type derives from ``type_key`` and is itself native.
+    """Whether any registered type derives from ``type_key`` and is itself native.
 
-    Such a child's native ``ffi_new`` takes ``base: <Self>Obj``, and the only way
-    a caller can produce that bare value is this type's ``<Self>Obj::ffi_new``
-    builder -- so the builder is emitted exactly for these parent types. Every
-    other type (in particular an ordinary root that nobody derives from) keeps
-    the builder-free shape: a single ``impl`` on the ref with the inline literal.
+    Only such parents need the bare-struct ``<Self>Obj::ffi_new`` builder -- it
+    is the only way a child's ``base:`` argument can be produced.
     """
     for child_key in GetRegisteredTypeKeys():
         try:
@@ -198,13 +169,11 @@ def _has_native_child(type_key: str) -> bool:
 
 
 def _layout_fields(fields: list[NamedTypeSchema]) -> list[NamedTypeSchema]:
-    """Own fields in C++ memory order (reflection ``offset``), not registration order.
+    """Sort own fields by reflection ``offset`` (C++ memory order).
 
-    Reflection stores fields in *registration* order (the ``def_field`` call
-    sequence), which need not match the C++ declaration (memory) order. The
-    generated ``#[repr(C)]`` struct lays fields out positionally, so it must
-    emit them sorted by their recorded byte offset. Fields without an offset
-    (synthetic ``ObjectInfo``s in tests) keep registration order.
+    Registration order need not match memory order, but the ``#[repr(C)]``
+    struct is positional. Fields without an offset (synthetic ``ObjectInfo``s
+    in tests) keep registration order.
     """
     if any(f.offset is None for f in fields):
         return list(fields)
@@ -214,19 +183,12 @@ def _layout_fields(fields: list[NamedTypeSchema]) -> list[NamedTypeSchema]:
 def _warn_offset_mismatch(type_key: str | None, fields: list[NamedTypeSchema]) -> None:
     """Warn when ``#[repr(C)]`` cannot reproduce the recorded field offsets.
 
-    Walks the offset-sorted fields and recomputes where ``#[repr(C)]`` would
-    place each one: the previous field's end, rounded up to the field's
-    alignment. Reflection records ``size`` but not ``alignof``, so alignment is
-    approximated as the largest power of two dividing ``size``, capped at 8 --
-    exact for scalars (align == size) and pointer-based renders, but it
-    over-estimates composite FFI structs (``DLDevice`` is size 8 / align 4,
-    ``DLDataType`` size 4 / align 2), which can yield a false-positive warning
-    for a perfectly valid layout. A mismatch means the generated struct *may*
-    read/write that field at the wrong address (e.g. an unregistered C++ member
-    leaves a hole the Rust layout won't reproduce); the binding is still
-    emitted, so only warn. A field without offset/size metadata cannot be
-    checked and is skipped -- and the field after it has no known predecessor
-    end, so checking resumes one field later.
+    Recomputes each field's ``#[repr(C)]`` placement from the previous field's
+    end. Reflection has no ``alignof``, so alignment is approximated from
+    ``size`` (largest power of two, capped at 8) -- exact for scalars, but
+    composite FFI structs like ``DLDevice`` can trigger a false positive. A
+    mismatch only warns; the binding is still emitted. Fields without
+    offset/size metadata are skipped and reset the running position.
     """
     prev_end: int | None = None
     for field in fields:
@@ -252,13 +214,8 @@ def _warn_offset_mismatch(type_key: str | None, fields: list[NamedTypeSchema]) -
 class _ObjectRenderer:
     """Renders one ``object/<key>`` block into Rust source lines.
 
-    Bundles the per-object rendering environment -- the import collector, the
-    ``ty_map``, the resolved struct/ref identifiers, and the mutability shape --
-    that is invariant across the whole of one object's rendering. Holding it as
-    state (rather than threading it through every helper signature) keeps the
-    method signatures small and makes adding new render context a one-field
-    change. The type-render entry points (:meth:`render_field` /
-    :meth:`render_param`) feed the stateless :func:`.utils.render_rust_type` seam.
+    Holds the per-object rendering context (imports, ``ty_map``, resolved
+    names, mutability) so helper methods don't have to thread it through.
     """
 
     info: ObjectInfo
@@ -271,12 +228,11 @@ class _ObjectRenderer:
     ty_map: dict[str, str]
 
     def _ty_render(self, origin: str) -> str:
-        """Resolve a leaf origin to its Rust leaf name and record its ``use``.
+        """Resolve a leaf origin to its Rust name and record its ``use``.
 
-        Only dotted names (object type keys like ``my_pkg.Foo``) may pass through
-        unmapped; an unmapped *bare* origin (e.g. ``const char*``) has no Rust
-        rendering and would otherwise be emitted verbatim as invalid source, so
-        it raises and the enclosing object is skipped.
+        Unmapped dotted names (object type keys) pass through; an unmapped bare
+        origin (e.g. ``const char*``) has no Rust rendering and raises, which
+        skips the enclosing object.
         """
         mapped = self.ty_map.get(origin)
         if mapped is None:
@@ -292,12 +248,10 @@ class _ObjectRenderer:
     def render_struct_field(self, schema: NamedTypeSchema) -> str:
         """Render a directly-laid-out struct field type, width-correct for scalars.
 
-        The ``#[repr(C)]`` struct (and the native ``ffi_new`` parameters that bind
-        straight into it) accesses fields at their real C++ offsets, so an
-        ``int32_t`` field must render as ``i32``, not the schema-erased default
-        ``i64``. The width comes from reflection's per-field ``sizeof(T)``
-        (:attr:`NamedTypeSchema.size`); schemas without one (or non-scalar
-        origins) fall through to the ordinary :meth:`render_field`.
+        An ``int32_t`` field must render as ``i32``, not the schema-erased
+        default ``i64``; the width comes from reflection's per-field ``size``.
+        Non-scalar origins (or schemas without a size) fall through to
+        :meth:`render_field`.
         """
         narrowed = C_RUST.RUST_SCALAR_BY_SIZE.get((schema.origin, schema.size))
         return narrowed if narrowed is not None else self.render_field(schema)
@@ -310,32 +264,26 @@ class _ObjectRenderer:
 
     def body(self) -> list[str]:
         """Build the Rust source lines for the object (raises on unsupported types)."""
-        # Boilerplate `use`s the generated items rely on, recorded through the
-        # same collector as field types: a pathological user type whose leaf
-        # collides with one of them raises and skips the object (see
-        # `RustImports.record`). The derive macros carry fixed aliases -- their
-        # leaves collide with `tvm_ffi::Object`/`ObjectRef` by construction.
+        # Boilerplate `use`s, recorded through the same collector as field types
+        # so leaf collisions raise and skip the object. The derive imports need
+        # aliases: their leaves collide with `tvm_ffi::Object`/`ObjectRef`.
         self.imports.record("std::ops::Deref")
-        # `ObjectCore` only needs to be in scope so the generated
-        # `<T>Obj::type_index()` trait-method calls resolve.
+        # `ObjectCore` must be in scope for the generated `type_index()` calls.
         self.imports.record("tvm_ffi::ObjectCore")
         self.imports.record("tvm_ffi::ObjectArc")
         self.imports.record("tvm_ffi::derive::Object", alias="DeriveObject")
         self.imports.record("tvm_ffi::derive::ObjectRef", alias="DeriveObjectRef")
         if self.is_root:
-            # The crate-root re-export: the same path the ty_map uses for
-            # `Object`/`ffi.Object` fields, so such a field dedups against the
-            # boilerplate instead of colliding with it.
+            # Same path the ty_map uses for `Object` fields, so they dedup
+            # instead of colliding.
             self.base_type = self.imports.record("tvm_ffi::Object")
         if self.mutable:
             self.imports.record("std::ops::DerefMut")
 
         leaf, obj_struct, base_type = self.leaf, self.obj_struct, self.base_type
         lines: list[str] = []
-        # The `ObjectCore` impl (TYPE_KEY / per-class static `type_index` /
-        # `object_header_mut`) is folded into the `#[derive(Object)]` proc macro,
-        # which derives `object_header_mut` from the first field and caches the
-        # type index in a per-type static -- no shared hashmap lookup.
+        # TYPE_KEY / `type_index` / `object_header_mut` all come from the
+        # `#[derive(Object)]` proc macro.
         lines += [
             "#[repr(C)]",
             "#[derive(DeriveObject)]",
@@ -360,12 +308,9 @@ class _ObjectRenderer:
         if not self.is_root:
             lines += _deref_impl(obj_struct, base_type, "base", self.mutable)
 
-        # Native (FFI-free) construction whenever possible (the whole inheritance
-        # chain must be eligible -- see `_info_native_eligible`). Otherwise the
-        # reflected `__ffi_init__` is dispatched as before. The bare-struct
-        # builder is an extra that only types with native children need (their
-        # `base` argument is constructible no other way); everything else keeps
-        # the single-`impl`, builder-free shape.
+        # Native (FFI-free) construction whenever the whole chain is eligible;
+        # otherwise dispatch the reflected `__ffi_init__`. The bare-struct
+        # builder is only needed by types with native children.
         native = _info_native_eligible(self.info)
         if native and _has_native_child(self.info.type_key or ""):
             lines += self._obj_new_fn_native()
@@ -407,11 +352,9 @@ class _ObjectRenderer:
     def _native_params(self) -> list[tuple[str, str]]:
         """Native ``ffi_new`` parameter list: ``base`` (derived only) + own init fields.
 
-        Unlike the FFI path (which must pass every flattened ancestor init field
-        through ``__ffi_init__``), the native signature takes the already-built
-        parent value as a single ``base: <Parent>Obj`` parameter -- a root type
-        omits it (its base is always ``Object::new()``). The caller builds the
-        ``base`` argument with the parent's own ``<Parent>Obj::ffi_new``.
+        Unlike the FFI path, ancestor init fields are not flattened in: the
+        caller passes an already-built ``base: <Parent>Obj`` (from the parent's
+        ``<Parent>Obj::ffi_new``); a root type omits it.
         """
         params: list[tuple[str, str]] = []
         if not self.is_root:
@@ -423,34 +366,25 @@ class _ObjectRenderer:
         return params
 
     def _struct_literal_lines(self) -> list[str]:
-        """Render the flat inline ``<Obj> { .. }`` struct literal for this object.
+        """Render the inline ``<Obj> { .. }`` struct literal, as source lines.
 
-        Mirrors the crate's own native construction idiom (e.g.
-        ``TensorObjFromNDAlloc { base: TensorObj { object: Object::new(), .. } }``
-        in ``collections/tensor.rs``). A root bottoms out at ``Object::new()``; a
-        derived type binds the in-scope ``base`` parameter (field-init shorthand)
-        -- ancestors are never inlined. Own init fields bind from the in-scope
-        ``ffi_new`` parameters (which carry the field names); own non-init fields
-        take their rendered defaults. Returned as lines:
-        ``["<Obj> {", "    base: ..", .., "}"]``.
+        A root bottoms out at ``Object::new()``; a derived type binds the
+        in-scope ``base`` parameter. Init fields bind from the like-named
+        ``ffi_new`` parameters; non-init fields take their rendered defaults.
         """
         lines = [f"{self.obj_struct} {{"]
         if self.is_root:
-            # For a root, `base_type` is the in-scope name of `tvm_ffi::Object`,
-            # recorded in :meth:`body`.
             lines.append(f"    base: {self.base_type}::new(),")
         else:
             lines.append("    base,")  # shorthand: the `base` parameter
         init_names = {f.name for f in self.info.init_fields}
         field_inits = {f.name: f for f in self.info.own_field_inits}
-        # Struct-literal entries bind by name, so order is semantically free;
-        # memory order is used to mirror the struct definition.
+        # Entries bind by name; memory order just mirrors the struct definition.
         for field in _layout_fields(self.info.fields):
             if field.name in init_names:
                 lines.append(f"    {field.name},")  # shorthand: param name == field name
             else:
-                # `render_struct_field`, not `render_field`: a non-finite float
-                # default renders as a typed constant (`f32::INFINITY`), which
+                # `render_struct_field`: a non-finite default (`f32::INFINITY`)
                 # must match the width-narrowed field type.
                 default = _render_default(field_inits[field.name], field, self.render_struct_field)
                 lines.append(f"    {field.name}: {default},")
@@ -460,11 +394,8 @@ class _ObjectRenderer:
     def _obj_new_fn_native(self) -> list[str]:
         """Emit ``impl <T>Obj { pub fn ffi_new(..) -> Self }`` -- the bare-struct builder.
 
-        Builds the struct *value* only (no allocation), with the same signature
-        as the ref-level ``ffi_new``. Emitted ONLY for types some native child
-        derives from (see :func:`_has_native_child`): its output is what the
-        child's ``ffi_new`` takes as ``base``. Types without native children
-        never get this extra ``impl``.
+        Builds the struct value only (no allocation); emitted only for types
+        with native children, whose ``ffi_new`` takes this output as ``base``.
         """
         params = self._native_params()
         sig = ", ".join(f"{n}: {t}" for n, t in params)
@@ -481,15 +412,11 @@ class _ObjectRenderer:
     def _new_fn_native(self) -> list[str]:
         """Emit `fn ffi_new(..) -> Result<Self>` that allocates the object natively.
 
-        No FFI round-trip: a single inline struct literal (built by
-        :meth:`_struct_literal_lines`) is handed to `ObjectArc::new`, which writes
-        the object header + Rust deleter. The `Result` wrapper is kept for
-        signature parity with the FFI path -- the body is infallible (`Ok(..)`).
-
-        Named ``ffi_new`` (not ``new``): it binds fields directly and bypasses any
-        C++ constructor logic (validation / derived fields / side effects). A user
-        who needs the faithful semantics hand-writes ``new`` (outside the stubgen
-        markers) delegating to this ``ffi_new``.
+        No FFI round-trip: the struct literal goes straight to `ObjectArc::new`.
+        The `Result` is kept for signature parity with the FFI path. Named
+        ``ffi_new`` (not ``new``) because it bypasses any C++ constructor logic;
+        a user who needs faithful semantics hand-writes ``new`` (outside the
+        markers) delegating to it.
         """
         params = self._native_params()
         sig = ", ".join(f"{n}: {t}" for n, t in params)
@@ -527,10 +454,8 @@ class _ObjectRenderer:
     def _cached_getter_lines(self, fvar: str, ffi_name: str) -> list[str]:
         """Body lines binding ``fvar`` to the reflected method, cached per call site.
 
-        Each generated function owns a ``thread_local!`` ``OnceCell`` so the
-        method-table scan in ``get_type_method`` runs once per thread instead of
-        on every call. (``Function`` is not ``Sync``, so a process-wide
-        ``OnceLock`` cannot hold it.)
+        A ``thread_local!`` ``OnceCell`` makes the method-table scan run once
+        per thread (``Function`` is not ``Sync``, ruling out a ``OnceLock``).
         """
         cell = fvar.upper()
         return [
@@ -574,15 +499,11 @@ def generate_rust_object(
 ) -> None:
     """Emit a Rust ``struct``/``impl`` binding for an ``object/<key>`` block.
 
-    Emits the standard binding shape: ``<T>Obj`` (``#[repr(C)]``,
-    ``#[derive(Object)]``, parent embedded as ``base``), the ``<T>`` ref (wrapping
-    ``ObjectArc``), ``Deref``/``DerefMut`` (the latter only for mutable classes),
-    and ``impl <T>`` with an ``ffi_new`` constructor + reflected methods.
-
-    Raises :class:`~..utils.UnsupportedTypeError` when the object uses a type the
-    crate cannot represent; ``cli`` catches it and skips the block. A raise may
-    leave already-recorded ``use``s behind in ``imports`` -- harmless, generated
-    files open with ``#![allow(unused_imports)]``.
+    Emits ``<T>Obj`` (``#[repr(C)]``, parent embedded as ``base``), the ``<T>``
+    ref wrapper, ``Deref``/``DerefMut``, and ``impl <T>`` with ``ffi_new`` plus
+    the reflected methods. Raises :class:`UnsupportedTypeError` for types the
+    crate cannot represent; ``cli`` catches it and skips the block (any ``use``s
+    already recorded are harmless -- generated files allow unused imports).
     """
     assert len(code.lines) >= 2
     type_key = obj_info.type_key
@@ -638,14 +559,11 @@ def generate_rust_import_section(
 ) -> None:
     """Render the collected ``use`` statements into an ``import-section`` block.
 
-    Imports whose target is a type *defined in this same file* are dropped
-    (``RustUse.full_name in defined_types``) -- you don't ``use`` what you
-    define locally. The remaining uses are deduped and sorted for a stable,
-    one-per-line rendering (Rust has no ``TYPE_CHECKING`` split).
+    Imports for types defined in this same file are dropped; the rest are
+    deduped and sorted.
     """
     assert len(code.lines) >= 2
-    # `RustImports.record` never admits a bare / no-import type into `items`, so
-    # every `as_use_line()` here is a real, non-empty `use` line.
+    # `record` never admits bare types, so every `as_use_line()` is non-empty.
     use_lines = sorted(
         {item.as_use_line() for item in imports.items if item.full_name not in defined_types}
     )
@@ -660,13 +578,10 @@ def generate_rust_import_section(
 
 # --- whole-file scaffolding (`--init` mode) ---------------------------------
 
-#: Shared per-file helper functions. Written fully-qualified with
-#: zero `use`s so they never clash with the import-section block (which carries
-#: every object-driven `use`). `get_type_method` pulls a reflected method off the
-#: type's method table; the type index is resolved by each object's
-#: `#[derive(Object)]`-generated per-class static (no shared hashmap lookup).
-#: `get_type_method_cached` fronts it with a per-call-site `thread_local!`
-#: `OnceCell` so the linear method-table scan runs once per thread.
+#: Shared per-file helpers, written fully-qualified (zero `use`s) so they never
+#: clash with the import-section block. `get_type_method` scans the type's
+#: method table; `get_type_method_cached` fronts it with a per-call-site
+#: `thread_local!` `OnceCell`.
 _RUST_HELPERS = """fn get_type_method_cached(
     cell: &'static std::thread::LocalKey<std::cell::OnceCell<tvm_ffi::Function>>,
     type_index: i32,
@@ -732,18 +647,13 @@ def generate_rust_api_file(
     is_new_file: bool = True,
     syntax: C.MarkerSyntax = C.RUST_SYNTAX,
 ) -> str:
-    """Scaffold a single Rust binding file (option A: one file per module prefix).
+    """Scaffold a single Rust binding file (one file per module prefix).
 
-    Only a genuinely new/empty file (``is_new_file``) gets the ``#![allow(...)]``
-    header: it is an inner attribute that must precede every item, so appending
-    it to a pre-existing file (e.g. an intermediate ``mod.rs`` holding ``pub
-    mod`` lines but no markers) would not compile. A ``helpers`` marker block
-    (filled by :func:`generate_rust_helpers` during stage processing with the
-    shared support functions), an ``import-section`` marker, and an
-    ``object/<type_key>`` marker per registered type are added if missing. Putting
-    the helpers in a marker means they are (re)generated on every run -- even into
-    a pre-existing file -- rather than only when the file is brand new. No
-    ``global``/``__all__``/``export`` blocks are emitted.
+    Only a genuinely new file gets the ``#![allow(...)]`` header: an inner
+    attribute appended to a pre-existing file would not compile. Missing
+    ``helpers`` / ``import-section`` / ``object/<type_key>`` marker blocks are
+    appended; keeping the helpers in a marker means they are regenerated on
+    every run, not just for brand-new files.
     """
     append = ""
     if is_new_file:
@@ -793,14 +703,10 @@ def generate_rust_init(
 def finalize_rust_module_tree(init_path: Path, prefixes: set[str]) -> None:
     """Stitch the generated tree under ``init_path`` into a valid Rust module tree.
 
-    For every generated prefix (e.g. ``a.b.c``) and each of its ancestor dirs,
-    ensure the parent's ``mod.rs`` declares ``pub mod <child>;`` -- creating
-    intermediate ``mod.rs`` files for prefixes that hold no types themselves, and
-    a root ``init_path/mod.rs`` declaring the top-level modules. Declarations are
-    idempotent (appended only when absent).
-
-    The only thing left to the user is one ``mod``/``pub mod`` line at their crate
-    root mounting ``init_path`` (stubgen cannot safely edit ``lib.rs``/``main.rs``).
+    Ensures every generated prefix is declared via ``pub mod`` in its parent's
+    ``mod.rs``, creating intermediate ``mod.rs`` files as needed; declarations
+    are appended only when absent. The user still mounts ``init_path`` with one
+    ``mod`` line at the crate root (stubgen does not edit ``lib.rs``/``main.rs``).
     """
     children: dict[Path, set[str]] = {}
     for prefix in prefixes:
