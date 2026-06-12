@@ -40,14 +40,20 @@ fn main() -> Result<()> {
     // Keep it alive for as long as the bindings are used.
     let _lib = Module::load_from_file(lib_path())?;
 
-    println!("=========== Example 1: construct via ffi_new ===========");
-    let mut pair = IntPair::ffi_new(1, 2)?;
-    println!("a={}, b={}", pair.a, pair.b);
+    println!("=========== Example 1: construct via the generated builder ===========");
+    // Every field is set through its like-named setter; `scale` defaults to 1
+    // and may be omitted, while leaving `a` or `b` unset makes `build()` fail.
+    let mut pair = IntPair::ffi_new().a(1).b(2).build()?;
+    println!("a={}, b={}, scale={}", pair.a, pair.b, pair.scale);
 
     println!("=========== Example 2: call a C++ method ===========");
     println!("sum={}", pair.sum()?);
 
-    println!("=========== Example 3: write a field through DerefMut ===========");
+    println!("=========== Example 3: override a defaulted field via its setter ===========");
+    let mut scaled = IntPair::ffi_new().a(1).b(2).scale(10).build()?;
+    println!("scale=10: sum={}", scaled.sum()?);
+
+    println!("=========== Example 4: write a field through DerefMut ===========");
     pair.a = 10;
     println!("after pair.a = 10: sum={}", pair.sum()?);
 

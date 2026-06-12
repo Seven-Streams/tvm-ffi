@@ -280,13 +280,15 @@ Key Features
 
 - Generate Rust code for registered C++ classes automatically (via CLI or CMake).
 - Mirror the C++ memory layout exactly in Rust.
-- Provide Rust-native memberwise constructors for registered classes.
+- Provide Rust-native builder-style constructors for registered classes, with
+  reflected default values prefilled and overridable through setters.
 - Expose methods of registered classes through cross-language calls.
 
 Generation Output
 ~~~~~~~~~~~~~~~~~
 
-For the type ``IntPair``, the generated Rust code looks like this:
+For the type ``IntPair`` (fields ``a`` / ``b``, plus ``scale`` registered with
+``refl::default_value(1)``), the generated Rust code looks like this:
 
 .. code-block:: rust
 
@@ -297,6 +299,7 @@ For the type ``IntPair``, the generated Rust code looks like this:
        base: Object,   // the parent type (or `tvm_ffi::Object` if no parent), embedded as the first field
        pub a: i64,     // fields are public: read (and write, if mutable) via `Deref`/`DerefMut`
        pub b: i64,
+       pub scale: i64,
    }
 
    #[repr(C)]
@@ -306,14 +309,50 @@ For the type ``IntPair``, the generated Rust code looks like this:
    }
 
    impl IntPair {
-       /// Native (FFI-free) construction: allocates the struct and binds fields directly.
-       pub fn ffi_new(a: i64, b: i64) -> Result<Self> { /* ... */ }
+       /// Native (FFI-free) construction: opens the builder. `scale` starts
+       /// prefilled with its reflected default (`1`); `a` / `b` start unset.
+       pub fn ffi_new() -> IntPairBuilder { /* ... */ }
+   }
+
+   pub struct IntPairBuilder { /* base + every own field */ }
+
+   impl IntPairBuilder {
+       /// One consuming setter per field -- one uniform API.
+       pub fn a(mut self, a: i64) -> Self { /* ... */ }
+       pub fn b(mut self, b: i64) -> Self { /* ... */ }
+       pub fn scale(mut self, scale: i64) -> Self { /* ... */ }
+       /// Allocates the object (`ObjectArc::new`); errors if a field without
+       /// a default is still unset.
+       pub fn build(self) -> Result<IntPair> { /* ... */ }
    }
 
 The object has the same memory layout as its C++ counterpart. Users can create new objects
-on the Rust side and call the methods defined in C++. Stubgen will also generate a
-Rust-native memberwise constructor ``ffi_new`` automatically, and users can build their own
-``new`` constructors on top of it.
+on the Rust side and call the methods defined in C++:
+
+.. code-block:: rust
+
+   let pair = IntPair::ffi_new().a(1).b(2).build()?;             // scale = 1 (default)
+   let scaled = IntPair::ffi_new().a(1).b(2).scale(10).build()?; // override via setter
+   let err = IntPair::ffi_new().a(1).build();                    // Err: field `b` is not set
+
+Construction is fully Rust-native and the API is uniform: every own field is
+set through its like-named consuming setter. Fields with a
+``refl::default_value`` are rendered as Rust literals at stub-generation time
+and prefilled in the builder; fields without a default start unset, and
+``build()`` returns an error if any is still missing. The builder deliberately
+bypasses any C++ constructor logic; users who need the faithful C++ semantics
+can hand-write a ``new`` constructor (outside the generated markers) on top of
+the builder. When some registered type derives from this one, the builder
+additionally gets a ``build_obj`` method returning the bare ``IntPairObj``
+value, which the derived type's ``ffi_new`` takes as its ``base`` argument
+(the only ``ffi_new`` parameter).
+
+A constructor cannot be generated when a field has no layout-compatible Rust
+rendering (top-level ``Optional`` / ``tuple``), when a default comes from a
+``refl::default_factory``, or when a default value has no Rust literal
+rendering: such types are emitted without ``ffi_new`` (a warning explains why),
+and construction stays on the C++ side -- e.g. through a ``def_static``
+factory.
 
 .. _sec-stubgen-advanced:
 

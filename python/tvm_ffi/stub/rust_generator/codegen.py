@@ -23,9 +23,11 @@ Codegen orchestration lives here; low-level rendering helpers live in
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 
 from tvm_ffi._ffi_api import GetRegisteredTypeKeys
+from tvm_ffi.core import MISSING
 
 from .. import consts as C
 from ..lib_state import object_info_from_type_key
@@ -51,22 +53,68 @@ if TYPE_CHECKING:
 # --- native (FFI-free) construction eligibility ------------------------------
 
 
-def _info_native_eligible(info: ObjectInfo) -> bool:
-    """Decide whether ``info`` can be constructed natively (no FFI ``__ffi_init__``).
+def _rust_string_literal(s: str) -> str:
+    """Escape ``s`` as a double-quoted Rust string literal."""
+    out = ['"']
+    for ch in s:
+        if ch in ('"', "\\"):
+            out.append("\\" + ch)
+        elif ch.isprintable():
+            out.append(ch)
+        else:
+            out.append(f"\\u{{{ord(ch):x}}}")
+    out.append('"')
+    return "".join(out)
 
-    The native ``ffi_new`` allocates the struct directly, binding EVERY own
-    field from a like-named parameter and silently bypassing any C++
-    constructor logic -- that is the opted-in behavior, so native is used
-    whenever possible. Defaults are deliberately never materialized in Rust:
-    an ``init(false)`` field simply becomes one more parameter. The FFI path
-    remains only when an own field is not memory-safe to write natively
-    (:data:`~.consts.RUST_NATIVE_UNSAFE_ORIGINS`) or a parent is itself
-    non-native.
+
+def _default_expr(field: NamedTypeSchema) -> str | None:
+    """Render ``field``'s registered default as a Rust expression (``None``: can't).
+
+    Only values whose Rust spelling is self-evident are supported: ``bool`` /
+    ``int`` / finite ``float`` literals (which coerce to the field's possibly
+    narrowed scalar type in the struct-literal position) and ``str`` (which
+    becomes a ``tvm_ffi::String``). Anything else -- objects, containers,
+    non-finite floats, factories -- has no native materialization.
     """
-    if not info.has_init or any(f.origin in C_RUST.RUST_NATIVE_UNSAFE_ORIGINS for f in info.fields):
-        return False
+    value = field.default
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return repr(value)
+    if isinstance(value, float):
+        return repr(value) if math.isfinite(value) else None
+    if isinstance(value, str):
+        return f"tvm_ffi::String::from({_rust_string_literal(value)})"
+    return None
+
+
+def _native_blocker(info: ObjectInfo) -> str | None:
+    """Why ``info`` cannot be constructed natively; ``None`` when it can.
+
+    The native builder allocates the struct directly, binding every own
+    field from its setter or a stubgen-rendered default and silently
+    bypassing any C++ constructor logic -- that is the opted-in behavior, so
+    native is used whenever possible. There is no FFI fallback: a blocked
+    type gets no generated constructor at all (the user hand-writes one).
+    """
+    if not info.has_init:
+        return "the type has no reflected constructor"
+    for field in info.fields:
+        if field.origin in C_RUST.RUST_NATIVE_UNSAFE_ORIGINS:
+            return f"field {field.name!r} has no layout-compatible Rust rendering"
+        if field.default_is_factory:
+            return f"field {field.name!r} uses a default factory (FFI-only)"
+        if field.default is not MISSING and _default_expr(field) is None:
+            return f"the default value of field {field.name!r} has no Rust rendering"
     parent = info.parent_type_key
-    return parent in (None, "ffi.Object") or _native_eligible(parent)
+    if parent in (None, "ffi.Object") or _native_eligible(parent):
+        return None
+    return f"parent {parent!r} is not natively constructible"
+
+
+def _info_native_eligible(info: ObjectInfo) -> bool:
+    """Whether ``info`` can be constructed natively (see :func:`_native_blocker`)."""
+    return _native_blocker(info) is None
 
 
 def _native_eligible(type_key: str) -> bool:
@@ -80,7 +128,7 @@ def _native_eligible(type_key: str) -> bool:
     except Exception as e:  # any failure means "cannot prove native-safe"
         print(
             f"{C.TERM_YELLOW}[Warning] cannot resolve type {type_key!r} for native "
-            f"construction ({type(e).__name__}: {e}); using the FFI constructor"
+            f"construction ({type(e).__name__}: {e}); treating it as non-native"
             f"{C.TERM_RESET}"
         )
         return False
@@ -90,8 +138,8 @@ def _native_eligible(type_key: str) -> bool:
 def _has_native_child(type_key: str) -> bool:
     """Whether any registered type derives from ``type_key`` and is itself native.
 
-    Only such parents need the bare-struct ``<Self>Obj::ffi_new`` builder -- it
-    is the only way a child's ``base:`` argument can be produced.
+    Only such parents need ``build_obj`` on their builder (the bare struct
+    value) -- it is the only way a child's ``base:`` argument can be produced.
     """
     for child_key in GetRegisteredTypeKeys():
         try:
@@ -237,30 +285,33 @@ class _ObjectRenderer:
             lines += _deref_impl(obj_struct, base_type, "base", self.info.mutable)
 
         # Native (FFI-free) construction whenever the whole chain is eligible;
-        # otherwise dispatch the reflected `__ffi_init__`.
-        native = _info_native_eligible(self.info)
-        if native and _has_native_child(self.info.type_key or ""):
-            lines += self._obj_new_fn_native()
+        # there is no FFI fallback -- a blocked constructor is skipped loudly.
+        blocker = _native_blocker(self.info)
+        native = blocker is None
+        if self.info.has_init and not native:
+            print(
+                f"{C.TERM_YELLOW}[Warning] object {self.info.type_key}: skipping "
+                f"`ffi_new` because {blocker}; hand-write a constructor outside "
+                f"the generated markers{C.TERM_RESET}"
+            )
         lines += self._impl_block(native)
+        if native:
+            lines += self._builder_lines()
 
         lines.pop()  # every section above ends with a `""` separator
         return lines
 
     def _impl_block(self, native: bool) -> list[str]:
-        """Emit `impl <T> { new; methods }`; empty list when there's nothing to emit."""
-        init_method = next(
-            (m for m in self.info.methods if m.schema.name.rsplit(".", 1)[-1] == "__ffi_init__"),
-            None,
-        )
+        """Emit `impl <T> { ffi_new; methods }`; empty list when there's nothing to emit."""
         methods = [
             m for m in self.info.methods if m.schema.name.rsplit(".", 1)[-1] != "__ffi_init__"
         ]
-        if not self.info.has_init and not methods:
+        if not native and not methods:
             return []
 
         inner: list[str] = []
-        if self.info.has_init:
-            inner += self._new_fn_native() if native else self._new_fn(init_method)
+        if native:  # `native` implies `has_init` (see `_native_blocker`)
+            inner += self._new_fn_native()
             if methods:
                 inner.append("")
         for i, method in enumerate(methods):
@@ -275,93 +326,118 @@ class _ObjectRenderer:
             "",
         ]
 
-    def _native_params(self) -> list[tuple[str, str]]:
-        """Native ``ffi_new`` parameter list: ``base`` (derived only) + ALL own fields.
+    def _obj_literal_lines(self) -> list[str]:
+        """Render the ``<Obj> { .. }`` literal moving the builder's fields in.
 
-        Every own field is a parameter -- including ``init(false)`` fields,
-        whose C++ defaults are deliberately not materialized in Rust. Unlike
-        the FFI path, ancestor init fields are not flattened in: the caller
-        passes an already-built ``base: <Parent>Obj`` (from the parent's
-        ``<Parent>Obj::ffi_new``); a root type omits it.
+        Defaulted fields move straight from the builder; the rest bind the
+        like-named locals that :meth:`_unwrap_lines` just checked.
         """
-        params: list[tuple[str, str]] = []
-        if not self.is_root:
-            params.append(("base", self.base_type))
-        params += [(f.name, self.render_struct_field(f)) for f in self.info.fields]
-        return params
-
-    def _struct_literal_lines(self) -> list[str]:
-        """Render the inline ``<Obj> { .. }`` struct literal, as source lines."""
-        lines = [f"{self.obj_struct} {{"]
-        if self.is_root:
-            lines.append(f"    base: {self.base_type}::new(),")
-        else:
-            lines.append("    base,")  # shorthand: the `base` parameter
-        # Entries bind by name (every own field has a like-named parameter);
-        # memory order just mirrors the struct definition.
+        lines = [f"{self.obj_struct} {{", "    base: self.base,"]
+        # Entries bind by name; memory order just mirrors the struct definition.
         for field in _layout_fields(self.info.fields):
-            lines.append(f"    {field.name},")
+            if field.default is MISSING:
+                lines.append(f"    {field.name},")  # the unwrapped local
+            else:
+                lines.append(f"    {field.name}: self.{field.name},")
         lines.append("}")
         return lines
 
-    def _obj_new_fn_native(self) -> list[str]:
-        """Emit ``impl <T>Obj { pub fn ffi_new(..) -> Self }`` -- the bare-struct builder.
-
-        Builds the struct value only (no allocation); a native child's
-        ``ffi_new`` takes this output as ``base``.
-        """
-        params = self._native_params()
-        sig = ", ".join(f"{n}: {t}" for n, t in params)
-        literal = self._struct_literal_lines()
+    def _unwrap_lines(self) -> list[str]:
+        """``let <f> = self.<f>.ok_or_else(..)?;`` for every field without a default."""
         return [
-            f"impl {self.obj_struct} {{",
-            f"    pub fn ffi_new({sig}) -> Self {{",
-            *[f"        {line}" for line in literal],
-            "    }",
-            "}",
-            "",
+            f"let {field.name} = self.{field.name}.ok_or_else(|| tvm_ffi::Error::new("
+            f'tvm_ffi::VALUE_ERROR, "field `{field.name}` is not set", ""))?;'
+            for field in _layout_fields(self.info.fields)
+            if field.default is MISSING
         ]
 
     def _new_fn_native(self) -> list[str]:
-        """Emit `fn ffi_new(..) -> Result<Self>` that allocates the object natively.
+        """Emit ``fn ffi_new(<base?>) -> <T>Builder``, opening the builder chain.
 
-        No FFI round-trip: the struct literal goes straight to `ObjectArc::new`.
-        The `Result` is kept for signature parity with the FFI path. Named
-        ``ffi_new`` (not ``new``); a user who needs the faithful C++ constructor
-        semantics hand-writes ``new`` (outside the markers) delegating to it.
+        Every own field is set through its like-named builder setter (one
+        uniform API): defaulted fields start prefilled with their
+        stubgen-rendered default, the rest start unset and ``build()`` errors
+        on any still missing. Only a derived type's ``base`` is a parameter.
+        Named ``ffi_new`` (not ``new``); a user who needs the faithful C++
+        constructor semantics hand-writes ``new`` (outside the markers)
+        delegating to the builder.
         """
-        params = self._native_params()
-        sig = ", ".join(f"{n}: {t}" for n, t in params)
-        literal = self._struct_literal_lines()
+        builder = f"{self.leaf}Builder"
+        sig = "" if self.is_root else f"base: {self.base_type}"
+        lines = [f"pub fn ffi_new({sig}) -> {builder} {{", f"    {builder} {{"]
+        if self.is_root:
+            lines.append(f"        base: {self.base_type}::new(),")
+        else:
+            lines.append("        base,")  # shorthand: the `base` parameter
+        for field in _layout_fields(self.info.fields):
+            if field.default is MISSING:
+                lines.append(f"        {field.name}: None,")
+            else:
+                # `_native_blocker` already guaranteed the default renders.
+                lines.append(f"        {field.name}: {_default_expr(field)},")
+        lines += ["    }", "}"]
+        return lines
+
+    def _builder_lines(self) -> list[str]:
+        """Emit ``pub struct <T>Builder`` + its ``impl`` (setters, ``build``, ``build_obj``).
+
+        One consuming setter per own field. Defaulted fields are stored
+        prefilled; fields without a default are stored as ``Option<T>`` and
+        checked by ``build`` / ``build_obj``, which return ``Err`` when one
+        is still unset. ``build_obj`` -- the bare struct value a native
+        child's ``ffi_new`` takes as ``base`` -- is emitted only when some
+        native type derives from this one.
+        """
+        builder = f"{self.leaf}Builder"
+        fields = _layout_fields(self.info.fields)
+        lines = [f"pub struct {builder} {{", f"    base: {self.base_type},"]
+        for field in fields:
+            ty = self.render_struct_field(field)
+            store = ty if field.default is not MISSING else f"Option<{ty}>"
+            lines.append(f"    {field.name}: {store},")
+        lines += ["}", ""]
+
+        inner: list[str] = []
+        for field in fields:
+            ty = self.render_struct_field(field)
+            value = field.name if field.default is not MISSING else f"Some({field.name})"
+            inner += [
+                f"pub fn {field.name}(mut self, {field.name}: {ty}) -> Self {{",
+                f"    self.{field.name} = {value};",
+                "    self",
+                "}",
+                "",
+            ]
         self.imports.record("tvm_ffi::Result")
-        return [
-            f"pub fn ffi_new({sig}) -> Result<Self> {{",
-            "    Ok(Self {",
+        unwraps = self._unwrap_lines()
+        literal = self._obj_literal_lines()
+        inner += [
+            f"pub fn build(self) -> Result<{self.leaf}> {{",
+            *[f"    {line}" for line in unwraps],
+            f"    Ok({self.leaf} {{",
             f"        data: ObjectArc::new({literal[0]}",
             *[f"        {line}" for line in literal[1:-1]],
             f"        {literal[-1]}),",
             "    })",
             "}",
         ]
-
-    def _new_fn(self, init_method: FuncInfo | None) -> list[str]:
-        """Emit `fn ffi_new(...) -> Result<Self>` calling reflected `__ffi_init__`."""
-        if init_method is not None:
-            arg_schemas = list(init_method.schema.args[1:]) if init_method.schema.args else []
-            params = [(f"_{i}", self.render_param(s)) for i, s in enumerate(arg_schemas)]
-        else:
-            params = [(f.name, self.render_param(f.schema)) for f in self.info.init_fields]
-        sig = ", ".join(f"{n}: {t}" for n, t in params)
-        self.imports.record("tvm_ffi::Result")
-        if params:
-            self.imports.record("tvm_ffi::AnyView")
-        packed = _packed_args_expr(params, is_member=False)
-        getter = self._cached_getter_lines("ctor", "__ffi_init__")
-        return [
-            f"pub fn ffi_new({sig}) -> Result<Self> {{",
-            *_packed_call_lines("ctor", getter, packed, "Self"),
+        if _has_native_child(self.info.type_key or ""):
+            inner += [
+                "",
+                f"pub fn build_obj(self) -> Result<{self.obj_struct}> {{",
+                *[f"    {line}" for line in unwraps],
+                f"    Ok({literal[0]}",
+                *[f"    {line}" for line in literal[1:-1]],
+                f"    {literal[-1]})",
+                "}",
+            ]
+        lines += [
+            f"impl {builder} {{",
+            *[f"    {line}" if line else "" for line in inner],
             "}",
+            "",
         ]
+        return lines
 
     def _cached_getter_lines(self, fvar: str, ffi_name: str) -> list[str]:
         """Body lines binding ``fvar`` to the reflected method, cached per call site.
@@ -412,10 +488,11 @@ def generate_rust_object(
     """Emit a Rust ``struct``/``impl`` binding for an ``object/<key>`` block.
 
     Emits ``<T>Obj`` (``#[repr(C)]``, parent embedded as ``base``), the ``<T>``
-    ref wrapper, ``Deref``/``DerefMut``, and ``impl <T>`` with ``ffi_new`` plus
-    the reflected methods. Raises :class:`UnsupportedTypeError` for types the
-    crate cannot represent; ``cli`` catches it and skips the block (any ``use``s
-    already recorded are harmless -- generated files allow unused imports).
+    ref wrapper, ``Deref``/``DerefMut``, ``impl <T>`` with ``ffi_new`` plus the
+    reflected methods, and the ``<T>Builder`` (when natively constructible).
+    Raises :class:`UnsupportedTypeError` for types the crate cannot represent;
+    ``cli`` catches it and skips the block (any ``use``s already recorded are
+    harmless -- generated files allow unused imports).
     """
     assert len(code.lines) >= 2
     type_key = obj_info.type_key

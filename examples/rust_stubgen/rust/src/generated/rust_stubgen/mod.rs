@@ -97,6 +97,7 @@ pub struct IntPairObj {
     base: Object,
     pub a: i64,
     pub b: i64,
+    pub scale: i64,
 }
 
 #[repr(C)]
@@ -119,20 +120,56 @@ impl DerefMut for IntPair {
 }
 
 impl IntPair {
-    pub fn ffi_new(a: i64, b: i64) -> Result<Self> {
-        Ok(Self {
-            data: ObjectArc::new(IntPairObj {
-                base: Object::new(),
-                a,
-                b,
-            }),
-        })
+    pub fn ffi_new() -> IntPairBuilder {
+        IntPairBuilder {
+            base: Object::new(),
+            a: None,
+            b: None,
+            scale: 1,
+        }
     }
 
     pub fn sum(&mut self) -> Result<i64> {
         thread_local!(static F: std::cell::OnceCell<tvm_ffi::Function> = const { std::cell::OnceCell::new() });
         let f = get_type_method_cached(&F, IntPairObj::type_index(), "sum")?;
         Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)
+    }
+}
+
+pub struct IntPairBuilder {
+    base: Object,
+    a: Option<i64>,
+    b: Option<i64>,
+    scale: i64,
+}
+
+impl IntPairBuilder {
+    pub fn a(mut self, a: i64) -> Self {
+        self.a = Some(a);
+        self
+    }
+
+    pub fn b(mut self, b: i64) -> Self {
+        self.b = Some(b);
+        self
+    }
+
+    pub fn scale(mut self, scale: i64) -> Self {
+        self.scale = scale;
+        self
+    }
+
+    pub fn build(self) -> Result<IntPair> {
+        let a = self.a.ok_or_else(|| tvm_ffi::Error::new(tvm_ffi::VALUE_ERROR, "field `a` is not set", ""))?;
+        let b = self.b.ok_or_else(|| tvm_ffi::Error::new(tvm_ffi::VALUE_ERROR, "field `b` is not set", ""))?;
+        Ok(IntPair {
+            data: ObjectArc::new(IntPairObj {
+                base: self.base,
+                a,
+                b,
+                scale: self.scale,
+            }),
+        })
     }
 }
 // tvm-ffi-stubgen(end)

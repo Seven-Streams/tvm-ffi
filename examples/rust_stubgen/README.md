@@ -57,5 +57,7 @@ cd rust
 cargo run
 ```
 
-This runs three flows: constructing an `IntPair` via the generated `ffi_new`,
-calling the `sum` method, and writing a field through `DerefMut`.
+This runs four flows: constructing an `IntPair` via the generated builder
+(`ffi_new().a(1).b(2).build()`; the defaulted `scale` field may be omitted),
+calling the `sum` method, overriding the default through the `.scale(..)`
+setter, and writing a field through `DerefMut`.

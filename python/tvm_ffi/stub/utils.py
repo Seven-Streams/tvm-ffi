@@ -27,7 +27,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
-from tvm_ffi.core import TypeInfo, TypeSchema, _lookup_type_attr
+from tvm_ffi.core import MISSING, TypeInfo, TypeSchema, _lookup_type_attr
 
 from . import consts as C
 
@@ -95,11 +95,18 @@ class Options:
 
 @dataclasses.dataclass(init=False)
 class NamedTypeSchema(TypeSchema):
-    """A type schema with an associated name, size and offset."""
+    """A type schema with an associated name, size, offset and default value.
+
+    ``default`` is the registered static default value (:data:`MISSING` when
+    none); ``default_is_factory`` marks a ``default_factory`` registration,
+    whose value only exists by calling the factory through FFI.
+    """
 
     name: str
     size: int | None = None
     offset: int | None = None
+    default: Any = MISSING
+    default_is_factory: bool = False
 
     def __init__(
         self,
@@ -107,12 +114,16 @@ class NamedTypeSchema(TypeSchema):
         schema: TypeSchema,
         size: int | None = None,
         offset: int | None = None,
+        default: Any = MISSING,
+        default_is_factory: bool = False,
     ) -> None:
         """Initialize a `NamedTypeSchema` with the given name, schema and field metadata."""
         super().__init__(origin=schema.origin, args=schema.args)
         self.name = name
         self.size = size
         self.offset = offset
+        self.default = default
+        self.default_is_factory = default_is_factory
 
 
 @dataclasses.dataclass
@@ -200,6 +211,8 @@ class ObjectInfo:
                     schema=_parse_type_schema(field.metadata["type_schema"]),
                     size=field.size,
                     offset=field.offset,
+                    default=field.c_default,
+                    default_is_factory=field.c_default_factory is not MISSING,
                 )
                 for field in type_info.fields
             ],

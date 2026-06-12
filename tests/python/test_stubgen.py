@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 import tvm_ffi.stub.cli as stub_cli
-from tvm_ffi.core import TypeSchema
+from tvm_ffi.core import MISSING, TypeSchema
 from tvm_ffi.stub import consts as C
 from tvm_ffi.stub.cli import _stage_2, _stage_3
 from tvm_ffi.stub.file_utils import CodeBlock, FileInfo
@@ -1028,27 +1028,114 @@ def _native_config_info() -> ObjectInfo:
 
 def test_rust_native_root_construction() -> None:
     text, _ = _gen_rust_object(_native_point_info())
-    # Auto-init root -> native: `ffi_new` allocates via `ObjectArc::new` with a
-    # single inline struct literal -- no `__ffi_init__` round-trip. A root type
-    # without native children gets no bare-struct builder (`impl PointObj`).
-    assert "pub fn ffi_new(x: i64, y: i64) -> Result<Self> {" in text
-    assert "data: ObjectArc::new(PointObj {" in text
+    # Auto-init root -> native: `ffi_new()` opens the builder (base prefilled
+    # with the root header, fields unset) and `build` allocates via
+    # `ObjectArc::new` -- no `__ffi_init__` round-trip. Every field is a
+    # setter; no native children -> no `build_obj`.
+    assert "pub fn ffi_new() -> PointBuilder {" in text
     assert "base: Object::new()," in text
+    assert "pub struct PointBuilder {" in text
+    assert "    x: Option<i64>," in text
+    assert "pub fn x(mut self, x: i64) -> Self {" in text
+    assert "self.x = Some(x);" in text
+    assert "pub fn build(self) -> Result<Point> {" in text
+    assert "data: ObjectArc::new(PointObj {" in text
+    assert "base: self.base," in text
+    assert "build_obj" not in text
     assert "impl PointObj {" not in text
     assert "__ffi_init__" not in text
     assert "get_type_method" not in text
 
 
-def test_rust_native_init_false_fields_become_params() -> None:
+def test_rust_fields_without_defaults_are_checked_setters() -> None:
     text, _ = _gen_rust_object(_native_config_info())
-    # Defaults are never materialized in Rust: `init(false)` fields are plain
-    # `ffi_new` parameters like any other own field, and the type stays native.
+    # A field with no registered default -- `init(false)` or not -- has no value
+    # source in Rust: it starts unset in the builder and `build` errors when it
+    # is still missing. The setter API stays uniform with defaulted fields.
+    assert "pub fn ffi_new() -> ConfigBuilder {" in text
+    assert "scale: None," in text
+    assert "label: None," in text
+    assert "pub fn label(mut self, label: tvm_ffi::String) -> Self {" in text
     assert (
-        "pub fn ffi_new(scale: i64, offset: i64, verbose: bool, label: tvm_ffi::String)"
-        " -> Result<Self> {" in text
+        "let scale = self.scale.ok_or_else(|| tvm_ffi::Error::new("
+        'tvm_ffi::VALUE_ERROR, "field `scale` is not set", ""))?;' in text
     )
     assert "data: ObjectArc::new(ConfigObj {" in text
     assert "__ffi_init__" not in text
+
+
+def _builder_knobs_info() -> ObjectInfo:
+    """Root auto-init `Knobs`: one required field + a default of every renderable kind."""
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("scale", TypeSchema("int")),
+            NamedTypeSchema("offset", TypeSchema("int"), default=2),
+            NamedTypeSchema("verbose", TypeSchema("bool"), default=True),
+            NamedTypeSchema("ratio", TypeSchema("float"), default=0.5),
+            NamedTypeSchema("label", TypeSchema("ffi.String"), default='he"llo\n'),
+        ],
+        methods=[],
+        type_key="cpp_rust_test.Knobs",
+        parent_type_key="ffi.Object",
+        has_init=True,
+    )
+
+
+def test_rust_builder_defaulted_fields_prefilled() -> None:
+    text, _ = _gen_rust_object(_builder_knobs_info())
+    # `ffi_new()` takes no field parameters: the builder API is uniform.
+    assert "pub fn ffi_new() -> KnobsBuilder {" in text
+    # Defaulted fields are prefilled with their rendered literal (strings are
+    # escaped Rust-style: `\"` for the quote, `\u{..}` for non-printables) ...
+    assert "offset: 2," in text
+    assert "verbose: true," in text
+    assert "ratio: 0.5," in text
+    assert 'label: tvm_ffi::String::from("he\\"llo\\u{a}"),' in text
+    # ... while the field without a default starts unset.
+    assert "scale: None," in text
+    assert "scale: Option<i64>," in text
+    # Every field gets a like-named consuming setter.
+    assert "pub fn scale(mut self, scale: i64) -> Self {" in text
+    assert "self.scale = Some(scale);" in text
+    assert "pub fn offset(mut self, offset: i64) -> Self {" in text
+    assert "self.offset = offset;" in text
+    assert "pub fn verbose(mut self, verbose: bool) -> Self {" in text
+    assert "pub fn label(mut self, label: tvm_ffi::String) -> Self {" in text
+    # `build` checks only the unset-able field and moves the rest.
+    assert "pub fn build(self) -> Result<Knobs> {" in text
+    assert (
+        "let scale = self.scale.ok_or_else(|| tvm_ffi::Error::new("
+        'tvm_ffi::VALUE_ERROR, "field `scale` is not set", ""))?;' in text
+    )
+    assert "offset: self.offset," in text
+    assert "scale: self.scale," not in text  # bound via the checked local
+
+
+@pytest.mark.parametrize(
+    ("default", "is_factory"),
+    [
+        pytest.param([1, 2], False, id="container"),
+        pytest.param(float("inf"), False, id="non-finite-float"),
+        pytest.param(MISSING, True, id="default-factory"),
+    ],
+)
+def test_rust_unrenderable_default_blocks_native(
+    default: object, is_factory: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A default stubgen cannot spell as a Rust literal -- or one that only exists
+    # by calling an FFI factory -- blocks native construction; with no FFI
+    # fallback the constructor is skipped with a warning.
+    info = _native_point_info()
+    info.fields = [
+        NamedTypeSchema("x", TypeSchema("int")),
+        NamedTypeSchema("y", TypeSchema("int"), default=default, default_is_factory=is_factory),
+    ]
+    text, _ = _gen_rust_object(info)
+    assert "ffi_new" not in text
+    assert "PointBuilder" not in text
+    out = capsys.readouterr().out
+    assert "[Warning] object cpp_rust_test.Point: skipping `ffi_new`" in out
+    assert "'y'" in out
 
 
 def _native_narrow_info() -> ObjectInfo:
@@ -1092,11 +1179,13 @@ def test_rust_scalar_fields_width_narrowed() -> None:
     assert "pub flag: i8," in text
     assert "pub weight: f32," in text
     assert "pub big: i64," in text
-    # The native ctor parameters bind straight into the struct -> same widths.
-    assert (
-        "pub fn ffi_new(x: i32, flag: i8, weight: f32, big: i64, ratio: f32)"
-        " -> Result<Self> {" in text
-    )
+    # The builder setters bind straight into the struct -> same widths.
+    assert "pub fn ffi_new() -> PixelBuilder {" in text
+    assert "pub fn x(mut self, x: i32) -> Self {" in text
+    assert "pub fn flag(mut self, flag: i8) -> Self {" in text
+    assert "pub fn weight(mut self, weight: f32) -> Self {" in text
+    assert "pub fn big(mut self, big: i64) -> Self {" in text
+    assert "    ratio: Option<f32>," in text
     # Method args/returns travel as packed Any (v_int64) -> stay i64.
     assert "pub fn get_x(&mut self) -> Result<i64> {" in text
 
@@ -1189,10 +1278,10 @@ def _explicit_init_point_info() -> ObjectInfo:
 @pytest.mark.parametrize("init_arity", [2, 1])
 def test_rust_native_explicit_init_stays_native(init_arity: int) -> None:
     # Native eligibility ignores the explicit `refl::init<...>` method entirely:
-    # whether its arity matches the init-field count (2) or not (1, the
-    # `Circle(radius)` derive shape), `ffi_new` binds ALL init fields with no FFI
+    # whether its arity matches the field count (2) or not (1, the
+    # `Circle(radius)` derive shape), `ffi_new` binds the own fields with no FFI
     # `__ffi_init__` dispatch. A user who needs the faithful C++ ctor semantics
-    # hand-writes a `new` (outside the markers) over `ffi_new`.
+    # hand-writes a `new` (outside the markers) over the builder.
     info = _explicit_init_point_info()
     args = (TypeSchema("cpp_rust_test.Point"),) + (TypeSchema("int"),) * init_arity
     info.methods = [
@@ -1202,22 +1291,29 @@ def test_rust_native_explicit_init_stays_native(init_arity: int) -> None:
         )
     ]
     text, _ = _gen_rust_object(info)
-    assert "pub fn ffi_new(x: i64, y: i64) -> Result<Self> {" in text
+    assert "pub fn ffi_new() -> PointBuilder {" in text
     assert "data: ObjectArc::new(PointObj {" in text
     assert "__ffi_init__" not in text
 
 
-def test_rust_native_excluded_for_optional_field() -> None:
+def test_rust_native_blocked_for_optional_field(capsys: pytest.CaptureFixture[str]) -> None:
     # A top-level `Optional` field renders to std `Option<T>`, whose layout differs
-    # from C++ `ffi::Optional<T>`; native writes would corrupt it -> FFI fallback.
+    # from C++ `ffi::Optional<T>`; native writes would corrupt it. There is no FFI
+    # fallback anymore: the constructor is skipped with a warning, and the explicit
+    # `__ffi_init__` method never leaks into the generated `impl`.
     info = _explicit_init_point_info()
     info.fields = [
         NamedTypeSchema("x", TypeSchema("int")),
         NamedTypeSchema("y", TypeSchema("Optional", (TypeSchema("int"),))),
     ]
     text, _ = _gen_rust_object(info)
-    assert "impl PointObj {" not in text  # no bare-struct builder on the FFI path
-    assert 'get_type_method_cached(&CTOR, PointObj::type_index(), "__ffi_init__")' in text
+    assert "ffi_new" not in text
+    assert "PointBuilder" not in text
+    assert "__ffi_init__" not in text
+    assert "get_type_method" not in text
+    out = capsys.readouterr().out
+    assert "[Warning] object cpp_rust_test.Point: skipping `ffi_new`" in out
+    assert "'y'" in out
 
 
 def _native_point3d_info() -> ObjectInfo:
@@ -1247,33 +1343,39 @@ def _patch_native_point_registry(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_rust_native_derived_takes_base_param(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A derived native type does NOT flatten ancestor init fields: its `ffi_new`
+    # A derived native type does NOT flatten ancestor fields: its `ffi_new`
     # takes the already-built parent value as one `base: <Parent>Obj` parameter
-    # followed by the OWN init fields only, bound in an inline struct literal.
+    # (from the parent builder's `build_obj`); its OWN fields are setters.
     _patch_native_point_registry(monkeypatch)
     text, _ = _gen_rust_object(_native_point3d_info())
-    assert "pub fn ffi_new(base: PointObj, z: i64) -> Result<Self> {" in text
+    assert "pub fn ffi_new(base: PointObj) -> Point3DBuilder {" in text
+    assert "        base," in text  # the `base` parameter moves into the builder
+    assert "pub fn z(mut self, z: i64) -> Self {" in text
+    assert "pub fn build(self) -> Result<Point3D> {" in text
     assert "data: ObjectArc::new(Point3DObj {" in text
-    assert "            base," in text
-    # Point3D has no native children -> no bare-struct builder on its own Obj.
-    assert "impl Point3DObj {" not in text
-    # No flattened ancestor params, no FFI dispatch.
-    assert "ffi_new(x: i64, y: i64, z: i64)" not in text
+    # Point3D has no native children -> no `build_obj` on its builder.
+    assert "build_obj" not in text
+    # No flattened ancestor setters, no FFI dispatch.
+    assert "pub fn x(" not in text
+    assert "pub fn y(" not in text
     assert "__ffi_init__" not in text
 
 
-def test_rust_native_parent_gets_bare_struct_builder(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A type some native child derives from additionally gets the bare-struct
-    # builder `impl <T>Obj { fn ffi_new(..) -> Self }` -- the only way a caller
-    # can produce the child's `base` argument. The ref-level `ffi_new` keeps the
-    # ordinary inline-literal shape (it does not delegate to the builder).
+def test_rust_native_parent_builder_gets_build_obj(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A type some native child derives from additionally gets `build_obj` on its
+    # builder -- the bare struct value, the only way a caller can produce the
+    # child's `base` argument. `build` (the allocating form) ships regardless;
+    # both run the same missing-field checks.
     _patch_native_point_registry(monkeypatch)
     text, _ = _gen_rust_object(_native_point_info())
-    assert "impl PointObj {" in text
-    assert "pub fn ffi_new(x: i64, y: i64) -> Self {" in text
-    assert "pub fn ffi_new(x: i64, y: i64) -> Result<Self> {" in text
+    assert "pub fn ffi_new() -> PointBuilder {" in text
+    assert "pub fn build(self) -> Result<Point> {" in text
+    assert "pub fn build_obj(self) -> Result<PointObj> {" in text
+    assert text.count("self.x.ok_or_else") == 2  # build and build_obj both check
     assert "data: ObjectArc::new(PointObj {" in text
     assert "base: Object::new()," in text
+    # The bare value comes from the builder, not from an `impl PointObj` ctor.
+    assert "impl PointObj {" not in text
 
 
 def test_rust_object_root_struct_and_impl() -> None:
@@ -1296,11 +1398,14 @@ def test_rust_object_root_struct_and_impl() -> None:
     assert "    data: ObjectArc<ExprObj>," in text
     assert "impl Deref for Expr {" in text
     assert "impl DerefMut for Expr {" in text
-    # native ffi_new (root, field-binding init): inline struct literal, no FFI
-    # generated types/functions are `pub` (decision Q2)
+    # native ffi_new (root, field-binding init): opens the builder; `build`
+    # allocates. generated types/functions are `pub` (decision Q2)
     assert "pub struct ExprObj {" in text
     assert "pub struct Expr {" in text
-    assert "pub fn ffi_new(value: i64) -> Result<Self> {" in text
+    assert "pub fn ffi_new() -> ExprBuilder {" in text
+    assert "pub fn value(mut self, value: i64) -> Self {" in text
+    assert "pub struct ExprBuilder {" in text
+    assert "pub fn build(self) -> Result<Expr> {" in text
     assert "pub fn test() -> Result<i64> {" in text
     assert "data: ObjectArc::new(ExprObj {" in text
     assert "base: Object::new()," in text
@@ -1329,7 +1434,10 @@ def test_rust_object_derived_embeds_parent() -> None:
     # instance method: &mut self receiver (mutable class); self is packed as `&*self`
     assert "fn update(&mut self) -> Result<()> {" in text
     assert "Ok(f.call_packed(&[AnyView::from(&*self)])?.try_into()?)" in text
-    assert "fn ffi_new(a: Expr, b: Expr, value: i64) -> Result<Self> {" in text
+    # The parent type key is not resolvable from the live registry -> the chain
+    # cannot be proven native and there is no FFI fallback: no ctor at all.
+    assert "ffi_new" not in text
+    assert "AddBuilder" not in text
 
 
 def test_rust_object_immutable_has_no_derefmut() -> None:
@@ -1626,50 +1734,6 @@ def test_rust_default_ty_map_is_real() -> None:
     m = RustGenerator().default_ty_map()
     assert m["int"] == "i64"
     assert m["None"] == "()"
-
-
-def test_rust_new_uses_ffi_init_schema_order() -> None:
-    # __ffi_init__ schema arg order (a, b, value) is authoritative and differs
-    # from the parent-first init_fields order (value, a, b).
-    info = ObjectInfo(
-        fields=[
-            NamedTypeSchema("a", TypeSchema("demo.Expr")),
-            NamedTypeSchema("b", TypeSchema("demo.Expr")),
-        ],
-        methods=[
-            FuncInfo(
-                NamedTypeSchema(
-                    "__ffi_init__",
-                    TypeSchema(
-                        "Callable",
-                        (
-                            TypeSchema("Object"),  # return (constructed object)
-                            TypeSchema("demo.Expr"),
-                            TypeSchema("demo.Expr"),
-                            TypeSchema("int"),
-                        ),
-                    ),
-                ),
-                is_member=True,
-            )
-        ],
-        type_key="demo.Add",
-        parent_type_key="demo.Expr",
-        init_fields=[
-            InitFieldInfo("value", NamedTypeSchema("value", TypeSchema("int")), False, False),
-            InitFieldInfo("a", NamedTypeSchema("a", TypeSchema("demo.Expr")), False, False),
-            InitFieldInfo("b", NamedTypeSchema("b", TypeSchema("demo.Expr")), False, False),
-        ],
-        has_init=True,
-    )
-    text, _ = _gen_rust_object(info)
-    assert "fn ffi_new(_0: Expr, _1: Expr, _2: i64) -> Result<Self> {" in text
-    assert (
-        "Ok(ctor.call_packed(&[AnyView::from(&_0), AnyView::from(&_1), "
-        "AnyView::from(&_2)])?.try_into()?)"
-    ) in text
-    # __ffi_init__ becomes `new`, not a regular method (only referenced once).
-    assert text.count("__ffi_init__") == 1
 
 
 def test_rust_api_filenames() -> None:
