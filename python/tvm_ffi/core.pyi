@@ -283,6 +283,7 @@ class TypeField:
     doc: str | None
     size: int
     offset: int
+    alignment: int
     frozen: bool
     metadata: dict[str, Any]
     getter: Any

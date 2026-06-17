@@ -618,6 +618,7 @@ class TypeField:
     doc: Optional[str]
     size: int
     offset: int
+    alignment: int
     frozen: bool
     metadata: dict[str, Any]
     getter: FieldGetter
@@ -1071,6 +1072,7 @@ def _register_fields(type_info, fields, structure_kind=None):
                 doc=py_field.doc,
                 size=size,
                 offset=field_offset,
+                alignment=alignment,
                 frozen=py_field.frozen,
                 metadata={"type_schema": py_field._ty_schema.to_json()},
                 getter=fgetter,

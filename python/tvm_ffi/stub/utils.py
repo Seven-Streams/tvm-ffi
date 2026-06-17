@@ -105,6 +105,7 @@ class NamedTypeSchema(TypeSchema):
     name: str
     size: int | None = None
     offset: int | None = None
+    alignment: int | None = None
     default: Any = MISSING
     default_is_factory: bool = False
 
@@ -114,6 +115,7 @@ class NamedTypeSchema(TypeSchema):
         schema: TypeSchema,
         size: int | None = None,
         offset: int | None = None,
+        alignment: int | None = None,
         default: Any = MISSING,
         default_is_factory: bool = False,
     ) -> None:
@@ -122,6 +124,7 @@ class NamedTypeSchema(TypeSchema):
         self.name = name
         self.size = size
         self.offset = offset
+        self.alignment = alignment
         self.default = default
         self.default_is_factory = default_is_factory
 
@@ -211,6 +214,7 @@ class ObjectInfo:
                     schema=_parse_type_schema(field.metadata["type_schema"]),
                     size=field.size,
                     offset=field.offset,
+                    alignment=field.alignment,
                     default=field.c_default,
                     default_is_factory=field.c_default_factory is not MISSING,
                 )

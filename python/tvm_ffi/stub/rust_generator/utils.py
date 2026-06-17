@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Callable
 
 from ..utils import UnsupportedTypeError
 from . import consts as C
-from .consts import RUST_UNSUPPORTED_ORIGINS
+from .consts import RUST_NOT_ANY_COMPATIBLE_ORIGINS, RUST_UNSUPPORTED_ORIGINS
 
 if TYPE_CHECKING:
     from tvm_ffi.core import TypeSchema
@@ -98,6 +98,13 @@ class RustImports:
         return probe.leaf
 
 
+def schema_contains(schema: TypeSchema, origins: frozenset[str]) -> bool:
+    """Whether ``schema`` mentions any origin in ``origins`` anywhere (recursive)."""
+    if schema.origin in origins:
+        return True
+    return any(schema_contains(arg, origins) for arg in (schema.args or ()))
+
+
 def render_rust_type(schema: TypeSchema, ty_render: Callable[[str], str]) -> str:
     """Render a :class:`TypeSchema` into a Rust type expression.
 
@@ -110,6 +117,17 @@ def render_rust_type(schema: TypeSchema, ty_render: Callable[[str], str]) -> str
 
     if origin in RUST_UNSUPPORTED_ORIGINS:
         raise UnsupportedTypeError(origin)
+
+    if origin == "Optional":
+        # Native `Option<T>` at function boundaries and when nested. A *direct*
+        # struct field is special-cased to the layout-mirror in
+        # `render_struct_field`, which never reaches this branch. The inner must
+        # be AnyCompatible to cross the Any boundary (`Option<Object>` etc. would
+        # not compile), otherwise there is no native rendering -> skip the object.
+        assert args  # TypeSchema's post_init fills a missing inner type.
+        if schema_contains(args[0], RUST_NOT_ANY_COMPATIBLE_ORIGINS):
+            raise UnsupportedTypeError(origin)
+        return f"Option<{render_rust_type(args[0], ty_render)}>"
 
     if origin == "Array":
         assert args  # TypeSchema's post_init fills a missing element type.

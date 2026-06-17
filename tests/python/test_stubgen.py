@@ -842,7 +842,6 @@ def test_render_nested() -> None:
         TypeSchema("Map", (TypeSchema("str"), TypeSchema("int"))),
         TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))),
         TypeSchema("List", (TypeSchema("int"),)),
-        TypeSchema("Optional", (TypeSchema("int"),)),
         TypeSchema("tuple", (TypeSchema("int"), TypeSchema("float"))),
         TypeSchema("tuple"),
     ],
@@ -857,16 +856,28 @@ def test_render_unsupported_raises(schema: TypeSchema) -> None:
     "inner",
     [
         TypeSchema("Map", (TypeSchema("str"), TypeSchema("int"))),
-        TypeSchema("Optional", (TypeSchema("int"),)),
     ],
 )
 def test_render_unsupported_nested_raises(inner: TypeSchema) -> None:
-    # An unsupported origin buried inside an Array still bubbles up; `Optional`
-    # is unsupported even when nested (no layout-compatible Rust rendering).
+    # An unsupported origin buried inside an Array still bubbles up and skips the
+    # enclosing object.
     schema = TypeSchema("Array", (inner,))
     with pytest.raises(UnsupportedTypeError) as exc:
         _rust_render(schema)
     assert exc.value.origin == inner.origin
+
+
+def test_render_optional_is_native_option() -> None:
+    # `Optional<T>` renders as the native `Option<T>` at function boundaries and
+    # when nested (the layout-mirror is only for direct struct fields).
+    text, imports = _rust_render(TypeSchema("Optional", (TypeSchema("int"),)))
+    assert text == "Option<i64>"
+    assert imports.items == []  # `Option` is prelude; no `use`
+
+    text, imports = _rust_render(
+        TypeSchema("Array", (TypeSchema("Optional", (TypeSchema("ffi.String"),)),))
+    )
+    assert text == "Array<Option<String>>"  # nested Optional inside Array
 
 
 def test_ty_render_dedups_same_path() -> None:
@@ -1230,9 +1241,9 @@ def test_rust_native_explicit_init_stays_native(init_arity: int) -> None:
     assert "__ffi_init__" not in text
 
 
-def test_rust_optional_method_arg_is_unsupported() -> None:
-    # Unified treatment: an unsupported origin in a method signature (not just
-    # a field) also raises and skips the whole object.
+def test_rust_optional_method_arg_renders_native_option() -> None:
+    # `Optional<T>` in a method signature is the native `Option<T>` (the
+    # layout-mirror is only for direct struct fields).
     info = _native_point_info()
     info.methods = [
         FuncInfo(
@@ -1246,6 +1257,147 @@ def test_rust_optional_method_arg_is_unsupported() -> None:
             is_member=False,
         )
     ]
+    text, _ = _gen_rust_object(info)
+    assert "pub fn lookup(_0: Option<i64>) -> Result<i64> {" in text
+
+
+def _optional_holder_info(*, mutable: bool = True) -> ObjectInfo:
+    """Root `Holder` with one Optional field per layout category.
+
+    Fields carry the reflected ``size``/``alignment`` the layout-mirror needs
+    (the ``ffi.Object`` header is 24 bytes; offsets are kept self-consistent so
+    the offset check stays quiet).
+    """
+    return ObjectInfo(
+        fields=[
+            # Category C (std::optional<scalar>): align comes from reflection.
+            NamedTypeSchema(
+                "a", TypeSchema("Optional", (TypeSchema("int"),)), size=16, alignment=8, offset=24
+            ),
+            # Category B (String): a nullable embedded Any.
+            NamedTypeSchema(
+                "s", TypeSchema("Optional", (TypeSchema("str"),)), size=16, alignment=8, offset=40
+            ),
+            # Category C with a narrower scalar -> alignment 4 (NOT 8).
+            NamedTypeSchema(
+                "n", TypeSchema("Optional", (TypeSchema("int"),)), size=8, alignment=4, offset=56
+            ),
+            # Category A but Any-bearing inner -> () marker, no typed accessor.
+            NamedTypeSchema(
+                "arr",
+                TypeSchema("Optional", (TypeSchema("Array", (TypeSchema("Any"),)),)),
+                size=8,
+                alignment=8,
+                offset=64,
+            ),
+        ],
+        methods=[],
+        type_key="cpp_rust_test.Holder",
+        parent_type_key="ffi.Object",
+        has_init=True,
+        mutable=mutable,
+    )
+
+
+def test_rust_optional_field_renders_layout_mirror(capsys: pytest.CaptureFixture[str]) -> None:
+    text, _ = _gen_rust_object(_optional_holder_info())
+    # size/alignment come from reflection -> Optional<T, AlignK, N>.
+    assert "pub a: Optional<i64, Align8, 16>," in text
+    assert "pub s: Optional<String, Align8, 16>," in text
+    assert "pub n: Optional<i64, Align4, 8>," in text  # narrower scalar -> Align4
+    # Any-bearing inner is not a valid standalone type -> () marker.
+    assert "pub arr: Optional<(), Align8, 8>," in text
+    # get/set accessors marshal a native Option<V> (mutable class -> both), with
+    # a per-call-site OnceLock so the field lookup is cached, not re-scanned.
+    assert "pub fn a(&self) -> Result<Option<i64>> {" in text
+    assert (
+        "static CELL: std::sync::OnceLock<tvm_ffi::FieldAccess> = std::sync::OnceLock::new();"
+        in text
+    )
+    assert 'self.a.read_cached::<i64>(&CELL, HolderObj::type_index(), "a")' in text
+    assert "pub fn set_a(&self, value: Option<i64>) -> Result<()> {" in text
+    assert 'self.a.write_cached::<i64>(&CELL, HolderObj::type_index(), "a", value)' in text
+    # Any inner -> field emitted but NO typed accessor (would need AnyCompatible).
+    assert "pub fn arr(" not in text
+    # A direct Optional field is view-only -> the type is not natively built.
+    assert "pub fn ffi_new()" not in text
+    out = capsys.readouterr().out
+    assert "is an ffi::Optional" in out
+    # The Any-inner field is skipped with a diagnostic, not silently.
+    assert "optional field 'arr' has no typed accessor" in out
+
+
+def test_rust_optional_field_immutable_getter_only() -> None:
+    text, _ = _gen_rust_object(_optional_holder_info(mutable=False))
+    assert "pub fn a(&self) -> Result<Option<i64>> {" in text
+    assert "pub fn set_a(" not in text  # immutable class -> read-only accessor
+    assert "impl DerefMut" not in text
+
+
+def test_rust_optional_object_inner_field_skips_accessor(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # `Optional<ObjectRef>` (bare base object, origin `ffi.Object` -> tvm_ffi::Object)
+    # is NOT AnyCompatible, so a `read::<Object>` accessor would not compile. The
+    # field is still emitted (with a `()` marker) but the accessor is skipped + warned.
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema(
+                "obj",
+                TypeSchema("Optional", (TypeSchema("ffi.Object"),)),
+                size=8,
+                alignment=8,
+                offset=24,
+            ),
+        ],
+        methods=[],
+        type_key="cpp_rust_test.OptObjHolder",
+        parent_type_key="ffi.Object",
+        has_init=True,
+        mutable=True,
+    )
+    text, _ = _gen_rust_object(info)
+    assert "pub obj: Optional<(), Align8, 8>," in text  # () marker, NOT Object
+    assert "pub fn obj(" not in text  # no accessor -> no `read::<Object>` compile break
+    assert "optional field 'obj' has no typed accessor" in capsys.readouterr().out
+
+
+def test_rust_optional_object_method_arg_is_unsupported() -> None:
+    # `Optional<ObjectRef>` in a method signature would render `Option<Object>`,
+    # which is not AnyCompatible; render must raise so the object is skipped rather
+    # than emit non-compiling bindings.
+    info = _native_point_info()
+    info.methods = [
+        FuncInfo(
+            NamedTypeSchema(
+                "f",
+                TypeSchema(
+                    "Callable",
+                    (TypeSchema("int"), TypeSchema("Optional", (TypeSchema("ffi.Object"),))),
+                ),
+            ),
+            is_member=False,
+        )
+    ]
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _gen_rust_object(info)
+    assert exc.value.origin == "Optional"
+
+
+def test_rust_optional_field_unsupported_alignment_skips() -> None:
+    # An ffi::Optional alignment with no marker (not in {1,2,4,8,16}) is skipped.
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema(
+                "a", TypeSchema("Optional", (TypeSchema("int"),)), size=32, alignment=32, offset=24
+            )
+        ],
+        methods=[],
+        type_key="cpp_rust_test.Weird",
+        parent_type_key="ffi.Object",
+        has_init=True,
+        mutable=True,
+    )
     with pytest.raises(UnsupportedTypeError) as exc:
         _gen_rust_object(info)
     assert exc.value.origin == "Optional"
