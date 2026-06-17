@@ -19,19 +19,33 @@
 use std::env;
 use std::process::Command;
 
+fn run_generate_script(script: &str, what: &str) {
+    let output_dir = env::var("OUT_DIR").unwrap();
+    let output = Command::new("python")
+        .arg(script)
+        .arg(&output_dir)
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run {script}: {e}"));
+    if !output.status.success() {
+        panic!(
+            "Failed to generate {what} via {script}:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    println!("cargo:rerun-if-changed={script}");
+}
+
 fn generate_example_lib() {
     let is_example_build = env::var("CARGO_FEATURE_EXAMPLE").is_ok();
     if !is_example_build {
         return;
     }
-    println!("Running optional build step to generate example library");
-    let output_dir = env::var("OUT_DIR").unwrap();
-    let _ = Command::new("python")
-        .arg("scripts/generate_example_lib.py")
-        .arg(output_dir)
-        .output()
-        .expect("Failed to generate example library");
-    println!("cargo:rerun-if-changed=scripts/generate_example_lib.py");
+    println!("Running optional build step to generate example/test libraries");
+    run_generate_script("scripts/generate_example_lib.py", "example library");
+    run_generate_script(
+        "scripts/generate_optional_test_lib.py",
+        "optional test library",
+    );
 }
 
 /// Update the LD_LIBRARY_PATH environment variable

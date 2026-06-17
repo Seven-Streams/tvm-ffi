@@ -64,11 +64,34 @@ RUST_SCALAR_BY_SIZE = {
 
 #: Origins the crate has no FFI type for: ``Map``/``Dict``/``List``/``Union``
 #: have no Rust counterpart at all (do NOT map to ``HashMap``/``Vec``), and
-#: ``Optional``/``tuple`` only have std renderings (``Option<T>``, Rust tuples)
-#: that are not layout-compatible with C++ ``ffi::Optional``/``ffi::Tuple``.
-#: ``render_rust_type`` raises ``UnsupportedTypeError`` wherever one appears
-#: (field, argument, return, or nested) and the enclosing object is skipped.
-RUST_UNSUPPORTED_ORIGINS = frozenset({"Map", "Dict", "List", "Union", "Optional", "tuple"})
+#: ``tuple`` only has a std rendering (Rust tuples) that is not layout-compatible
+#: with C++ ``ffi::Tuple``. ``render_rust_type`` raises ``UnsupportedTypeError``
+#: wherever one appears (field, argument, return, or nested) and the enclosing
+#: object is skipped. (``Optional`` is supported: native ``Option<T>`` at
+#: boundaries, layout-mirror as a direct struct field.)
+RUST_UNSUPPORTED_ORIGINS = frozenset({"Map", "Dict", "List", "Union", "tuple"})
+
+#: Alignment value -> zero-sized marker (re-exported at the crate root) used to
+#: give ``tvm_ffi::Optional<T, A, N>`` its alignment (Rust has no const-generic
+#: ``align``).
+RUST_ALIGN_MARKER = {
+    1: "tvm_ffi::Align1",
+    2: "tvm_ffi::Align2",
+    4: "tvm_ffi::Align4",
+    8: "tvm_ffi::Align8",
+    16: "tvm_ffi::Align16",
+}
+
+#: The crate's layout-mirror type for a C++ ``ffi::Optional<T>`` struct field.
+RUST_OPTIONAL_TYPE = "tvm_ffi::Optional"
+
+#: Origins whose Rust rendering does NOT implement ``AnyCompatible``: ``Any``
+#: (``tvm_ffi::Any``) and the bare base object (``tvm_ffi::Object``). A type is
+#: AnyCompatible iff none of these appear in it (every other renderable leaf --
+#: scalars, ``String``/``Bytes``, ``Array<T>``, generated/builtin ObjectRefs --
+#: is AnyCompatible). Used to decide whether ``Optional<T>`` can marshal through
+#: a native ``Option<V>`` (accessor / argument / return) or must be skipped.
+RUST_NOT_ANY_COMPATIBLE_ORIGINS = frozenset({"Any", "Object", "ffi.Object"})
 
 #: Module-prefix rewrites for ``use`` paths: builtin ``ffi.*`` type keys live at
 #: the crate root.

@@ -38,6 +38,7 @@ from .utils import (
     _packed_args_expr,
     _packed_call_lines,
     render_rust_type,
+    schema_contains,
 )
 
 if TYPE_CHECKING:
@@ -99,6 +100,10 @@ def _native_blocker(info: ObjectInfo) -> str | None:
     if not info.has_init:
         return "the type has no reflected constructor"
     for field in info.fields:
+        if field.origin == "Optional":
+            # A direct `Optional<T>` field is the view-only layout-mirror
+            # `tvm_ffi::Optional` (no Rust constructor); created on the C++ side.
+            return f"field {field.name!r} is an ffi::Optional (view-only, C++-constructed)"
         if field.default_is_factory:
             return f"field {field.name!r} uses a default factory (FFI-only)"
         if field.default is not MISSING and _default_expr(field) is None:
@@ -132,6 +137,16 @@ def _native_eligible(type_key: str) -> bool:
     return _info_native_eligible(info)
 
 
+def _is_any_compatible(schema: TypeSchema) -> bool:
+    """Whether ``schema``'s Rust rendering implements ``AnyCompatible``.
+
+    True unless ``Any`` or the bare base ``Object`` appears anywhere -- those are
+    the only renderable leaves that are not ``AnyCompatible`` (so they cannot be
+    the ``V`` of a native ``Option<V>`` accessor / marshal).
+    """
+    return not schema_contains(schema, C_RUST.RUST_NOT_ANY_COMPATIBLE_ORIGINS)
+
+
 def _layout_fields(fields: list[NamedTypeSchema]) -> list[NamedTypeSchema]:
     """Sort own fields by reflection ``offset`` (C++ memory order).
 
@@ -148,11 +163,12 @@ def _warn_offset_mismatch(type_key: str | None, fields: list[NamedTypeSchema]) -
     """Warn when ``#[repr(C)]`` cannot reproduce the recorded field offsets.
 
     Recomputes each field's ``#[repr(C)]`` placement from the previous field's
-    end. Reflection has no ``alignof``, so alignment is approximated from
-    ``size`` (largest power of two, capped at 8) -- exact for scalars, but
-    composite FFI structs like ``DLDevice`` can trigger a false positive. A
-    mismatch only warns; the binding is still emitted. Fields without
-    offset/size metadata are skipped and reset the running position.
+    end, using the reflected per-field ``alignment``. When alignment is missing
+    (synthetic ``ObjectInfo``s in tests) it is approximated from ``size``
+    (largest power of two, capped at 8), which can false-positive on composite
+    FFI structs like ``DLDevice``. A mismatch only warns; the binding is still
+    emitted. Fields without offset/size metadata are skipped and reset the
+    running position.
     """
     prev_end: int | None = None
     for field in fields:
@@ -160,7 +176,7 @@ def _warn_offset_mismatch(type_key: str | None, fields: list[NamedTypeSchema]) -
             prev_end = None
             continue
         if prev_end is not None:
-            align = min(8, field.size & -field.size)
+            align = field.alignment or min(8, field.size & -field.size)
             placed = (prev_end + align - 1) // align * align
             if placed != field.offset:
                 print(
@@ -189,6 +205,10 @@ class _ObjectRenderer:
     is_root: bool
     imports: RustImports
     ty_map: dict[str, str]
+    #: Rendered inner type of each AnyCompatible Optional field, keyed by field
+    #: name. Populated when the struct field is rendered and reused by the
+    #: accessor pass so the inner is rendered once (not twice) per field.
+    _opt_inner: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def _ty_render(self, origin: str) -> str:
         """Resolve a leaf origin to its Rust name and record its ``use``.
@@ -209,10 +229,43 @@ class _ObjectRenderer:
 
         An ``int32_t`` field must render as ``i32``, not the schema-erased
         default ``i64``; the width comes from reflection's per-field ``size``.
-        Non-scalar origins (or schemas without a size) render plainly.
+        A direct ``Optional<T>`` field renders as the layout-mirror
+        ``tvm_ffi::Optional<T, A, N>`` (size/alignment from reflection) -- this is
+        the *only* position the mirror is used; elsewhere ``Optional`` is the
+        native ``Option<T>``. Non-scalar origins render plainly.
         """
+        if schema.origin == "Optional":
+            return self._render_optional_field(schema)
         narrowed = C_RUST.RUST_SCALAR_BY_SIZE.get((schema.origin, schema.size))
         return narrowed if narrowed is not None else render_rust_type(schema, self._ty_render)
+
+    def _render_optional_field(self, schema: NamedTypeSchema) -> str:
+        """Render a direct ``Optional<T>`` field as ``tvm_ffi::Optional<T, AlignK, N>``.
+
+        ``N``/``AlignK`` are the reflected ``size``/``alignment`` (so the layout
+        matches C++); ``T`` is a marker only. A non-AnyCompatible inner (``Any``
+        or bare ``Object``) has no usable rendering, so the marker falls back to
+        ``()`` and the accessor pass skips it; an AnyCompatible inner's rendering
+        is cached for reuse by :meth:`_optional_accessor_blocks`.
+        """
+        if schema.size is None:
+            raise UnsupportedTypeError("Optional", "reflected size is unavailable for the field")
+        # A missing or unsupported alignment both land here (`.get(None)` -> None).
+        marker = C_RUST.RUST_ALIGN_MARKER.get(schema.alignment)
+        if marker is None:
+            raise UnsupportedTypeError(
+                "Optional", f"unsupported ffi::Optional alignment {schema.alignment}"
+            )
+        args = schema.args or ()
+        assert args  # TypeSchema's post_init fills a missing inner type.
+        if _is_any_compatible(args[0]):
+            inner = render_rust_type(args[0], self._ty_render)
+            self._opt_inner[schema.name] = inner  # reused by the accessor pass
+        else:
+            inner = "()"
+        opt = self.imports.record(C_RUST.RUST_OPTIONAL_TYPE)
+        align = self.imports.record(marker)
+        return f"{opt}<{inner}, {align}, {schema.size}>"
 
     def render_param(self, schema: TypeSchema) -> str:
         """Render an argument type (a top-level ``Any`` is the non-owning ``AnyView``)."""
@@ -282,21 +335,23 @@ class _ObjectRenderer:
         return lines
 
     def _impl_block(self, native: bool) -> list[str]:
-        """Emit `impl <T> { ffi_new; methods }`; empty list when there's nothing to emit."""
+        """Emit `impl <T> { ffi_new; methods; optional accessors }` (empty when nothing)."""
         methods = [
             m for m in self.info.methods if m.schema.name.rsplit(".", 1)[-1] != "__ffi_init__"
         ]
-        if not native and not methods:
+        # Each entry is one self-contained `fn` block; joined with a blank line.
+        blocks: list[list[str]] = []
+        if native:  # `native` implies `has_init` (see `_native_blocker`)
+            blocks.append(self._new_fn_native())
+        blocks += [self._method_fn(m) for m in methods]
+        blocks += self._optional_accessor_blocks()
+        if not blocks:
             return []
 
         inner: list[str] = []
-        if native:  # `native` implies `has_init` (see `_native_blocker`)
-            inner += self._new_fn_native()
-            if methods:
-                inner.append("")
-        for i, method in enumerate(methods):
-            inner += self._method_fn(method)
-            if i != len(methods) - 1:
+        for i, block in enumerate(blocks):
+            inner += block
+            if i != len(blocks) - 1:
                 inner.append("")
 
         return [
@@ -305,6 +360,57 @@ class _ObjectRenderer:
             "}",
             "",
         ]
+
+    def _optional_accessor_blocks(self) -> list[list[str]]:
+        """Emit a get (+ set, when the class is mutable) accessor per Optional field.
+
+        Reads/writes the opaque field via the C++ reflection getter/setter as a
+        native ``Option<V>``, caching the field lookup per call site in a
+        ``OnceLock`` (resolved once, not on every call). A non-AnyCompatible inner
+        (``Any`` / bare ``Object``) has no native ``Option<V>`` rendering, so its
+        accessor is skipped with a warning (the field is still reachable through
+        the runtime ``tvm_ffi::optional`` API). The AnyCompatible decision is made
+        here directly; ``_opt_inner`` is only reused as a render cache (re-rendered
+        on miss), so this pass does not depend on the struct-field pass order.
+        """
+        blocks: list[list[str]] = []
+        for field in _layout_fields(self.info.fields):
+            if field.origin != "Optional":
+                continue
+            args = field.args or ()
+            if not args or not _is_any_compatible(args[0]):
+                print(
+                    f"{C.TERM_YELLOW}[Warning] object {self.info.type_key}: optional field "
+                    f"{field.name!r} has no typed accessor (inner type is not AnyCompatible); "
+                    f"the field is emitted -- read/write it via the runtime "
+                    f"tvm_ffi::optional API{C.TERM_RESET}"
+                )
+                continue
+            # Reuse the inner rendered in the struct-field pass; re-render on miss
+            # so this pass is independent of pass ordering.
+            inner = self._opt_inner.get(field.name) or render_rust_type(args[0], self._ty_render)
+            self.imports.record("tvm_ffi::Result")
+            name, obj = field.name, self.obj_struct
+            # Per-call-site cache so the field-table scan runs once, not per call.
+            cell = "    static CELL: std::sync::OnceLock<tvm_ffi::FieldAccess> = std::sync::OnceLock::new();"
+            block = [
+                f"pub fn {name}(&self) -> Result<Option<{inner}>> {{",
+                cell,
+                f"    unsafe {{ self.{name}.read_cached::<{inner}>(&CELL, "
+                f'{obj}::type_index(), "{name}") }}',
+                "}",
+            ]
+            if self.info.mutable:
+                block += [
+                    "",
+                    f"pub fn set_{name}(&self, value: Option<{inner}>) -> Result<()> {{",
+                    cell,
+                    f"    unsafe {{ self.{name}.write_cached::<{inner}>(&CELL, "
+                    f'{obj}::type_index(), "{name}", value) }}',
+                    "}",
+                ]
+            blocks.append(block)
+        return blocks
 
     def _obj_literal_lines(self) -> list[str]:
         """Render the ``<Obj> { .. }`` literal moving the builder's fields in.
