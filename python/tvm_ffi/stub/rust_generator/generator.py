@@ -44,8 +44,8 @@ if TYPE_CHECKING:
 class RustGenerator:
     """Generator that emits Rust binding stubs.
 
-    Objects using an unrepresentable origin (``Union`` / ``Map`` / ``Dict`` /
-    ``List``) are skipped with a warning; global functions and
+    Objects using an unrepresentable origin (``Union`` / ``Dict`` / ``List`` /
+    ``tuple``) are skipped with a warning; global functions and
     ``__all__``/``export`` re-exports are not generated.
     """
 

@@ -31,6 +31,7 @@ RUST_TY_MAP_DEFAULTS = {
     "Any": "tvm_ffi::Any",
     "Callable": "tvm_ffi::Function",
     "Array": "tvm_ffi::Array",  # the crate's own Array<T>, NOT Vec
+    "Map": "tvm_ffi::Map",  # the crate's read-only Map<K, V>, NOT HashMap
     "Object": "tvm_ffi::Object",
     "Tensor": "tvm_ffi::Tensor",
     "Shape": "tvm_ffi::Shape",
@@ -40,6 +41,7 @@ RUST_TY_MAP_DEFAULTS = {
     # --- builtin object type keys (ffi.*) ---
     "ffi.String": "tvm_ffi::String",
     "ffi.Bytes": "tvm_ffi::Bytes",
+    "ffi.Map": "tvm_ffi::Map",
     "ffi.Module": "tvm_ffi::Module",
     "ffi.Error": "tvm_ffi::Error",
     "ffi.Object": "tvm_ffi::Object",
@@ -62,14 +64,15 @@ RUST_SCALAR_BY_SIZE = {
     ("float", 8): "f64",
 }
 
-#: Origins the crate has no FFI type for: ``Map``/``Dict``/``List``/``Union``
-#: have no Rust counterpart at all (do NOT map to ``HashMap``/``Vec``), and
-#: ``tuple`` only has a std rendering (Rust tuples) that is not layout-compatible
-#: with C++ ``ffi::Tuple``. ``render_rust_type`` raises ``UnsupportedTypeError``
-#: wherever one appears (field, argument, return, or nested) and the enclosing
-#: object is skipped. (``Optional`` is supported: native ``Option<T>`` at
-#: boundaries, layout-mirror as a direct struct field.)
-RUST_UNSUPPORTED_ORIGINS = frozenset({"Map", "Dict", "List", "Union", "tuple"})
+#: Origins the crate has no FFI type for: ``Dict``/``List``/``Union`` have no
+#: Rust counterpart at all (do NOT map to ``HashMap``/``Vec``), and ``tuple``
+#: only has a std rendering (Rust tuples) that is not layout-compatible with C++
+#: ``ffi::Tuple``. ``render_rust_type`` raises ``UnsupportedTypeError`` wherever
+#: one appears (field, argument, return, or nested) and the enclosing object is
+#: skipped. (``Optional`` is supported: native ``Option<T>`` at boundaries,
+#: layout-mirror as a direct struct field. ``Map`` is supported via the crate's
+#: read-only ``Map<K, V>`` -- see ``render_rust_type``.)
+RUST_UNSUPPORTED_ORIGINS = frozenset({"Dict", "List", "Union", "tuple"})
 
 #: Alignment value -> zero-sized marker (re-exported at the crate root) used to
 #: give ``tvm_ffi::Optional<T, A, N>`` its alignment (Rust has no const-generic

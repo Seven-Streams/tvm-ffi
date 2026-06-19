@@ -839,7 +839,7 @@ def test_render_nested() -> None:
     "schema",
     [
         TypeSchema("Union", (TypeSchema("int"), TypeSchema("str"))),
-        TypeSchema("Map", (TypeSchema("str"), TypeSchema("int"))),
+        TypeSchema("Map"),  # untyped map -> Map<Any, Any>, which is not AnyCompatible
         TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))),
         TypeSchema("List", (TypeSchema("int"),)),
         TypeSchema("tuple", (TypeSchema("int"), TypeSchema("float"))),
@@ -855,7 +855,7 @@ def test_render_unsupported_raises(schema: TypeSchema) -> None:
 @pytest.mark.parametrize(
     "inner",
     [
-        TypeSchema("Map", (TypeSchema("str"), TypeSchema("int"))),
+        TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))),
     ],
 )
 def test_render_unsupported_nested_raises(inner: TypeSchema) -> None:
@@ -878,6 +878,38 @@ def test_render_optional_is_native_option() -> None:
         TypeSchema("Array", (TypeSchema("Optional", (TypeSchema("ffi.String"),)),))
     )
     assert text == "Array<Option<String>>"  # nested Optional inside Array
+
+
+def test_render_map_typed() -> None:
+    # A typed map renders as the crate's read-only `Map<K, V>` (NOT std HashMap)
+    # and records its `use`, plus the `use` of each element type.
+    text, imports = _rust_render(TypeSchema("Map", (TypeSchema("str"), TypeSchema("int"))))
+    assert text == "Map<String, i64>"
+    assert RustUse("tvm_ffi::Map") in imports.items
+    assert RustUse("tvm_ffi::String") in imports.items
+
+    # Nested inside an Array round-trips through the same recursive path.
+    text, _ = _rust_render(
+        TypeSchema("Array", (TypeSchema("Map", (TypeSchema("ffi.String"), TypeSchema("int"))),))
+    )
+    assert text == "Array<Map<String, i64>>"
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        TypeSchema("Map"),  # 0 args -> Map<Any, Any>
+        TypeSchema("Map", (TypeSchema("Any"), TypeSchema("int"))),  # Any key
+        TypeSchema("Map", (TypeSchema("str"), TypeSchema("Object"))),  # bare Object value
+    ],
+)
+def test_render_map_non_any_compatible_inner_is_unsupported(schema: TypeSchema) -> None:
+    # `Map<K, V>` needs both K and V AnyCompatible to cross the Any boundary; an
+    # `Any` / bare-`Object` element (including the untyped `Map<Any, Any>` default)
+    # skips the enclosing object, exactly as before Map was supported.
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _rust_render(schema)
+    assert exc.value.origin == "Map"
 
 
 def test_ty_render_dedups_same_path() -> None:
@@ -1583,9 +1615,13 @@ def test_rust_method_any_return_stays_any_not_anyview() -> None:
 
 
 def _has_map_info() -> ObjectInfo:
+    # An *untyped* map field (`Map<Any, Any>`) is still unsupported -- `Any` is not
+    # AnyCompatible -- so this stays a skip fixture for the generic skip-handling
+    # tests below. (A *typed* `Map<K, V>` field renders fine; see
+    # ``test_rust_map_field_renders``.)
     return ObjectInfo(
         fields=[
-            NamedTypeSchema("cfg", TypeSchema("Map", (TypeSchema("str"), TypeSchema("int")))),
+            NamedTypeSchema("cfg", TypeSchema("Map")),
         ],
         methods=[],
         type_key="demo.HasMap",
@@ -1667,6 +1703,22 @@ def test_rust_bytes_field_maps_to_crate_bytes() -> None:
     text, imports = _gen_rust_object(info)
     assert "    pub payload: Bytes," in text
     assert RustUse("tvm_ffi::Bytes") in imports.items
+
+
+def test_rust_map_field_renders() -> None:
+    # A typed `Map<K, V>` field renders as the crate's read-only `Map` (a single
+    # pointer, layout-compatible with C++ `Map : ObjectRef`).
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("cfg", TypeSchema("Map", (TypeSchema("str"), TypeSchema("int")))),
+        ],
+        methods=[],
+        type_key="demo.Config",
+        parent_type_key="ffi.Object",
+    )
+    text, imports = _gen_rust_object(info)
+    assert "    pub cfg: Map<String, i64>," in text
+    assert RustUse("tvm_ffi::Map") in imports.items
 
 
 def test_rust_unknown_bare_origin_skips_object() -> None:

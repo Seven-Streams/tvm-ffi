@@ -134,6 +134,18 @@ def render_rust_type(schema: TypeSchema, ty_render: Callable[[str], str]) -> str
         elem = render_rust_type(args[0], ty_render)
         return f"{ty_render('Array')}<{elem}>"
 
+    if origin == "Map":
+        # The crate's read-only `Map<K, V>`. Both the key and value must be
+        # AnyCompatible to cross the Any boundary (`Map<Any, Any>` -- the default
+        # for an untyped map -- is not, so it skips the enclosing object, exactly
+        # as before). As a `#[repr(C)]` field a `Map` is a single pointer, so it
+        # is layout-compatible with C++ `Map : ObjectRef` and needs no mirror.
+        assert args  # TypeSchema's post_init fills a missing K/V pair with (Any, Any).
+        if any(schema_contains(a, RUST_NOT_ANY_COMPATIBLE_ORIGINS) for a in args):
+            raise UnsupportedTypeError(origin)
+        params = ", ".join(render_rust_type(a, ty_render) for a in args)
+        return f"{ty_render('Map')}<{params}>"
+
     if origin == "Callable":
         # The crate's Function is type-erased: no generic params.
         return ty_render("Callable")

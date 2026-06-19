@@ -397,9 +397,15 @@ Limitations
 A type that mentions an origin the Rust crate cannot represent -- in any
 position: field, method argument, return type, or nested inside another
 container -- is explicitly unsupported: the whole binding is skipped with a
-warning. This covers ``Map`` / ``Dict`` / ``List`` / ``Union`` (no Rust
-counterpart) as well as ``Optional`` / ``tuple`` (std ``Option<T>`` and Rust
-tuples do not match the C++ ``ffi::Optional`` / ``ffi::Tuple`` memory layout).
+warning. This covers ``Dict`` / ``List`` / ``Union`` (no Rust counterpart) and
+``tuple`` (Rust tuples do not match the C++ ``ffi::Tuple`` memory layout).
+
+``Map`` is supported through the crate's read-only ``Map<K, V>``, but only when
+both the key and the value are themselves representable (specifically
+``AnyCompatible``): an untyped ``Map<Any, Any>``, or one whose key/value is the
+bare base ``Object``, cannot cross the ``Any`` boundary and skips the enclosing
+binding. ``Optional`` is supported as the native ``Option<T>`` at boundaries and
+as a layout-mirror (``tvm_ffi::Optional``) for a direct struct field.
 
 A constructor alone cannot be generated when a default comes from a
 ``refl::default_factory`` or when a default value has no Rust literal
