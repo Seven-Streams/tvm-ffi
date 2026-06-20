@@ -2197,17 +2197,17 @@ def test_rust_method_any_return_stays_any_not_anyview() -> None:
     assert RustUse("tvm_ffi::AnyView") in imports.items
 
 
-def _has_map_info() -> ObjectInfo:
-    # An *untyped* map field (`Map<Any, Any>`) is still unsupported -- `Any` is not
-    # AnyCompatible -- so this stays a skip fixture for the generic skip-handling
-    # tests below. (A *typed* `Map<K, V>` field renders fine; see
-    # ``test_rust_map_field_renders``.)
+def _has_dict_info() -> ObjectInfo:
+    # A `Dict` field is genuinely unsupported (no Rust type at all), so this stays
+    # a skip fixture for the generic skip-handling tests below. (An untyped
+    # `Map<Any, Any>` field now renders -- see ``test_rust_map_any_field_renders``
+    # -- because as a field a `Map` is a single pointer with phantom params.)
     return ObjectInfo(
         fields=[
-            NamedTypeSchema("cfg", TypeSchema("Map")),
+            NamedTypeSchema("cfg", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int")))),
         ],
         methods=[],
-        type_key="demo.HasMap",
+        type_key="demo.HasDict",
         parent_type_key="ffi.Object",
     )
 
@@ -2217,13 +2217,13 @@ def test_rust_object_unsupported_raises() -> None:
     # resets the block). Boilerplate `use`s recorded before the raise may stay
     # behind in the collector -- harmless, generated files open with
     # `#![allow(unused_imports)]`.
-    block = _rust_object_block("demo.HasMap")
+    block = _rust_object_block("demo.HasDict")
     imports = RustImports(items=[RustUse("tvm_ffi::Tensor")])
     with pytest.raises(UnsupportedTypeError) as exc:
         generate_rust_object(
-            block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), _has_map_info()
+            block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), _has_dict_info()
         )
-    assert exc.value.origin == "Map"
+    assert exc.value.origin == "Dict"
     assert RustUse("tvm_ffi::Tensor") in imports.items  # pre-seeded use kept
 
 
@@ -2239,7 +2239,7 @@ def test_rust_stage3_skipped_type_not_counted_as_defined(
                 f"{C.RUST_SYNTAX.begin} import-section",
                 C.RUST_SYNTAX.end,
                 "",
-                f"{C.RUST_SYNTAX.begin} object/demo.HasMap",
+                f"{C.RUST_SYNTAX.begin} object/demo.HasDict",
                 C.RUST_SYNTAX.end,
                 "",
                 f"{C.RUST_SYNTAX.begin} object/demo.Holder",
@@ -2250,9 +2250,9 @@ def test_rust_stage3_skipped_type_not_counted_as_defined(
         encoding="utf-8",
     )
     infos = {
-        "demo.HasMap": _has_map_info(),
+        "demo.HasDict": _has_dict_info(),
         "demo.Holder": ObjectInfo(
-            fields=[NamedTypeSchema("child", TypeSchema("demo.HasMap"))],
+            fields=[NamedTypeSchema("child", TypeSchema("demo.HasDict"))],
             methods=[],
             type_key="demo.Holder",
             parent_type_key="ffi.Object",
@@ -2269,10 +2269,10 @@ def test_rust_stage3_skipped_type_not_counted_as_defined(
         generator=RustGenerator(),
     )
     text = "\n".join(info.lines)
-    assert "[Skipped] object demo.HasMap" in capsys.readouterr().out
-    assert "struct HasMapObj" not in text  # skipped block reset to bare markers
-    assert "    pub child: HasMap," in text  # the referencing object still renders
-    assert "use crate::demo::HasMap;" in text  # ... and keeps its (crate::-rooted) import
+    assert "[Skipped] object demo.HasDict" in capsys.readouterr().out
+    assert "struct HasDictObj" not in text  # skipped block reset to bare markers
+    assert "    pub child: HasDict," in text  # the referencing object still renders
+    assert "use crate::demo::HasDict;" in text  # ... and keeps its (crate::-rooted) import
 
 
 def test_rust_stage3_skipped_base_skips_child(
@@ -2478,6 +2478,74 @@ def test_rust_map_field_renders() -> None:
     text, imports = _gen_rust_object(info)
     assert "    pub cfg: Map<String, i64>," in text
     assert RustUse("tvm_ffi::Map") in imports.items
+
+
+def test_rust_map_any_field_renders() -> None:
+    # Keystone recovery: a `Map<str, Any>` (or untyped `Map<Any, Any>`) FIELD is a
+    # single pointer with phantom params, so it renders even though `Any` is not
+    # AnyCompatible -- only a typed accessor (not emitted for Map) would need it.
+    # In arg/return/nested position the guard still rejects it (those must marshal).
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("d", TypeSchema("Map", (TypeSchema("str"), TypeSchema("Any")))),
+            NamedTypeSchema("u", TypeSchema("Map")),  # untyped -> Map<Any, Any>
+        ],
+        methods=[],
+        type_key="ir.DictAttrs",
+        parent_type_key="ffi.Object",
+    )
+    text, imports = _gen_rust_object(info)
+    assert "    pub d: Map<String, Any>," in text
+    assert "    pub u: Map<Any, Any>," in text
+    assert RustUse("tvm_ffi::Map") in imports.items
+    assert RustUse("tvm_ffi::Any") in imports.items
+    assert "[Skipped]" not in text  # the object is NOT skipped
+
+
+def test_rust_map_value_genuinely_unsupported_still_skips() -> None:
+    # The relaxation is only for phantom-OK params: a `Map` value that is not a
+    # valid Rust type at all (here a `Dict`) still skips the object.
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema(
+                "bad",
+                TypeSchema(
+                    "Map",
+                    (TypeSchema("str"), TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int")))),
+                ),
+            ),
+        ],
+        methods=[],
+        type_key="ir.Bad",
+        parent_type_key="ffi.Object",
+    )
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _gen_rust_object(info)
+    assert exc.value.origin == "Dict"
+
+
+def test_rust_map_any_field_unskips_cascade(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The keystone cascade: `DictAttrs.__dict__ : Map<str, Any>` no longer skips
+    # `DictAttrs`, so reference-aware buildability marks it (and `BaseFunc`, which
+    # references it) buildable -- the consumers that round 3 cascade-skipped now
+    # come back.
+    dict_attrs = ObjectInfo(
+        fields=[NamedTypeSchema("d", TypeSchema("Map", (TypeSchema("str"), TypeSchema("Any"))))],
+        methods=[],
+        type_key="ir.DictAttrs",
+        parent_type_key="ffi.Object",
+    )
+    base_func = ObjectInfo(
+        fields=[NamedTypeSchema("attrs", TypeSchema("ir.DictAttrs"))],
+        methods=[],
+        type_key="ir.BaseFunc",
+        parent_type_key="ffi.Object",
+    )
+    fixtures = {"ir.DictAttrs": dict_attrs, "ir.BaseFunc": base_func}
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
+    ty = RC.RUST_TY_MAP_DEFAULTS.copy()
+    assert rust_codegen._base_buildable("ir.DictAttrs", ty) is True
+    assert rust_codegen._base_buildable("ir.BaseFunc", ty) is True  # cascade recovered
 
 
 def test_rust_unknown_bare_origin_skips_object() -> None:

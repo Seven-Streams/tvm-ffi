@@ -299,12 +299,37 @@ class _ObjectRenderer:
         A direct ``Optional<T>`` field renders as the layout-mirror
         ``tvm_ffi::Optional<T, A, N>`` (size/alignment from reflection) -- this is
         the *only* position the mirror is used; elsewhere ``Optional`` is the
-        native ``Option<T>``. Non-scalar origins render plainly.
+        native ``Option<T>``. A direct ``Map<K, V>`` field is a single pointer
+        whose params are phantom, so it renders even with non-AnyCompatible K/V
+        (see :meth:`_render_map_field`). Non-scalar origins render plainly.
         """
         if schema.origin == "Optional":
             return self._render_optional_field(schema)
+        if schema.origin == "Map":
+            return self._render_map_field(schema)
         narrowed = C_RUST.RUST_SCALAR_BY_SIZE.get((schema.origin, schema.size))
         return narrowed if narrowed is not None else render_rust_type(schema, self._ty_render)
+
+    def _render_map_field(self, schema: NamedTypeSchema) -> str:
+        """Render a direct ``Map<K, V>`` struct field, allowing non-AnyCompatible K/V.
+
+        As a ``#[repr(C)]`` field a ``Map`` is a single pointer
+        (``ObjectArc<MapObj>``) whose ``K``/``V`` are phantom markers, so its
+        layout is independent of them -- unlike an argument/return/nested
+        position, where the ``Map`` must itself be ``AnyCompatible`` to marshal
+        across the ``Any`` boundary. This lets the ``DictAttrs.__dict__ : Map<str,
+        Any>`` keystone (and the large cascade hanging off it) render as a
+        typed-pointer field with no typed accessor; the field is read via the
+        runtime reflection API. Each ``K``/``V`` still renders through
+        ``render_rust_type``, so a param that is not a valid Rust type at all
+        (``Dict`` / ``List`` / ``Array<Any>`` / ...) still raises and skips the
+        object. (A nested ``Map<_, Map<_, Any>>`` is conservatively skipped: the
+        inner map keeps the arg-position guard. The flat keystone is the goal.)
+        """
+        args = schema.args or ()
+        assert args  # TypeSchema's post_init fills a missing K/V pair with (Any, Any).
+        params = ", ".join(render_rust_type(a, self._ty_render) for a in args)
+        return f"{self._ty_render('Map')}<{params}>"
 
     def _render_optional_field(self, schema: NamedTypeSchema) -> str:
         """Render a direct ``Optional<T>`` field as ``tvm_ffi::Optional<T, AlignK, N>``.
