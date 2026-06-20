@@ -768,13 +768,13 @@ def test_rustuse_keeps_qualified_path() -> None:
 
 
 def test_rustuse_normalizes_dotted_ffi_name() -> None:
-    # leading `ffi` segment rewritten via RUST_MOD_MAP, dots -> ::
+    # leading `ffi` segment rewritten via RUST_MOD_MAP to the external crate
     assert RustUse("ffi.String").path == "tvm_ffi::String"
-    # unmapped crate prefix is preserved, dots still -> ::
+    # a generated-tree type key is rooted at `crate` (mounted at the crate root)
     u = RustUse("my_pkg.sub.Foo")
-    assert u.path == "my_pkg::sub::Foo"
+    assert u.path == "crate::my_pkg::sub::Foo"
     assert u.leaf == "Foo"
-    assert u.as_use_line() == "use my_pkg::sub::Foo;"
+    assert u.as_use_line() == "use crate::my_pkg::sub::Foo;"
 
 
 @pytest.mark.parametrize("bare", ["i64", "bool"])
@@ -912,6 +912,43 @@ def test_render_map_non_any_compatible_inner_is_unsupported(schema: TypeSchema) 
     assert exc.value.origin == "Map"
 
 
+@pytest.mark.parametrize(
+    "schema",
+    [
+        TypeSchema("Array", (TypeSchema("Any"),)),  # Array<Any>
+        TypeSchema("Array", (TypeSchema("Object"),)),  # Array<bare Object>
+        TypeSchema("Array", (TypeSchema("Array", (TypeSchema("Any"),)),)),  # Array<Array<Any>>
+    ],
+)
+def test_render_array_non_any_compatible_element_is_unsupported(schema: TypeSchema) -> None:
+    # C4: `Array<T>` requires `T: AnyCompatible`; an `Any` / bare-`Object` element
+    # (at any depth) has no rendering (`Array<Any>` would not compile) and skips
+    # the enclosing object -- symmetric with the `Map` / `Optional` guards.
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _rust_render(schema)
+    assert exc.value.origin == "Array"
+
+
+@pytest.mark.parametrize(
+    "type_key",
+    ["ffi.reflection.AccessPath", "ffi.reflection.AccessStep", "ffi.SomethingUnexposed"],
+)
+def test_rust_unmapped_ffi_builtin_field_is_unsupported(type_key: str) -> None:
+    # C1: an `ffi.*` builtin absent from the ty_map is a crate type the Rust crate
+    # does not expose (e.g. `ffi.reflection.AccessPath`). Referencing it must skip
+    # the enclosing object, NOT emit a `use tvm_ffi::reflection::AccessPath;` for a
+    # nonexistent crate path (the old passthrough did exactly that -> E0432).
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("p", TypeSchema(type_key))],
+        methods=[],
+        type_key="cpp_rust_test.Refs",
+        parent_type_key="ffi.Object",
+    )
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _gen_rust_object(info)
+    assert exc.value.origin == type_key
+
+
 def test_ty_render_dedups_same_path() -> None:
     imports = RustImports()
     ty_map = RC.RUST_TY_MAP_DEFAULTS
@@ -924,15 +961,46 @@ def test_ty_render_dedups_same_path() -> None:
     assert imports.items == [RustUse("tvm_ffi::Array")]  # recorded exactly once
 
 
-def test_ty_render_same_leaf_different_path_raises() -> None:
-    # No auto-aliasing: two different paths wanting the same in-scope name only
-    # arise from pathological type names, declared unsupported -> the enclosing
-    # object is skipped (rename the type or hand-write the binding).
+def test_ty_render_same_leaf_different_path_full_qualifies() -> None:
+    # No auto-aliasing: two different paths wanting the same in-scope name are
+    # disambiguated by full-qualifying the loser inline (it records no `use`).
     imports = RustImports()
     assert imports.record("crate_a::Foo") == "Foo"  # first claims the bare leaf
-    with pytest.raises(UnsupportedTypeError):
-        imports.record("crate_b::Foo")
-    assert imports.items == [RustUse("crate_a::Foo")]  # the loser is not recorded
+    assert imports.record("crate_b::Foo") == "crate_b::Foo"  # loser uses full path
+    assert imports.items == [RustUse("crate_a::Foo")]  # only the winner is imported
+    # The winner still dedups by path; the loser stays full-qualified, no `use`.
+    assert imports.record("crate_a::Foo") == "Foo"
+    assert imports.record("crate_b::Foo") == "crate_b::Foo"
+
+
+def test_rust_imports_seed_local_types_records_paths_and_leaves() -> None:
+    imports = RustImports()
+    imports.seed_local_types(["tirx.Call"])
+    # both the ref name and its `<Name>Obj` twin are claimed, crate::-rooted
+    assert imports.local_paths == {"crate::tirx::Call", "crate::tirx::CallObj"}
+    assert imports.local_leaves == {"Call", "CallObj"}
+
+
+def test_rust_imports_cross_module_collides_with_local_full_qualifies() -> None:
+    # A4: a cross-module import whose leaf collides with a locally-defined type is
+    # referenced by full path inline (no `use`, which would be an E0255 clash with
+    # the local `pub struct Call`).
+    imports = RustImports()
+    imports.seed_local_types(["tirx.Call"])  # this file defines `Call` / `CallObj`
+    assert imports.record("relax.expr.Call") == "crate::relax::expr::Call"
+    assert imports.items == []  # no colliding `use` emitted
+    # the `<Name>Obj` twin collides too (a cross-module base `CallObj`)
+    assert imports.record("relax.expr.CallObj") == "crate::relax::expr::CallObj"
+    assert imports.items == []
+
+
+def test_rust_imports_same_file_reference_uses_bare_leaf() -> None:
+    # A4: a reference to a type the file itself defines is an in-scope sibling --
+    # bare leaf, never full-qualified (its `use` is dropped by the import section).
+    imports = RustImports()
+    imports.seed_local_types(["tirx.Call"])
+    assert imports.record("tirx.Call") == "Call"
+    assert imports.record("tirx.CallObj") == "CallObj"
 
 
 # ---------------------------------------------------------------------------
@@ -1131,6 +1199,53 @@ def test_rust_unrenderable_default_blocks_native(
     out = capsys.readouterr().out
     assert "[Warning] object cpp_rust_test.Point: skipping `ffi_new`" in out
     assert "'y'" in out
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        (NamedTypeSchema("a", TypeSchema("int"), default=2), "2"),
+        (NamedTypeSchema("a", TypeSchema("bool"), default=True), "true"),
+        (NamedTypeSchema("a", TypeSchema("float"), default=0.5), "0.5"),
+        (NamedTypeSchema("a", TypeSchema("float"), default=5), "5.0"),  # int coerces to float
+        (NamedTypeSchema("a", TypeSchema("str"), default="x"), 'tvm_ffi::String::from("x")'),
+        (NamedTypeSchema("a", TypeSchema("ffi.String"), default="x"), 'tvm_ffi::String::from("x")'),
+        # C2: type mismatches have no Rust literal -> None (not a wrong-typed value)
+        (NamedTypeSchema("a", TypeSchema("dtype"), default=""), None),
+        (NamedTypeSchema("a", TypeSchema("DataType"), default="float32"), None),
+        (NamedTypeSchema("a", TypeSchema("Device"), default=""), None),
+        (NamedTypeSchema("a", TypeSchema("int"), default="5"), None),  # str on int field
+        (NamedTypeSchema("a", TypeSchema("bool"), default=1), None),  # int on bool field
+        (NamedTypeSchema("a", TypeSchema("float"), default=float("inf")), None),  # non-finite
+    ],
+)
+def test_rust_default_expr_matches_field_type(field: NamedTypeSchema, expected: str | None) -> None:
+    assert rust_codegen._default_expr(field) == expected
+
+
+def _dtype_default_info() -> ObjectInfo:
+    """Build a native root type with a DLDataType field carrying a string default."""
+    return ObjectInfo(
+        fields=[NamedTypeSchema("dtype", TypeSchema("dtype"), default="")],
+        methods=[],
+        type_key="cpp_rust_test.Typed",
+        parent_type_key="ffi.Object",
+        has_init=True,
+    )
+
+
+def test_rust_dtype_string_default_blocks_native(capsys: pytest.CaptureFixture[str]) -> None:
+    # C2: a `DLDataType` field with a registered string default must NOT render as
+    # `tvm_ffi::String::from(...)` (an E0308 mismatch). The default has no Rust
+    # literal, so it blocks native construction with a clear warning instead.
+    text, _ = _gen_rust_object(_dtype_default_info())
+    assert "pub dtype: DLDataType," in text  # the field type still renders
+    assert "tvm_ffi::String::from" not in text  # the broken String default is gone
+    assert "ffi_new" not in text  # native construction blocked
+    assert "TypedBuilder" not in text
+    out = capsys.readouterr().out
+    assert "[Warning] object cpp_rust_test.Typed: skipping `ffi_new`" in out
+    assert "'dtype'" in out
 
 
 def _native_narrow_info() -> ObjectInfo:
@@ -1460,6 +1575,79 @@ def _patch_native_point_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key]())
 
 
+def _native_attrs_info() -> ObjectInfo:
+    """Build a native root parent in module `ir` (the cross-module base for the child)."""
+    return ObjectInfo(
+        fields=[NamedTypeSchema("span", TypeSchema("int"))],
+        methods=[],
+        type_key="ir.Attrs",
+        has_init=True,
+    )
+
+
+def _native_relax_foo_info() -> ObjectInfo:
+    """Build a native derived `relax.Foo` whose parent `ir.Attrs` is cross-module."""
+    return ObjectInfo(
+        fields=[NamedTypeSchema("k", TypeSchema("int"))],
+        methods=[],
+        type_key="relax.Foo",
+        parent_type_key="ir.Attrs",
+        has_init=True,
+    )
+
+
+def test_rust_cross_module_base_obj_is_imported() -> None:
+    # A2: a derived type embeds its parent as `base: <Parent>Obj`. When the parent
+    # lives in another generated module, the value type `<Parent>Obj` must be
+    # imported (crate::-rooted), else the struct / Deref / builder won't compile.
+    info = ObjectInfo(
+        fields=[],
+        methods=[],
+        type_key="relax.Foo",
+        parent_type_key="ir.Attrs",
+    )
+    text, imports = _gen_rust_object(info)
+    assert "    base: AttrsObj," in text  # parent Obj embedded by leaf name
+    assert "    type Target = AttrsObj;" in text  # Deref target is the base Obj
+    uses = {u.as_use_line() for u in imports.items}
+    assert "use crate::ir::AttrsObj;" in uses
+    assert "use ir::AttrsObj;" not in uses  # never the bare (extern-prelude) form
+
+
+def test_rust_native_derived_cross_module_imports_base_and_parent_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A2: a native derived type whose parent lives in another module must import
+    # BOTH the embedded `<Parent>Obj` (struct field / builder store + setter) AND
+    # the parent ref type `<Parent>` (used by the unset-base default-construction
+    # fallback in `build_obj`). Both must be crate::-rooted.
+    fixtures = {"ir.Attrs": _native_attrs_info, "relax.Foo": _native_relax_foo_info}
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key]())
+    text, imports = _gen_rust_object(_native_relax_foo_info())
+    assert "    base: Option<AttrsObj>," in text  # builder stores the parent Obj
+    assert "pub fn base(mut self, base: AttrsObj) -> Self {" in text
+    assert "None => Attrs::ffi_new().build_obj()" in text  # parent ref in the fallback
+    uses = {u.as_use_line() for u in imports.items}
+    assert "use crate::ir::AttrsObj;" in uses  # embedded base value type
+    assert "use crate::ir::Attrs;" in uses  # parent ref type
+
+
+def test_rust_same_module_base_obj_filtered_from_imports() -> None:
+    # A2: a parent in the SAME file is embedded by leaf name; its recorded
+    # `<Parent>Obj` import must be filtered out alongside the ref type (the import
+    # section drops both `crate::..::Expr` and its `..ExprObj` twin), so neither
+    # collides with the local `Expr` / `ExprObj` definitions.
+    block = _rust_import_block()
+    imports = RustImports(items=[RustUse("cpp_rust_test.ExprObj"), RustUse("cpp_rust_test.Expr")])
+    generate_rust_import_section(
+        block, imports, Options(), defined_types={"crate::cpp_rust_test::Expr"}
+    )
+    assert block.lines == [
+        "// tvm-ffi-stubgen(begin): import-section",
+        "// tvm-ffi-stubgen(end)",
+    ]
+
+
 def test_rust_native_derived_base_setter(monkeypatch: pytest.MonkeyPatch) -> None:
     # A derived native type does NOT flatten ancestor fields, and `ffi_new` is
     # nullary like everywhere else: `base` is a consuming setter (uniform API)
@@ -1484,6 +1672,383 @@ def test_rust_native_derived_base_setter(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "pub fn x(" not in text
     assert "pub fn y(" not in text
     assert "__ffi_init__" not in text
+
+
+def test_rust_field_named_base_renames_synthetic_embed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Y: a derived type with its OWN reflected field `base` (e.g. tirx.Ramp,
+    # arith.IterSumExpr) must not collide with the synthetic parent-embed (E0124).
+    # The embed renames to `_base` (derive(Object) reads the first field
+    # positionally); the real `base` field keeps its name. Builder setters/inits,
+    # the Deref target, the base-resolve fallback, and the obj-literal all follow.
+    parent = ObjectInfo(
+        fields=[NamedTypeSchema("v", TypeSchema("int"))],
+        methods=[],
+        type_key="cpp_rust_test.PExpr",
+        has_init=True,
+    )
+    child = ObjectInfo(
+        fields=[NamedTypeSchema("base", TypeSchema("int"))],  # real C++ field named `base`
+        methods=[],
+        type_key="cpp_rust_test.Ramp",
+        parent_type_key="cpp_rust_test.PExpr",
+        has_init=True,
+    )
+    fixtures = {"cpp_rust_test.PExpr": parent, "cpp_rust_test.Ramp": child}
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
+    text, _ = _gen_rust_object(child)
+    # struct: synthetic embed renamed (first field), real `base` field kept
+    assert "struct RampObj {" in text
+    assert "    _base: PExprObj," in text  # synthetic parent embed renamed
+    assert "    pub base: i64," in text  # the real C++ field keeps `base`
+    # Deref targets the renamed embed
+    assert "&self._base" in text
+    # builder: two distinct stores + setters, no `base`/`base` collision
+    assert "    _base: Option<PExprObj>," in text
+    assert "    base: Option<i64>," in text
+    assert "pub fn _base(mut self, _base: PExprObj) -> Self {" in text  # parent setter
+    assert "pub fn base(mut self, base: i64) -> Self {" in text  # real-field setter
+    assert "self._base = Some(_base);" in text
+    assert "self.base = Some(base);" in text
+    # build_obj: base fallback + obj-literal use the renamed embed
+    assert "let _base = match self._base {" in text
+    assert "None => PExpr::ffi_new().build_obj()" in text
+    assert "let base = self.base.ok_or_else(" in text  # the real field, unwrapped
+    assert "Ok(RampObj {" in text
+    assert "        _base," in text  # obj-literal shorthand: the embed local
+    assert "        base," in text  # obj-literal shorthand: the real field local
+
+
+def _three_level_fixtures() -> dict[str, ObjectInfo]:
+    """Build a native 3-level chain GP -> P -> C, each with one distinct own field."""
+    return {
+        "cpp_rust_test.GP": ObjectInfo(
+            fields=[NamedTypeSchema("a", TypeSchema("int"))],
+            methods=[],
+            type_key="cpp_rust_test.GP",
+            has_init=True,
+        ),
+        "cpp_rust_test.P": ObjectInfo(
+            fields=[NamedTypeSchema("b", TypeSchema("int"))],
+            methods=[],
+            type_key="cpp_rust_test.P",
+            parent_type_key="cpp_rust_test.GP",
+            has_init=True,
+        ),
+        "cpp_rust_test.C": ObjectInfo(
+            fields=[NamedTypeSchema("c", TypeSchema("int"))],
+            methods=[],
+            type_key="cpp_rust_test.C",
+            parent_type_key="cpp_rust_test.P",
+            has_init=True,
+        ),
+    }
+
+
+def test_rust_multilevel_inheritance_no_field_flattening(monkeypatch: pytest.MonkeyPatch) -> None:
+    # C3: each level's `Obj` struct and its `build_obj` literal use ONLY that
+    # level's own fields (ancestor fields live in the embedded `base`), so a child
+    # never assigns an ancestor field into a parent `Obj`. The E0560
+    # (`RelaxFrameObj has no field is_func`) the feedback saw is an A4 same-leaf
+    # name-collision artifact, not a flattening bug in the generator.
+    fixtures = _three_level_fixtures()
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
+
+    text_c, _ = _gen_rust_object(fixtures["cpp_rust_test.C"])
+    assert "struct CObj {" in text_c
+    assert "    base: PObj," in text_c  # parent embedded, not flattened
+    assert "    pub c: i64," in text_c
+    assert "pub a:" not in text_c and "pub b:" not in text_c  # no ancestor fields
+    assert "None => P::ffi_new().build_obj()" in text_c  # base via the parent's builder
+    assert "Ok(CObj {" in text_c  # the literal targets C's own Obj ...
+    assert "let c = self.c.ok_or_else(" in text_c  # ... binding only its own field
+    assert "let a " not in text_c and "let b " not in text_c
+
+    text_p, _ = _gen_rust_object(fixtures["cpp_rust_test.P"])
+    assert "    base: GPObj," in text_p
+    assert "    pub b: i64," in text_p
+    assert "pub a:" not in text_p  # grandparent field stays in the embedded base
+    assert "Ok(PObj {" in text_p
+    assert "let b = self.b.ok_or_else(" in text_p
+
+
+def test_rust_skipped_base_skips_descendant_transitively(monkeypatch: pytest.MonkeyPatch) -> None:
+    # D: a base with an unsupported field (here a `Dict`) is itself skipped, so its
+    # `<Base>Obj` is never emitted. A subclass embedding `base: <Base>Obj` would not
+    # compile, so it is skipped transitively naming the unbuildable base.
+    base = ObjectInfo(
+        fields=[NamedTypeSchema("m", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))))],
+        methods=[],
+        type_key="cpp_rust_test.Base",
+        parent_type_key="ffi.Object",
+    )
+    child = ObjectInfo(
+        fields=[NamedTypeSchema("x", TypeSchema("int"))],
+        methods=[],
+        type_key="cpp_rust_test.Child",
+        parent_type_key="cpp_rust_test.Base",
+    )
+    fixtures = {"cpp_rust_test.Base": base, "cpp_rust_test.Child": child}
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
+    # The base itself is unsupported (the `Dict` field has no Rust rendering).
+    with pytest.raises(UnsupportedTypeError) as base_exc:
+        _gen_rust_object(base)
+    assert base_exc.value.origin == "Dict"
+    # The child is skipped transitively, the error naming the unbuildable base.
+    with pytest.raises(UnsupportedTypeError) as child_exc:
+        _gen_rust_object(child)
+    assert child_exc.value.origin == "cpp_rust_test.Base"
+
+
+def test_rust_skipped_grandparent_skips_whole_subtree(monkeypatch: pytest.MonkeyPatch) -> None:
+    # D: an unbuildable ancestor propagates down the whole chain. Root has an
+    # unsupported field; Mid renders on its own but embeds RootObj; Leaf embeds
+    # MidObj. Both Mid and Leaf are skipped (each naming its immediate parent).
+    root = ObjectInfo(
+        fields=[NamedTypeSchema("t", TypeSchema("tuple", (TypeSchema("int"), TypeSchema("int"))))],
+        methods=[],
+        type_key="cpp_rust_test.Root",
+        parent_type_key="ffi.Object",
+    )
+    mid = ObjectInfo(
+        fields=[NamedTypeSchema("b", TypeSchema("int"))],
+        methods=[],
+        type_key="cpp_rust_test.Mid",
+        parent_type_key="cpp_rust_test.Root",
+    )
+    leaf = ObjectInfo(
+        fields=[NamedTypeSchema("c", TypeSchema("int"))],
+        methods=[],
+        type_key="cpp_rust_test.Leaf",
+        parent_type_key="cpp_rust_test.Mid",
+    )
+    fixtures = {k.type_key: k for k in (root, mid, leaf)}
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
+    with pytest.raises(UnsupportedTypeError) as mid_exc:  # Mid skipped: Root unrenderable
+        _gen_rust_object(mid)
+    assert mid_exc.value.origin == "cpp_rust_test.Root"
+    with pytest.raises(UnsupportedTypeError) as leaf_exc:  # Leaf skipped: Root up the chain
+        _gen_rust_object(leaf)
+    assert leaf_exc.value.origin == "cpp_rust_test.Mid"
+
+
+def test_rust_unresolvable_base_is_not_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # D (lenient): a base that cannot be RESOLVED from the registry is not treated
+    # as skipped -- a descendant is dropped only when an ancestor is *provably*
+    # unrenderable. The derived type still generates (non-native, since the parent
+    # chain also cannot be proven constructible).
+    def boom(key: str) -> ObjectInfo:
+        raise KeyError(key)
+
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", boom)
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("x", TypeSchema("int"))],
+        methods=[],
+        type_key="cpp_rust_test.Child",
+        parent_type_key="cpp_rust_test.Missing",
+    )
+    text, _ = _gen_rust_object(info)
+    assert "struct ChildObj {" in text  # still generated, not skipped
+    assert "base: MissingObj," in text  # references the parent by name
+    assert "ffi_new" not in text  # non-native: parent not provably constructible
+
+
+def test_rust_unmapped_ffi_base_is_skipped() -> None:
+    # X: a type whose parent is an unmapped `ffi.*` builtin (e.g. `ffi.Enum`) has
+    # no crate `<X>Obj` to embed, so it is skipped -- not emitted with a dangling
+    # `use tvm_ffi::EnumObj;` base import.
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("x", TypeSchema("int"))],
+        methods=[],
+        type_key="testing.MyEnum",
+        parent_type_key="ffi.Enum",
+    )
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _gen_rust_object(info)
+    assert exc.value.origin == "ffi.Enum"
+
+
+def test_rust_field_referencing_skipped_type_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # X: a field whose type was itself skipped (here `S` has a `Dict` field) must
+    # not leave a dangling `use`/field type. The referencing type is skipped, and
+    # no import for the skipped type is recorded (the raise precedes the record).
+    skipped = ObjectInfo(
+        fields=[NamedTypeSchema("m", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))))],
+        methods=[],
+        type_key="ir.S",
+        parent_type_key="ffi.Object",
+    )
+    user = ObjectInfo(
+        fields=[NamedTypeSchema("s", TypeSchema("ir.S"))],
+        methods=[],
+        type_key="relax.User",
+        parent_type_key="ffi.Object",
+    )
+    fixtures = {"ir.S": skipped, "relax.User": user}
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
+    imports = RustImports()
+    block = _rust_object_block("relax.User")
+    with pytest.raises(UnsupportedTypeError) as exc:
+        generate_rust_object(block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), user)
+    assert exc.value.origin == "ir.S"
+    # the skipped type's import was never recorded (raise before record)
+    assert not any(u.path == "crate::ir::S" for u in imports.items)
+
+
+def test_rust_cyclic_type_references_terminate(monkeypatch: pytest.MonkeyPatch) -> None:
+    # X: two mutually-referencing types must not loop in the buildability probe
+    # (`check_refs` is disabled during the dry-render, breaking the recursion).
+    # Both are buildable, so both generate, each referencing the other by name.
+    a = ObjectInfo(
+        fields=[NamedTypeSchema("b", TypeSchema("m.B"))],
+        methods=[],
+        type_key="m.A",
+        parent_type_key="ffi.Object",
+    )
+    b = ObjectInfo(
+        fields=[NamedTypeSchema("a", TypeSchema("m.A"))],
+        methods=[],
+        type_key="m.B",
+        parent_type_key="ffi.Object",
+    )
+    fixtures = {"m.A": a, "m.B": b}
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
+    text_a, imports_a = _gen_rust_object(a)
+    assert "    pub b: B," in text_a
+    assert "use crate::m::B;" in {u.as_use_line() for u in imports_a.items}
+
+
+def test_rust_multi_hop_skip_propagates_to_consumers(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Round 3: `Mid` own-renders but references the SKIPPED `Leaf` (Dict field), so
+    # `Mid` is skipped (1-hop). Reference-aware buildability propagates that: a
+    # `Consumer` whose field is `Mid` is skipped too -- it must NOT emit a dangling
+    # `use crate::ir::Mid;` for a type the crate never generates (the round-3 bug).
+    leaf = ObjectInfo(
+        fields=[NamedTypeSchema("m", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))))],
+        methods=[],
+        type_key="ir.Leaf",
+        parent_type_key="ffi.Object",
+    )
+    mid = ObjectInfo(
+        fields=[NamedTypeSchema("leaf", TypeSchema("ir.Leaf"))],  # references the skipped Leaf
+        methods=[],
+        type_key="ir.Mid",
+        parent_type_key="ffi.Object",
+    )
+    consumer = ObjectInfo(
+        fields=[NamedTypeSchema("mid", TypeSchema("ir.Mid"))],  # 2 hops from Leaf
+        methods=[],
+        type_key="relax.Consumer",
+        parent_type_key="ffi.Object",
+    )
+    fixtures = {"ir.Leaf": leaf, "ir.Mid": mid, "relax.Consumer": consumer}
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
+    with pytest.raises(UnsupportedTypeError):  # Leaf: own unsupported field
+        _gen_rust_object(leaf)
+    with pytest.raises(UnsupportedTypeError) as mid_exc:  # Mid: 1-hop ref to skipped Leaf
+        _gen_rust_object(mid)
+    assert mid_exc.value.origin == "ir.Leaf"
+    imports = RustImports()
+    block = _rust_object_block("relax.Consumer")
+    with pytest.raises(UnsupportedTypeError) as cons_exc:  # Consumer: 2-hop, reference-aware
+        generate_rust_object(block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), consumer)
+    assert cons_exc.value.origin == "ir.Mid"
+    assert not any(u.path == "crate::ir::Mid" for u in imports.items)  # no dangling import
+
+
+def test_rust_cycle_referencing_skipped_type_skips_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Round 3 (greatest-fixpoint): a reference cycle A<->B where A *also* references
+    # a SKIPPED `Leaf` must mark BOTH A and B unbuildable -- the cycle must not
+    # rescue them. (Naive memoization of the verdict would wrongly cache B=True.)
+    leaf = ObjectInfo(
+        fields=[NamedTypeSchema("m", TypeSchema("List", (TypeSchema("int"),)))],
+        methods=[],
+        type_key="m.Leaf",
+        parent_type_key="ffi.Object",
+    )
+    a = ObjectInfo(
+        fields=[
+            NamedTypeSchema("b", TypeSchema("m.B")),
+            NamedTypeSchema("l", TypeSchema("m.Leaf")),
+        ],
+        methods=[],
+        type_key="m.A",
+        parent_type_key="ffi.Object",
+    )
+    b = ObjectInfo(
+        fields=[NamedTypeSchema("a", TypeSchema("m.A"))],
+        methods=[],
+        type_key="m.B",
+        parent_type_key="ffi.Object",
+    )
+    fixtures = {"m.Leaf": leaf, "m.A": a, "m.B": b}
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
+    ty = RC.RUST_TY_MAP_DEFAULTS.copy()
+    assert rust_codegen._base_buildable("m.A", ty) is False
+    assert rust_codegen._base_buildable("m.B", ty) is False  # the cycle does not rescue B
+
+
+def test_rust_callable_field_referencing_skipped_type_does_not_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Round 3 (false-skip guard): `Callable` is type-erased -- it renders as the
+    # opaque `tvm_ffi::Function`, ignoring its signature -- so a field typed
+    # `Callable[[Skipped]]` references nothing. The owner must STILL generate
+    # (buildability must not over-collect Callable args).
+    leaf = ObjectInfo(
+        fields=[NamedTypeSchema("m", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))))],
+        methods=[],
+        type_key="ir.Leaf",
+        parent_type_key="ffi.Object",
+    )
+    owner = ObjectInfo(
+        fields=[
+            NamedTypeSchema(
+                "cb", TypeSchema("Callable", (TypeSchema("None"), TypeSchema("ir.Leaf")))
+            ),
+        ],
+        methods=[],
+        type_key="relax.Owner",
+        parent_type_key="ffi.Object",
+    )
+    fixtures = {"ir.Leaf": leaf, "relax.Owner": owner}
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
+    assert rust_codegen._base_buildable("relax.Owner", RC.RUST_TY_MAP_DEFAULTS.copy()) is True
+    text, _ = _gen_rust_object(owner)
+    assert "struct OwnerObj {" in text
+    assert "    pub cb: Function," in text  # type-erased; no reference to Leaf
+
+
+def test_rust_method_arg_referencing_skipped_type_skips_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Round 3 (companion to the Callable guard): a reflected method's signature IS
+    # rendered by `_method_fn`, so a method param referencing a SKIPPED type must
+    # still skip the owner -- and reference-aware buildability must agree, so the
+    # owner's consumers cascade-skip. Confirms method refs survive the Callable fix.
+    leaf = ObjectInfo(
+        fields=[NamedTypeSchema("m", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))))],
+        methods=[],
+        type_key="ir.Leaf",
+        parent_type_key="ffi.Object",
+    )
+    owner = ObjectInfo(
+        fields=[NamedTypeSchema("x", TypeSchema("int"))],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema(
+                    "use_leaf", TypeSchema("Callable", (TypeSchema("None"), TypeSchema("ir.Leaf")))
+                ),
+                is_member=False,
+            )
+        ],
+        type_key="relax.Owner2",
+        parent_type_key="ffi.Object",
+    )
+    fixtures = {"ir.Leaf": leaf, "relax.Owner2": owner}
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
+    with pytest.raises(UnsupportedTypeError):  # method param renders the skipped Leaf
+        _gen_rust_object(owner)
+    assert rust_codegen._base_buildable("relax.Owner2", RC.RUST_TY_MAP_DEFAULTS.copy()) is False
 
 
 def test_rust_object_root_struct_and_impl() -> None:
@@ -1575,6 +2140,24 @@ def test_rust_object_field_of_type_object_shares_boilerplate_use() -> None:
     assert "    pub child: Object," in text  # the field binds the same type
     uses = [u.as_use_line() for u in imports.items]
     assert uses.count("use tvm_ffi::Object;") == 1
+
+
+def test_rust_cross_module_type_use_is_crate_rooted() -> None:
+    # A1: a field whose type lives in another generated module must be imported
+    # via a `crate::`-rooted path (the tree is mounted at the crate root). A bare
+    # `use ir::Attrs;` would resolve against the extern prelude and fail to
+    # compile; the body still references the type by its leaf name.
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("attrs", TypeSchema("ir.Attrs"))],
+        methods=[],
+        type_key="tirx.Foo",
+        parent_type_key="ffi.Object",
+    )
+    text, imports = _gen_rust_object(info)
+    assert "    pub attrs: Attrs," in text  # referenced by leaf in the body
+    uses = {u.as_use_line() for u in imports.items}
+    assert "use crate::ir::Attrs;" in uses
+    assert "use ir::Attrs;" not in uses  # never the bare (extern-prelude) form
 
 
 def test_rust_method_any_return_stays_any_not_anyview() -> None:
@@ -1689,7 +2272,183 @@ def test_rust_stage3_skipped_type_not_counted_as_defined(
     assert "[Skipped] object demo.HasMap" in capsys.readouterr().out
     assert "struct HasMapObj" not in text  # skipped block reset to bare markers
     assert "    pub child: HasMap," in text  # the referencing object still renders
-    assert "use demo::HasMap;" in text  # ... and keeps its import
+    assert "use crate::demo::HasMap;" in text  # ... and keeps its (crate::-rooted) import
+
+
+def test_rust_stage3_skipped_base_skips_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # D end-to-end: a base with an unsupported field (`List`) is skipped, and its
+    # subclass is skipped transitively -- NOT emitted referencing a missing
+    # `BaseObj` (which would be E0412). Neither struct lands in the output.
+    rs = tmp_path / "demo.rs"
+    rs.write_text(
+        "\n".join(
+            [
+                f"{C.RUST_SYNTAX.begin} import-section",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} object/demo.Base",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} object/demo.Child",
+                C.RUST_SYNTAX.end,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    infos = {
+        "demo.Base": ObjectInfo(
+            fields=[NamedTypeSchema("m", TypeSchema("List", (TypeSchema("int"),)))],
+            methods=[],
+            type_key="demo.Base",
+            parent_type_key="ffi.Object",
+        ),
+        "demo.Child": ObjectInfo(
+            fields=[NamedTypeSchema("x", TypeSchema("int"))],
+            methods=[],
+            type_key="demo.Child",
+            parent_type_key="demo.Base",
+        ),
+    }
+    # `_stage_3` resolves via stub_cli; `_base_buildable`/`_native_eligible` via rust_codegen.
+    monkeypatch.setattr(stub_cli, "object_info_from_type_key", lambda key: infos[key])
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: infos[key])
+    info = FileInfo.from_file(rs)
+    assert info is not None
+    _stage_3(
+        info,
+        Options(dry_run=True),
+        RC.RUST_TY_MAP_DEFAULTS.copy(),
+        {},
+        generator=RustGenerator(),
+    )
+    text = "\n".join(info.lines)
+    out = capsys.readouterr().out
+    assert "[Skipped] object demo.Base" in out
+    assert "[Skipped] object demo.Child" in out  # transitive skip
+    assert "struct BaseObj" not in text
+    assert "struct ChildObj" not in text  # not emitted referencing a missing BaseObj
+
+
+def test_rust_stage3_field_ref_to_skipped_type_drops_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # X end-to-end: `S` is skipped (Dict field); `User` has a field of type `S`.
+    # `User` is skipped too -- NOT emitted with a dangling `pub s: S` and a
+    # `use crate::demo::S;` import that points at a type the crate never defines.
+    rs = tmp_path / "demo.rs"
+    rs.write_text(
+        "\n".join(
+            [
+                f"{C.RUST_SYNTAX.begin} import-section",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} object/demo.S",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} object/demo.User",
+                C.RUST_SYNTAX.end,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    infos = {
+        "demo.S": ObjectInfo(
+            fields=[
+                NamedTypeSchema("m", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))))
+            ],
+            methods=[],
+            type_key="demo.S",
+            parent_type_key="ffi.Object",
+        ),
+        "demo.User": ObjectInfo(
+            fields=[NamedTypeSchema("s", TypeSchema("demo.S"))],
+            methods=[],
+            type_key="demo.User",
+            parent_type_key="ffi.Object",
+        ),
+    }
+    monkeypatch.setattr(stub_cli, "object_info_from_type_key", lambda key: infos[key])
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: infos[key])
+    info = FileInfo.from_file(rs)
+    assert info is not None
+    _stage_3(
+        info,
+        Options(dry_run=True),
+        RC.RUST_TY_MAP_DEFAULTS.copy(),
+        {},
+        generator=RustGenerator(),
+    )
+    text = "\n".join(info.lines)
+    out = capsys.readouterr().out
+    assert "[Skipped] object demo.S" in out
+    assert "[Skipped] object demo.User" in out  # referencing type skipped too
+    assert "struct UserObj" not in text
+    assert "use crate::demo::S;" not in text  # no dangling import for the skipped type
+
+
+def test_rust_stage3_multi_hop_skip_drops_consumer_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Round 3 end-to-end (the reported dangling-import bug across modules):
+    # `Consumer` (relax) has a field of cross-module `ir.Mid`; `Mid` references the
+    # skipped `ir.Leaf` (Dict field). Reference-aware buildability skips `Consumer`
+    # and drops the `use crate::ir::Mid;` import for a type the crate never emits.
+    rs = tmp_path / "relax.rs"
+    rs.write_text(
+        "\n".join(
+            [
+                f"{C.RUST_SYNTAX.begin} import-section",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} object/relax.Consumer",
+                C.RUST_SYNTAX.end,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    infos = {
+        "relax.Consumer": ObjectInfo(
+            fields=[NamedTypeSchema("mid", TypeSchema("ir.Mid"))],
+            methods=[],
+            type_key="relax.Consumer",
+            parent_type_key="ffi.Object",
+        ),
+        "ir.Mid": ObjectInfo(
+            fields=[NamedTypeSchema("leaf", TypeSchema("ir.Leaf"))],
+            methods=[],
+            type_key="ir.Mid",
+            parent_type_key="ffi.Object",
+        ),
+        "ir.Leaf": ObjectInfo(
+            fields=[
+                NamedTypeSchema("m", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))))
+            ],
+            methods=[],
+            type_key="ir.Leaf",
+            parent_type_key="ffi.Object",
+        ),
+    }
+    monkeypatch.setattr(stub_cli, "object_info_from_type_key", lambda key: infos[key])
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: infos[key])
+    info = FileInfo.from_file(rs)
+    assert info is not None
+    _stage_3(
+        info,
+        Options(dry_run=True),
+        RC.RUST_TY_MAP_DEFAULTS.copy(),
+        {},
+        generator=RustGenerator(),
+    )
+    text = "\n".join(info.lines)
+    out = capsys.readouterr().out
+    assert "[Skipped] object relax.Consumer" in out  # skipped via the 2-hop chain
+    assert "struct ConsumerObj" not in text
+    assert "use crate::ir::Mid;" not in text  # no dangling import for the skipped Mid
 
 
 def test_rust_bytes_field_maps_to_crate_bytes() -> None:
@@ -1767,9 +2526,11 @@ def test_rust_import_section_renders_dedups_sorts() -> None:
 
 def test_rust_import_section_filters_defined_types() -> None:
     block = _rust_import_block()
-    imports = RustImports(items=[RustUse("cpp_rust_test::Expr"), RustUse("tvm_ffi::Tensor")])
-    # Expr is defined in this file -> its `use` must be dropped.
-    generate_rust_import_section(block, imports, Options(), defined_types={"cpp_rust_test::Expr"})
+    imports = RustImports(items=[RustUse("cpp_rust_test.Expr"), RustUse("tvm_ffi::Tensor")])
+    # Expr is defined in this file -> its (crate::-rooted) `use` must be dropped.
+    generate_rust_import_section(
+        block, imports, Options(), defined_types={"crate::cpp_rust_test::Expr"}
+    )
     assert block.lines == [
         "// tvm-ffi-stubgen(begin): import-section",
         "use tvm_ffi::Tensor;",
@@ -1783,8 +2544,8 @@ def test_rust_generator_wired() -> None:
     imp = gen.new_imports()
     assert isinstance(imp, RustImports)
     gen.add_imported_object(imp, "cpp_rust_test.Expr", "False", "")
-    assert imp.items == [RustUse("cpp_rust_test::Expr")]
-    assert gen.canonical_type_name("cpp_rust_test.Expr") == "cpp_rust_test::Expr"
+    assert imp.items == [RustUse("cpp_rust_test.Expr")]  # normalized to crate::-rooted
+    assert gen.canonical_type_name("cpp_rust_test.Expr") == "crate::cpp_rust_test::Expr"
     assert gen.extra_export_names(imp) == set()
     # object block delegates to generate_rust_object
     block = _rust_object_block("cpp_rust_test.Expr")
@@ -1834,6 +2595,151 @@ def test_rust_stage3_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert "use tvm_ffi::ObjectCore;" in text
     # Expr defines itself -> no self `use`
     assert "use cpp_rust_test::Expr;" not in text
+
+
+def test_rust_stage3_cross_module_name_collision_full_qualifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A4 end-to-end: a file defining `tirx.Call` and a sibling `tirx.Holder` whose
+    # field type is the cross-module `relax.expr.Call` (same leaf `Call`). The
+    # collision is resolved by full-qualifying the cross-module reference inline;
+    # no conflicting `use` is emitted next to the local `Call` definition.
+    rs = tmp_path / "tirx.rs"
+    rs.write_text(
+        "\n".join(
+            [
+                f"{C.RUST_SYNTAX.begin} import-section",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} object/tirx.Call",
+                C.RUST_SYNTAX.end,
+                "",
+                f"{C.RUST_SYNTAX.begin} object/tirx.Holder",
+                C.RUST_SYNTAX.end,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    infos = {
+        "tirx.Call": ObjectInfo(
+            fields=[], methods=[], type_key="tirx.Call", parent_type_key="ffi.Object"
+        ),
+        "tirx.Holder": ObjectInfo(
+            fields=[NamedTypeSchema("call", TypeSchema("relax.expr.Call"))],
+            methods=[],
+            type_key="tirx.Holder",
+            parent_type_key="ffi.Object",
+        ),
+    }
+    monkeypatch.setattr(stub_cli, "object_info_from_type_key", lambda key: infos[key])
+    info = FileInfo.from_file(rs)
+    assert info is not None
+    _stage_3(
+        info,
+        Options(dry_run=True),
+        RC.RUST_TY_MAP_DEFAULTS.copy(),
+        {},
+        generator=RustGenerator(),
+    )
+    text = "\n".join(info.lines)
+    assert "struct CallObj {" in text  # the local `Call` is defined here
+    # the cross-module `Call` is referenced by full path, not imported under `Call`
+    assert "pub call: crate::relax::expr::Call," in text
+    assert "use crate::relax::expr::Call;" not in text
+
+
+def _keyword_field_info() -> ObjectInfo:
+    """Build a native root type with a Rust-keyword field name `mod` (+ a normal field)."""
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("mod", TypeSchema("int")),
+            NamedTypeSchema("value", TypeSchema("int")),
+        ],
+        methods=[],
+        type_key="cpp_rust_test.KwHolder",
+        has_init=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("mod", "r#mod"),
+        ("impl", "r#impl"),
+        ("type", "r#type"),
+        ("async", "r#async"),  # reserved keyword, still rejected as a bare ident
+        ("self", "self_"),  # `r#` cannot spell it -> suffix rename
+        ("Self", "Self_"),
+        ("crate", "crate_"),
+        ("super", "super_"),
+        ("value", "value"),  # ordinary name unchanged
+        ("set_mod", "set_mod"),  # not a keyword
+    ],
+)
+def test_rust_ident_escapes_keywords(name: str, expected: str) -> None:
+    assert rust_codegen._rust_ident(name) == expected
+
+
+def test_rust_keyword_field_name_is_raw_identifier() -> None:
+    # B: a C++ field named `mod` (a Rust keyword) is emitted as `r#mod` in every
+    # bare-identifier position (struct, builder store/setter, ffi_new, unwrap,
+    # obj-literal), while the FFI field-name string and error text keep `mod`.
+    text, _ = _gen_rust_object(_keyword_field_info())
+    assert "pub r#mod: i64," in text  # struct field
+    assert "pub value: i64," in text  # ordinary field unescaped
+    assert "r#mod: None," in text  # ffi_new builder-literal init
+    assert "r#mod: Option<i64>," in text  # builder store
+    assert "pub fn r#mod(mut self, r#mod: i64) -> Self {" in text  # builder setter
+    assert "self.r#mod = Some(r#mod);" in text
+    assert "let r#mod = self.r#mod.ok_or_else(" in text  # build_obj unwrap
+    assert "`mod` is not set" in text  # error text keeps the C++ name
+    assert "    r#mod," in text  # obj-literal shorthand binds the local
+    # the ordinary `value` field still gets a plain (unescaped) setter
+    assert "pub fn value(mut self, value: i64) -> Self {" in text
+
+
+def test_rust_keyword_method_name_is_raw_identifier() -> None:
+    # B: a reflected method named `move` (a keyword) becomes `pub fn r#move`, but
+    # the FFI lookup string stays `move`.
+    info = _native_point_info()
+    info.methods = [
+        FuncInfo(
+            NamedTypeSchema("move", TypeSchema("Callable", (TypeSchema("int"),))),
+            is_member=False,
+        )
+    ]
+    text, _ = _gen_rust_object(info)
+    assert "pub fn r#move(" in text
+    assert '"move")?;' in text  # the FFI method-name string is unescaped
+
+
+def test_rust_keyword_optional_accessor_is_raw_identifier() -> None:
+    # B: an Optional field named `impl` yields `pub fn r#impl` / `pub fn set_impl`
+    # accessing `self.r#impl`, while the reflection field name stays `impl`.
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema(
+                "impl",
+                TypeSchema("Optional", (TypeSchema("int"),)),
+                size=16,
+                alignment=8,
+                offset=24,
+            )
+        ],
+        methods=[],
+        type_key="cpp_rust_test.KwOpt",
+        parent_type_key="ffi.Object",
+        has_init=True,
+        mutable=True,
+    )
+    text, _ = _gen_rust_object(info)
+    assert "pub r#impl: " in text  # struct field is escaped
+    assert "pub fn r#impl(&self) -> Result<Option<i64>> {" in text
+    assert "self.r#impl.read_cached::<i64>(&CELL, " in text
+    assert '"impl") }' in text  # FFI field name unescaped in the getter
+    assert "pub fn set_impl(&self, value: Option<i64>) -> Result<()> {" in text
+    assert "self.r#impl.write_cached::<i64>(&CELL, " in text
 
 
 def test_rust_default_ty_map_is_real() -> None:

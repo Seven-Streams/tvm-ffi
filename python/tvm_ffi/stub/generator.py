@@ -87,6 +87,16 @@ class Generator(Protocol):
         """Record an ``import-object`` directive (raw directive fields) into ``imports``."""
         ...
 
+    def seed_local_types(self, imports: Any, type_keys: list[str]) -> None:
+        """Tell the import collector which type keys this file defines.
+
+        Called once per file before any block is rendered, so a generator can
+        recognise a same-file reference (and disambiguate a cross-module import
+        whose name collides with a local definition) regardless of declaration
+        order. Backends that disambiguate by aliasing instead may no-op.
+        """
+        ...
+
     def canonical_type_name(self, type_key: str) -> str:
         """Return the canonical identifier for a locally-defined type key.
 

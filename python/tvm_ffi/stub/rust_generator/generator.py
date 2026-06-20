@@ -70,6 +70,10 @@ class RustGenerator:
         """
         imports.record(name)
 
+    def seed_local_types(self, imports: RustImports, type_keys: list[str]) -> None:
+        """Register the file's own type keys so cross-module collisions disambiguate."""
+        imports.seed_local_types(type_keys)
+
     def canonical_type_name(self, type_key: str) -> str:
         """Return the Rust path for a defined type key (matches :attr:`RustUse.path`)."""
         return RustUse(type_key).path

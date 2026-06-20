@@ -101,3 +101,24 @@ RUST_NOT_ANY_COMPATIBLE_ORIGINS = frozenset({"Any", "Object", "ffi.Object"})
 RUST_MOD_MAP = {
     "ffi": "tvm_ffi",
 }
+
+#: Rust keywords (strict + reserved, across the 2015/2018/2021 editions) that are
+#: a parse error when used as a bare identifier. A C++ field/method name landing
+#: on one is escaped as a raw identifier ``r#<name>`` (see ``RUST_RAW_IDENT_*``).
+RUST_KEYWORDS = frozenset(
+    {
+        "as", "break", "const", "continue", "crate", "dyn", "else", "enum",
+        "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop",
+        "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
+        "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
+        "where", "while",
+        # reserved for future use (also rejected as bare identifiers)
+        "abstract", "async", "await", "become", "box", "do", "final", "gen",
+        "macro", "override", "priv", "try", "typeof", "unsized", "virtual",
+        "yield",
+    }
+)  # fmt: skip
+
+#: The few keywords a raw identifier (``r#``) cannot spell; a C++ name landing on
+#: one is suffix-renamed instead (``self -> self_``). Rare in practice.
+RUST_RAW_IDENT_FORBIDDEN = frozenset({"crate", "self", "super", "Self"})

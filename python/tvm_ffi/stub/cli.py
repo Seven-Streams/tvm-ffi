@@ -215,6 +215,15 @@ def _stage_3(  # noqa: PLR0912
     defined_funcs: set[str] = set()
     defined_types: set[str] = set()
     imports = generator.new_imports()
+    # Stage 0. Tell the collector every type key this file defines (forward
+    # references need the full set up front) so a cross-module import that
+    # collides with a local definition can be disambiguated while rendering.
+    local_type_keys = [
+        code.param
+        for code in file.code_blocks
+        if code.kind == "object" and isinstance(code.param, str)
+    ]
+    generator.seed_local_types(imports, local_type_keys)
     # Stage 1. Collect `tvm-ffi-stubgen(import-object): ...`
     for code in file.code_blocks:
         if code.kind == "import-object":

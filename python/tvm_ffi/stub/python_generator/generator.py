@@ -63,6 +63,9 @@ class PythonGenerator:
         if alias == "_FFI_LOAD_LIB" or name.endswith("libinfo.load_lib_module"):
             imports.has_lib_load = True
 
+    def seed_local_types(self, imports: PythonImports, type_keys: list[str]) -> None:
+        """No-op: Python disambiguates a local/import name clash by aliasing the import."""
+
     def canonical_type_name(self, type_key: str) -> str:
         """Return the canonical (import-comparable) full name for a defined type key."""
         return ImportItem(type_key).full_name

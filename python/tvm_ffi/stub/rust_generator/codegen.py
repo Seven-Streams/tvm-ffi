@@ -22,7 +22,9 @@ Codegen orchestration lives here; low-level rendering helpers live in
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
 import math
 from typing import TYPE_CHECKING
 
@@ -67,23 +69,54 @@ def _rust_string_literal(s: str) -> str:
     return "".join(out)
 
 
+def _rust_ident(name: str) -> str:
+    """Escape a C++-derived name for use as a bare Rust identifier.
+
+    A name that is a Rust keyword is spelled as the raw identifier ``r#<name>``;
+    the few keywords ``r#`` cannot spell (``crate`` / ``self`` / ``super`` /
+    ``Self``) are suffix-renamed (``self -> self_``) instead. Non-keywords pass
+    through unchanged. The *original* name is still used wherever the C++ name
+    must appear verbatim -- the reflection field/method-name string literals and
+    human-readable error text -- so escaping is purely a Rust-syntax concern.
+    """
+    if name in C_RUST.RUST_RAW_IDENT_FORBIDDEN:
+        return f"{name}_"
+    if name in C_RUST.RUST_KEYWORDS:
+        return f"r#{name}"
+    return name
+
+
+#: Field origins whose Rust rendering is ``tvm_ffi::String`` (so a ``str`` default
+#: materializes as a ``String`` literal). A ``str`` default on any other field --
+#: notably the ``dtype`` string registered for a ``DLDataType`` field -- has no
+#: such rendering and must NOT be emitted as a ``String`` (it would be an E0308
+#: type mismatch).
+_DEFAULT_STRING_ORIGINS = frozenset({"str", "ffi.String"})
+
+
 def _default_expr(field: NamedTypeSchema) -> str | None:
     """Render ``field``'s registered default as a Rust expression (``None``: can't).
 
-    Only values whose Rust spelling is self-evident are supported: ``bool`` /
-    ``int`` / finite ``float`` literals (which coerce to the field's possibly
-    narrowed scalar type in the struct-literal position) and ``str`` (which
-    becomes a ``tvm_ffi::String``). Anything else -- objects, containers,
-    non-finite floats, factories -- has no native materialization.
+    The rendering must match the field's Rust type, so each literal is gated on
+    the field's ``origin``: a ``bool`` / ``int`` / finite-``float`` literal only
+    for a ``bool`` / ``int`` / ``float`` field (an ``int`` default on a ``float``
+    field coerces to a float literal), and a ``str`` only for a ``String`` field
+    (-> ``tvm_ffi::String``). A value whose type does not match the field -- e.g.
+    the string default registered for a ``DLDataType`` / ``Device`` field, or any
+    object/container/non-finite-float -- has no self-evident Rust literal and
+    yields ``None`` (the caller then blocks native construction rather than
+    emitting a type-mismatched default).
     """
     value = field.default
+    origin = field.origin
     if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
+        # `bool` is an `int` subclass; handle it first. Only a `bool` field.
+        return ("true" if value else "false") if origin == "bool" else None
+    if origin == "int" and isinstance(value, int):
         return repr(value)
-    if isinstance(value, float):
-        return repr(value) if math.isfinite(value) else None
-    if isinstance(value, str):
+    if origin == "float" and isinstance(value, (int, float)):
+        return repr(float(value)) if math.isfinite(value) else None
+    if origin in _DEFAULT_STRING_ORIGINS and isinstance(value, str):
         return f"tvm_ffi::String::from({_rust_string_literal(value)})"
     return None
 
@@ -205,22 +238,56 @@ class _ObjectRenderer:
     is_root: bool
     imports: RustImports
     ty_map: dict[str, str]
+    #: Whether to verify that every referenced object type is itself buildable
+    #: (skip the enclosing type if it references a skipped type). Disabled while
+    #: dry-rendering for the buildability probe itself, to break the recursion.
+    check_refs: bool = True
     #: Rendered inner type of each AnyCompatible Optional field, keyed by field
     #: name. Populated when the struct field is rendered and reused by the
     #: accessor pass so the inner is rendered once (not twice) per field.
     _opt_inner: dict[str, str] = dataclasses.field(default_factory=dict)
 
+    @property
+    def base_field(self) -> str:
+        """Name of the synthetic parent-embed field, avoiding a real-field clash.
+
+        The parent is embedded as the first ``#[repr(C)]`` field, normally named
+        ``base``. But a C++ type may itself have a reflected field named ``base``
+        (e.g. ``tirx.Ramp``, ``arith.IterSumExpr``); two ``base`` fields would be
+        an E0124 collision, so prefix ``_`` until the name is unique among the
+        own fields. ``#[derive(Object)]`` reads the first field positionally, so
+        any name works.
+        """
+        names = {f.name for f in self.info.fields}
+        name = "base"
+        while name in names:
+            name = f"_{name}"
+        return name
+
     def _ty_render(self, origin: str) -> str:
         """Resolve a leaf origin to its Rust name and record its ``use``.
 
-        Unmapped dotted names (object type keys) pass through; an unmapped bare
-        origin (e.g. ``const char*``) has no Rust rendering and raises, which
-        skips the enclosing object.
+        Unmapped dotted names that are generated-tree object type keys pass
+        through (``RustUse`` roots them at ``crate::``). Two kinds raise
+        :class:`UnsupportedTypeError` (skipping the enclosing object): an unmapped
+        bare origin (e.g. ``const char*``), and an unmapped ``ffi.*`` builtin --
+        ``ffi.*`` is reserved for the crate's own types, exposed only through the
+        explicit ``ty_map``, so an unmapped one (e.g. ``ffi.reflection.AccessPath``,
+        which the crate has no Rust type for) must not be passed through as a
+        nonexistent ``tvm_ffi::`` path.
         """
         mapped = self.ty_map.get(origin)
         if mapped is None:
-            if "." not in origin:
+            if "." not in origin or origin.startswith("ffi."):
                 raise UnsupportedTypeError(origin)
+            # A generated-tree object type key. If its own binding was/will-be
+            # skipped (not buildable), referencing it would dangle -- the `use`
+            # would point at a type the crate never emits and the field/arg type
+            # would not exist. Skip the enclosing type instead (raise *before*
+            # recording, so no dangling import leaks). The probe is disabled while
+            # dry-rendering for buildability, which breaks the recursion.
+            if self.check_refs and not _base_buildable(origin, self.ty_map):
+                raise UnsupportedTypeError(origin, f"referenced type {origin!r} is skipped")
             mapped = origin
         return self.imports.record(mapped)
 
@@ -287,6 +354,13 @@ class _ObjectRenderer:
             # Same path the ty_map uses for `Object` fields, so they dedup
             # instead of colliding.
             self.base_type = self.imports.record("tvm_ffi::Object")
+        else:
+            # Embed the parent's `<Parent>Obj` as `base`. The parent may live in
+            # another generated module, so its `use` is collected like any field
+            # type (crate::-rooted; a same-file parent's import is filtered out by
+            # the import section). The recorded leaf is the in-scope name used by
+            # the struct field, the `Deref` target, and the builder `base` setter.
+            self.base_type = self.imports.record(f"{self.info.parent_type_key}Obj")
         # C++ `_type_mutable`: class-level mutability dominates per-field `def_ro`.
         if self.info.mutable:
             self.imports.record("std::ops::DerefMut")
@@ -298,10 +372,10 @@ class _ObjectRenderer:
             "#[derive(tvm_ffi::derive::Object)]",
             f'#[type_key = "{self.info.type_key}"]',
             f"pub struct {obj_struct} {{",
-            f"    base: {base_type},",
+            f"    {self.base_field}: {base_type},",
         ]
         for field in _layout_fields(self.info.fields):
-            lines.append(f"    pub {field.name}: {self.render_struct_field(field)},")
+            lines.append(f"    pub {_rust_ident(field.name)}: {self.render_struct_field(field)},")
         lines += ["}", ""]
 
         lines += [
@@ -315,7 +389,7 @@ class _ObjectRenderer:
 
         lines += _deref_impl(leaf, obj_struct, "data", self.info.mutable)
         if not self.is_root:
-            lines += _deref_impl(obj_struct, base_type, "base", self.info.mutable)
+            lines += _deref_impl(obj_struct, base_type, self.base_field, self.info.mutable)
 
         # Native (FFI-free) construction whenever the whole chain is eligible;
         # there is no FFI fallback -- a blocked constructor is skipped loudly.
@@ -391,12 +465,13 @@ class _ObjectRenderer:
             inner = self._opt_inner.get(field.name) or render_rust_type(args[0], self._ty_render)
             self.imports.record("tvm_ffi::Result")
             name, obj = field.name, self.obj_struct
+            ident = _rust_ident(name)  # bare-identifier spelling; `name` stays the FFI field name
             # Per-call-site cache so the field-table scan runs once, not per call.
             cell = "    static CELL: std::sync::OnceLock<tvm_ffi::FieldAccess> = std::sync::OnceLock::new();"
             block = [
-                f"pub fn {name}(&self) -> Result<Option<{inner}>> {{",
+                f"pub fn {ident}(&self) -> Result<Option<{inner}>> {{",
                 cell,
-                f"    unsafe {{ self.{name}.read_cached::<{inner}>(&CELL, "
+                f"    unsafe {{ self.{ident}.read_cached::<{inner}>(&CELL, "
                 f'{obj}::type_index(), "{name}") }}',
                 "}",
             ]
@@ -405,7 +480,7 @@ class _ObjectRenderer:
                     "",
                     f"pub fn set_{name}(&self, value: Option<{inner}>) -> Result<()> {{",
                     cell,
-                    f"    unsafe {{ self.{name}.write_cached::<{inner}>(&CELL, "
+                    f"    unsafe {{ self.{ident}.write_cached::<{inner}>(&CELL, "
                     f'{obj}::type_index(), "{name}", value) }}',
                     "}",
                 ]
@@ -419,14 +494,16 @@ class _ObjectRenderer:
         like-named locals that :meth:`_unwrap_lines` just checked (on derived
         types ``base`` binds the local :meth:`_base_resolve_lines` produced).
         """
-        base_entry = "    base: self.base," if self.is_root else "    base,"
+        bf = self.base_field
+        base_entry = f"    {bf}: self.{bf}," if self.is_root else f"    {bf},"
         lines = [f"{self.obj_struct} {{", base_entry]
         # Entries bind by name; memory order just mirrors the struct definition.
         for field in _layout_fields(self.info.fields):
+            fid = _rust_ident(field.name)
             if field.default is MISSING:
-                lines.append(f"    {field.name},")  # the unwrapped local
+                lines.append(f"    {fid},")  # the unwrapped local
             else:
-                lines.append(f"    {field.name}: self.{field.name},")
+                lines.append(f"    {fid}: self.{fid},")
         lines.append("}")
         return lines
 
@@ -439,13 +516,19 @@ class _ObjectRenderer:
         """
         if self.is_root:
             return []
-        parent_ref = (self.info.parent_type_key or "").rsplit(".", 1)[-1]
+        # The parent's ref type drives the default-construction fallback; record
+        # its `use` (crate::-rooted) so a cross-module parent resolves. Non-root
+        # always has a parent key (root is parent None / `ffi.Object`).
+        parent_key = self.info.parent_type_key
+        assert parent_key is not None
+        parent_ref = self.imports.record(parent_key)
+        bf = self.base_field
         return [
-            "let base = match self.base {",
-            "    Some(base) => base,",
+            f"let {bf} = match self.{bf} {{",
+            f"    Some({bf}) => {bf},",
             f"    None => {parent_ref}::ffi_new().build_obj().map_err(|e| tvm_ffi::Error::new(",
             "        tvm_ffi::VALUE_ERROR,",
-            f'        &format!("field `base` is not set and default `{parent_ref}` '
+            f'        &format!("field `{bf}` is not set and default `{parent_ref}` '
             'construction failed: {}", e.message()),',
             '        "",',
             "    ))?,",
@@ -455,8 +538,8 @@ class _ObjectRenderer:
     def _unwrap_lines(self) -> list[str]:
         """``let <f> = self.<f>.ok_or_else(..)?;`` for every field without a default."""
         return [
-            f"let {field.name} = self.{field.name}.ok_or_else(|| tvm_ffi::Error::new("
-            f'tvm_ffi::VALUE_ERROR, "field `{field.name}` is not set", ""))?;'
+            f"let {_rust_ident(field.name)} = self.{_rust_ident(field.name)}.ok_or_else(|| "
+            f'tvm_ffi::Error::new(tvm_ffi::VALUE_ERROR, "field `{field.name}` is not set", ""))?;'
             for field in _layout_fields(self.info.fields)
             if field.default is MISSING
         ]
@@ -476,15 +559,16 @@ class _ObjectRenderer:
         builder = f"{self.leaf}Builder"
         lines = [f"pub fn ffi_new() -> {builder} {{", f"    {builder} {{"]
         if self.is_root:
-            lines.append(f"        base: {self.base_type}::new(),")
+            lines.append(f"        {self.base_field}: {self.base_type}::new(),")
         else:
-            lines.append("        base: None,")
+            lines.append(f"        {self.base_field}: None,")
         for field in _layout_fields(self.info.fields):
+            fid = _rust_ident(field.name)
             if field.default is MISSING:
-                lines.append(f"        {field.name}: None,")
+                lines.append(f"        {fid}: None,")
             else:
                 # `_native_blocker` already guaranteed the default renders.
-                lines.append(f"        {field.name}: {_default_expr(field)},")
+                lines.append(f"        {fid}: {_default_expr(field)},")
         lines += ["    }", "}"]
         return lines
 
@@ -502,29 +586,31 @@ class _ObjectRenderer:
         """
         builder = f"{self.leaf}Builder"
         fields = _layout_fields(self.info.fields)
+        bf = self.base_field
         base_store = self.base_type if self.is_root else f"Option<{self.base_type}>"
-        lines = [f"pub struct {builder} {{", f"    base: {base_store},"]
+        lines = [f"pub struct {builder} {{", f"    {bf}: {base_store},"]
         for field in fields:
             ty = self.render_struct_field(field)
             store = ty if field.default is not MISSING else f"Option<{ty}>"
-            lines.append(f"    {field.name}: {store},")
+            lines.append(f"    {_rust_ident(field.name)}: {store},")
         lines += ["}", ""]
 
         inner: list[str] = []
         if not self.is_root:
             inner += [
-                f"pub fn base(mut self, base: {self.base_type}) -> Self {{",
-                "    self.base = Some(base);",
+                f"pub fn {bf}(mut self, {bf}: {self.base_type}) -> Self {{",
+                f"    self.{bf} = Some({bf});",
                 "    self",
                 "}",
                 "",
             ]
         for field in fields:
             ty = self.render_struct_field(field)
-            value = field.name if field.default is not MISSING else f"Some({field.name})"
+            fid = _rust_ident(field.name)
+            value = fid if field.default is not MISSING else f"Some({fid})"
             inner += [
-                f"pub fn {field.name}(mut self, {field.name}: {ty}) -> Self {{",
-                f"    self.{field.name} = {value};",
+                f"pub fn {fid}(mut self, {fid}: {ty}) -> Self {{",
+                f"    self.{fid} = {value};",
                 "    self",
                 "}",
                 "",
@@ -586,9 +672,157 @@ class _ObjectRenderer:
         if method.is_member or params:
             self.imports.record("tvm_ffi::AnyView")
         packed = _packed_args_expr(params, method.is_member)
-        getter = self._cached_getter_lines("f", ffi_name)
-        header = f"pub fn {ffi_name}({', '.join(sig_parts)}) -> Result<{ret}> {{"
+        getter = self._cached_getter_lines("f", ffi_name)  # raw: the FFI method name
+        header = f"pub fn {_rust_ident(ffi_name)}({', '.join(sig_parts)}) -> Result<{ret}> {{"
         return [header, *_packed_call_lines("f", getter, packed, ret), "}"]
+
+
+def _make_renderer(
+    obj_info: ObjectInfo,
+    imports: RustImports,
+    ty_map: dict[str, str],
+    check_refs: bool = True,
+) -> _ObjectRenderer:
+    """Build the per-object renderer (resolves leaf / ``<T>Obj`` / base / root-ness)."""
+    type_key = obj_info.type_key
+    assert isinstance(type_key, str)
+    leaf = type_key.rsplit(".", 1)[-1]
+    parent_key = obj_info.parent_type_key
+    is_root = parent_key in (None, "ffi.Object")
+    base_type = "Object" if is_root else f"{parent_key.rsplit('.', 1)[-1]}Obj"  # type: ignore[union-attr]
+    return _ObjectRenderer(
+        info=obj_info,
+        leaf=leaf,
+        obj_struct=f"{leaf}Obj",
+        base_type=base_type,
+        is_root=is_root,
+        imports=imports,
+        ty_map=ty_map,
+        check_refs=check_refs,
+    )
+
+
+def _renders(obj_info: ObjectInfo, ty_map: dict[str, str]) -> bool:
+    """Whether ``obj_info``'s own fields/methods all have a Rust rendering.
+
+    Dry-renders the body into a throwaway collector (stdout suppressed, so the
+    real generation pass owns the warnings); a raised :class:`UnsupportedTypeError`
+    means an own field/arg/return type is unsupported -- i.e. the type would be
+    skipped. Reference checks are disabled (``check_refs=False``) so the probe
+    asks only "do this type's own field/arg/return *origins* render" without
+    recursing into referenced types -- which would otherwise loop back here on a
+    cyclic type reference. Does not consider ancestors (:func:`_base_buildable`).
+    """
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            _make_renderer(obj_info, RustImports(), ty_map, check_refs=False).body()
+    except UnsupportedTypeError:
+        return False
+    return True
+
+
+def _collect_object_keys(schema: TypeSchema, keys: set[str], ty_map: dict[str, str]) -> None:
+    """Collect the generated-tree object type keys ``schema`` references (recursive).
+
+    A generated-tree object key is a dotted, non-``ffi.*`` origin with no
+    ``ty_map`` entry -- exactly the origins :meth:`_ObjectRenderer._ty_render`
+    passes through (and checks). Container args (``Array<X>``, ``Map<K, V>``,
+    ``Optional<T>``, ...) are walked so a nested object reference is captured.
+    ``Callable`` is type-erased: ``render_rust_type`` renders it as the opaque
+    ``tvm_ffi::Function`` and never touches its signature, so its args reference
+    nothing and must NOT be collected (else a ``Callable[[Skipped]]`` field would
+    falsely mark its owner unbuildable). A reflected *method*'s own signature IS
+    rendered, but that is handled by destructuring in :func:`_type_record`, not
+    by recursing through the method's ``Callable`` schema here.
+    """
+    origin = schema.origin
+    if "." in origin and not origin.startswith("ffi.") and ty_map.get(origin) is None:
+        keys.add(origin)
+    if origin == "Callable":
+        return  # type-erased: its args are not rendered, so they reference nothing
+    for arg in schema.args or ():
+        _collect_object_keys(arg, keys, ty_map)
+
+
+#: Per-(type_key) cache of ``(own_renders, parent_key, refs)`` records, scoped to
+#: the current ``(registry resolver, ty_map)`` so a monkeypatched resolver (tests)
+#: or a different ``ty_map`` invalidates it. Records are reference-INDEPENDENT
+#: (own-origin renderability + static structure), so caching them is always safe
+#: -- only the buildability *verdict* (which depends on the cycle context) is left
+#: uncached and recomputed per query.
+_BUILDABLE_RECORDS: dict = {"key": None, "data": {}}
+
+
+def _type_record(
+    type_key: str, ty_map: dict[str, str]
+) -> tuple[bool, str | None, frozenset[str]] | None:
+    """Return the cached ``(own_renders, parent_key, refs)`` record for ``type_key``.
+
+    ``None`` when ``type_key`` cannot be resolved from the registry.
+    """
+    cache_key = (object_info_from_type_key, id(ty_map))
+    if _BUILDABLE_RECORDS["key"] != cache_key:
+        _BUILDABLE_RECORDS["key"] = cache_key
+        _BUILDABLE_RECORDS["data"] = {}
+    cache = _BUILDABLE_RECORDS["data"]
+    if type_key not in cache:
+        try:
+            info = object_info_from_type_key(type_key)
+        except Exception:
+            cache[type_key] = None  # unresolvable
+        else:
+            refs: set[str] = set()
+            for field in info.fields:
+                _collect_object_keys(field, refs, ty_map)
+            for method in info.methods:
+                # `_method_fn` renders only the return type + params (a member's
+                # `self` at args[1] is not rendered); the method's own `Callable`
+                # wrapper is not, so destructure rather than recurse through it.
+                margs = method.schema.args or ()
+                if margs:
+                    rendered = [margs[0], *(margs[2:] if method.is_member else margs[1:])]
+                    for sub in rendered:
+                        _collect_object_keys(sub, refs, ty_map)
+            cache[type_key] = (_renders(info, ty_map), info.parent_type_key, frozenset(refs))
+    return cache[type_key]
+
+
+def _base_buildable(
+    type_key: str | None, ty_map: dict[str, str], _visiting: frozenset[str] = frozenset()
+) -> bool:
+    """Whether ``type_key`` and everything it needs can be generated.
+
+    Checks ``type_key``'s own body, its whole ancestor chain, AND every type it
+    transitively references -- the reference recursion is what makes a skip
+    propagate to *consumers* at any depth, not just the type directly holding an
+    unsupported field.
+
+    Used for a derived type's parent chain (a skipped ancestor leaves its
+    ``<Parent>Obj`` un-emitted) and for any referenced type (referencing a skipped
+    type dangles). Rules: roots (``None`` / ``ffi.Object``) and crate-provided builtins
+    (mapped in ``ty_map``) are buildable; an *unmapped* ``ffi.*`` key is NOT
+    (``ffi.*`` is the crate's own namespace, exposed only via ``ty_map``, so e.g.
+    ``ffi.Enum`` has no Rust type); a key unresolvable from the registry is
+    lenient-buildable (only skip on *provable* unrenderability). A type already on
+    the visiting path is assumed buildable, so a pure reference cycle does not
+    make its members unbuildable (greatest-fixpoint semantics).
+    """
+    if type_key in (None, "ffi.Object") or type_key in ty_map:
+        return True
+    if type_key.startswith("ffi."):
+        return False  # unmapped ffi.* builtin: the crate has no Rust type for it
+    if type_key in _visiting:
+        return True  # cycle back-edge: do not let a pure cycle mark itself unbuildable
+    record = _type_record(type_key, ty_map)
+    if record is None:
+        return True  # cannot prove unbuildable -> do not skip
+    own_renders, parent_key, refs = record
+    if not own_renders:
+        return False
+    visiting = _visiting | {type_key}
+    return _base_buildable(parent_key, ty_map, visiting) and all(
+        _base_buildable(ref, ty_map, visiting) for ref in refs
+    )
 
 
 def generate_rust_object(
@@ -610,26 +844,18 @@ def generate_rust_object(
     assert len(code.lines) >= 2
     type_key = obj_info.type_key
     assert isinstance(type_key, str)
-    leaf = type_key.rsplit(".", 1)[-1]
-    obj_struct = f"{leaf}Obj"
     parent_key = obj_info.parent_type_key
-    is_root = parent_key in (None, "ffi.Object")
-    if is_root:
-        base_type = "Object"
-    else:
-        assert isinstance(parent_key, str)
-        base_type = f"{parent_key.rsplit('.', 1)[-1]}Obj"
-    renderer = _ObjectRenderer(
-        info=obj_info,
-        leaf=leaf,
-        obj_struct=obj_struct,
-        base_type=base_type,
-        is_root=is_root,
-        imports=imports,
-        ty_map=ty_map,
-    )
+    # A derived type embeds `base: <Parent>Obj`; if the parent (or any ancestor)
+    # is itself skipped, that `Obj` is never emitted, so the descendant would not
+    # compile. Skip the descendant transitively with a clear message instead.
+    if parent_key not in (None, "ffi.Object") and not _base_buildable(parent_key, ty_map):
+        raise UnsupportedTypeError(
+            parent_key,
+            f"base type {parent_key!r} (or one of its ancestors) cannot be "
+            "generated, so this type is skipped too",
+        )
 
-    body = renderer.body()
+    body = _make_renderer(obj_info, imports, ty_map).body()
 
     _warn_offset_mismatch(type_key, _layout_fields(obj_info.fields))
 
@@ -657,10 +883,13 @@ def generate_rust_import_section(
     deduped and sorted.
     """
     assert len(code.lines) >= 2
+    # A type defined in this file owns BOTH its ref name (in `defined_types`) and
+    # its `<Name>Obj` value type, whose path is the ref path + "Obj". Filter
+    # self-imports of either, so an embedded same-file base (`base: <Parent>Obj`)
+    # is not re-imported -- which would collide with the local definition.
+    defined = defined_types | {name + "Obj" for name in defined_types}
     # `record` never admits bare types, so every `as_use_line()` is non-empty.
-    use_lines = sorted(
-        {item.as_use_line() for item in imports.items if item.path not in defined_types}
-    )
+    use_lines = sorted({item.as_use_line() for item in imports.items if item.path not in defined})
     indent = " " * code.indent
     code.lines = [
         code.lines[0],
