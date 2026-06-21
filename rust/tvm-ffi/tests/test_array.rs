@@ -103,6 +103,59 @@ fn test_array_recursive_type_checking() {
 }
 
 #[test]
+fn test_array_of_any_heterogeneous() {
+    // #1: `Array<Any>` stores heterogeneous, type-erased elements (a Shape, a
+    // Tensor, a scalar) -- impossible with `Array<T: AnyCompatible>` since `Any`
+    // is not AnyCompatible. Each element reads back as an opaque `Any` and
+    // downcasts to its real type.
+    let shape = Shape::from(vec![1, 2, 3]);
+    let tensor = create_tensor(7.0, &[1]);
+    let array: Array<Any> = Array::new(vec![
+        Any::from(shape),
+        Any::from(tensor),
+        Any::from(42i64),
+    ]);
+
+    assert_eq!(array.len(), 3);
+    assert!(!array.is_empty());
+
+    // `get` yields an owned `Any`; downcast each to its real type.
+    let e0: Any = array.get(0).unwrap();
+    assert_eq!(e0.try_as::<Shape>().unwrap().as_slice(), &[1, 2, 3]);
+    let e1: Any = array.get(1).unwrap();
+    assert_eq!(get_val(&Tensor::try_from(e1).unwrap()), 7.0);
+    let e2: Any = array.get(2).unwrap();
+    assert_eq!(e2.try_as::<i64>().unwrap(), 42);
+
+    // Iteration yields `Any` items.
+    let kinds: Vec<i32> = array.iter().map(|a: Any| a.type_index()).collect();
+    assert_eq!(kinds.len(), 3);
+    assert_eq!(kinds[2], TypeIndex::kTVMFFIInt as i32);
+}
+
+#[test]
+fn test_array_of_any_refcount_roundtrip() {
+    // The `Any` element path must inc-ref managed objects on read so the returned
+    // `Any` owns its reference (no double-free, no leak). Assert the *concrete*
+    // strong count so a missing `inc_ref` would fail here (not just manifest as a
+    // later use-after-free).
+    let shape = Shape::from(vec![9]);
+    let array: Array<Any> = Array::new(vec![Any::from(shape.clone())]);
+    // live refs: the `shape` binding (1) + the array's stored slot (1) = 2.
+    // The non-owning view obtained via `Index` does not add a reference.
+    assert_eq!(array[0].debug_strong_count(), Some(2));
+
+    let got: Any = array.get(0).unwrap(); // must inc-ref -> 3
+    assert_eq!(got.debug_strong_count(), Some(3));
+    assert_eq!(got.try_as::<Shape>().unwrap().as_slice(), &[9]);
+
+    drop(got); // back to 2; the array's element is still valid
+    assert_eq!(array[0].debug_strong_count(), Some(2));
+    let again: Shape = Shape::try_from(array.get(0).unwrap()).unwrap();
+    assert_eq!(again.as_slice(), &[9]);
+}
+
+#[test]
 fn test_array_parametric_heterogeneity() {
     // Verify Array works with different ObjectRefCore types
     let shape_array = Array::new(vec![Shape::from(vec![1, 2, 3]), Shape::from(vec![10])]);

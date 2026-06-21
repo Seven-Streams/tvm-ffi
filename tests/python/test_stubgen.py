@@ -2617,14 +2617,13 @@ def test_rust_map_value_unsupported_field_degrades() -> None:
     [
         ("List", (TypeSchema("int"),)),  # List has no Rust type at all
         ("Dict", (TypeSchema("str"), TypeSchema("int"))),  # nor does Dict
-        ("Array", (TypeSchema("Object"),)),  # Array<Object>: element not AnyCompatible
-        ("Array", (TypeSchema("Any"),)),  # Array<Any>: element type-erased
     ],
 )
 def test_rust_pointer_container_field_degrades(origin: str, args: tuple[TypeSchema, ...]) -> None:
-    # #0: every single-pointer container field (`ObjectArc<...Obj>`, size 8) whose
-    # element cannot be rendered degrades to the opaque `ObjectRef` rather than
-    # skipping the owning struct -- the cascade-killer for the real library.
+    # #0: a top-level single-pointer container field (`ObjectArc<...Obj>`, size 8)
+    # with no crate type at all (`List`/`Dict`) degrades to the opaque `ObjectRef`
+    # rather than skipping the owning struct. (An `Array` field never degrades --
+    # it always renders `Array<T>`/`Array<Any>`; see the next test.)
     info = ObjectInfo(
         fields=[NamedTypeSchema("c", TypeSchema(origin, args), size=8, alignment=8)],
         methods=[],
@@ -2637,13 +2636,59 @@ def test_rust_pointer_container_field_degrades(origin: str, args: tuple[TypeSche
     assert RustUse("tvm_ffi::ObjectRef") in imports.items
 
 
+@pytest.mark.parametrize(
+    "elem",
+    [
+        TypeSchema("Any"),  # explicit Any element
+        TypeSchema("Object"),  # bare base object
+        TypeSchema("ffi.Object"),
+        TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))),  # unrenderable element
+        TypeSchema("Array", (TypeSchema("Any"),)),  # nested Array<Any> element
+    ],
+)
+def test_rust_array_field_renders_array_any(elem: TypeSchema) -> None:
+    # #1: an `Array` whose element is type-erased (`Any`/bare `Object`) OR has no
+    # Rust rendering at all (`Dict`, nested `Array<Any>`, ...) renders as the crate's
+    # typed `Array<Any>` -- a single `#[repr(C)]` pointer, layout-identical to C++
+    # `Array<X>` -- and is still iterable (elements read back as `Any` and downcast).
+    # An `Array` field never degrades to a bare `ObjectRef`.
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("c", TypeSchema("Array", (elem,)), size=8, alignment=8)],
+        methods=[],
+        type_key="ir.ArrHolder",
+        parent_type_key="ffi.Object",
+    )
+    text, imports = _gen_rust_object(info)
+    assert "struct ArrHolderObj {" in text
+    assert "    pub c: Array<Any>," in text
+    assert "    pub c: ObjectRef," not in text  # typed, not degraded to the opaque ref
+    assert RustUse("tvm_ffi::Array") in imports.items
+    assert RustUse("tvm_ffi::Any") in imports.items
+
+
+def test_rust_array_field_concrete_element_renders_typed() -> None:
+    # An `Array` of a concretely-renderable element stays precisely typed (not
+    # collapsed to `Array<Any>`).
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("c", TypeSchema("Array", (TypeSchema("str"),)), size=8, alignment=8)
+        ],
+        methods=[],
+        type_key="ir.StrArrHolder",
+        parent_type_key="ffi.Object",
+    )
+    text, imports = _gen_rust_object(info)
+    assert "    pub c: Array<String>," in text  # imported leaf, precisely typed
+    assert RustUse("tvm_ffi::String") in imports.items
+
+
 def test_rust_non_pointer_container_field_does_not_degrade() -> None:
     # The #0 fallback is guarded by the reflected `size`: a container-origin field
     # that is NOT pointer-wide (size != 8 -- e.g. an inline/by-value layout) has no
     # safe opaque substitution, so it still skips rather than corrupt the layout.
     info = ObjectInfo(
         fields=[
-            NamedTypeSchema("c", TypeSchema("Array", (TypeSchema("Any"),)), size=24, alignment=8)
+            NamedTypeSchema("c", TypeSchema("List", (TypeSchema("int"),)), size=24, alignment=8)
         ],
         methods=[],
         type_key="ir.WideHolder",

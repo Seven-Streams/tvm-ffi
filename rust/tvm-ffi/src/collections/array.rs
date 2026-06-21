@@ -50,12 +50,71 @@ unsafe impl ObjectCoreWithExtraItems for ArrayObj {
 
 #[repr(C)]
 #[derive(Clone)]
-pub struct Array<T: AnyCompatible + Clone> {
+pub struct Array<T: ArrayElement> {
     data: ObjectArc<ArrayObj>,
     _marker: PhantomData<T>,
 }
 
-impl<T: AnyCompatible + Clone> Debug for Array<T> {
+/// Element types that can be stored in and read back from an [`Array`].
+///
+/// Implemented for every `T: AnyCompatible + Clone` (read back as that concrete
+/// type, with subtype-aware downcast) **and** for [`Any`] itself (read back as an
+/// opaque, still-downcastable `Any`). The `Any` impl is what makes a heterogeneous
+/// `Array<Any>` -- e.g. tirx tile-op args, or any `Array<Object>` field -- usable,
+/// even though `Any` is deliberately *not* `AnyCompatible` (that would collide with
+/// the reflexive `From<Any> for Any`; see `any.rs`). Not meant to be implemented
+/// by hand -- you get it for free from `#[derive(Object)]`/`#[derive(ObjectRef)]`.
+pub trait ArrayElement: Clone + 'static {
+    /// Read an element out of a stored `TVMFFIAny` slot (the array owns the slot;
+    /// this only borrows it). `Err(())` means the slot does not hold this type.
+    #[doc(hidden)]
+    unsafe fn array_element_from_slot(slot: &TVMFFIAny) -> Result<Self, ()>;
+    /// Convert an owned element into an [`Any`] for storage in the array buffer.
+    #[doc(hidden)]
+    fn array_element_into_any(self) -> Any;
+    /// Human-readable element type name, used in cast-failure messages.
+    #[doc(hidden)]
+    fn array_element_type_str() -> String;
+}
+
+// Every AnyCompatible value is an array element (round-trips as its own type).
+impl<T: AnyCompatible + Clone + 'static> ArrayElement for T {
+    #[inline]
+    unsafe fn array_element_from_slot(slot: &TVMFFIAny) -> Result<Self, ()> {
+        T::try_cast_from_any_view(slot)
+    }
+    #[inline]
+    fn array_element_into_any(self) -> Any {
+        Any::from(self)
+    }
+    #[inline]
+    fn array_element_type_str() -> String {
+        T::type_str()
+    }
+}
+
+// `Any` itself is an array element: every slot reads back as an opaque `Any`
+// (cloned, so a managed object is inc-ref'd to match the returned value's drop).
+impl ArrayElement for Any {
+    #[inline]
+    unsafe fn array_element_from_slot(slot: &TVMFFIAny) -> Result<Self, ()> {
+        let copy = *slot;
+        if copy.type_index >= TypeIndex::kTVMFFIStaticObjectBegin as i32 {
+            crate::object::unsafe_::inc_ref(copy.data_union.v_obj);
+        }
+        Ok(Any::from_raw_ffi_any(copy))
+    }
+    #[inline]
+    fn array_element_into_any(self) -> Any {
+        self
+    }
+    #[inline]
+    fn array_element_type_str() -> String {
+        "Any".to_string()
+    }
+}
+
+impl<T: ArrayElement> Debug for Array<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let full_name = std::any::type_name::<T>();
         let short_name = full_name.split("::").last().unwrap_or(full_name);
@@ -63,13 +122,13 @@ impl<T: AnyCompatible + Clone> Debug for Array<T> {
     }
 }
 
-impl<T: AnyCompatible + Clone> Default for Array<T> {
+impl<T: ArrayElement> Default for Array<T> {
     fn default() -> Self {
         Self::new(vec![])
     }
 }
 
-unsafe impl<T: AnyCompatible + Clone> ObjectRefCore for Array<T> {
+unsafe impl<T: ArrayElement> ObjectRefCore for Array<T> {
     type ContainerType = ArrayObj;
 
     fn data(this: &Self) -> &ObjectArc<Self::ContainerType> {
@@ -88,7 +147,7 @@ unsafe impl<T: AnyCompatible + Clone> ObjectRefCore for Array<T> {
     }
 }
 
-impl<T: AnyCompatible + Clone> Array<T> {
+impl<T: ArrayElement> Array<T> {
     /// Creates a new Array from a vector of items.
     pub fn new(items: Vec<T>) -> Self {
         let capacity = items.len();
@@ -116,7 +175,7 @@ impl<T: AnyCompatible + Clone> Array<T> {
             container.data = base_ptr as *mut _;
 
             for (i, item) in items.into_iter().enumerate() {
-                let any: Any = Any::from(item);
+                let any: Any = item.array_element_into_any();
                 let raw = Any::into_raw_ffi_any(any);
                 core::ptr::write(base_ptr.add(i), raw);
             }
@@ -142,13 +201,13 @@ impl<T: AnyCompatible + Clone> Array<T> {
             let base_ptr = container.data as *const TVMFFIAny;
             let raw_any_ref = &*base_ptr.add(index);
 
-            match T::try_cast_from_any_view(raw_any_ref) {
+            match T::array_element_from_slot(raw_any_ref) {
                 Ok(val) => Ok(val),
                 Err(_) => crate::bail!(
                     crate::error::TYPE_ERROR,
                     "Failed to cast element at {} to {}",
                     index,
-                    T::type_str()
+                    T::array_element_type_str()
                 ),
             }
         }
@@ -173,7 +232,7 @@ impl<T: AnyCompatible + Clone> Array<T> {
 
 // --- Index Implementation ---
 
-impl<T: AnyCompatible + Clone> std::ops::Index<usize> for Array<T> {
+impl<T: ArrayElement> std::ops::Index<usize> for Array<T> {
     type Output = AnyView<'static>;
 
     fn index(&self, index: usize) -> &Self::Output {
@@ -194,13 +253,13 @@ impl<T: AnyCompatible + Clone> std::ops::Index<usize> for Array<T> {
 
 // --- Iterator Implementations ---
 
-pub struct ArrayIterator<'a, T: AnyCompatible + Clone> {
+pub struct ArrayIterator<'a, T: ArrayElement> {
     array: &'a Array<T>,
     index: usize,
     len: usize,
 }
 
-impl<'a, T: AnyCompatible + Clone> Iterator for ArrayIterator<'a, T> {
+impl<'a, T: ArrayElement> Iterator for ArrayIterator<'a, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -222,7 +281,7 @@ impl<'a, T: AnyCompatible + Clone> Iterator for ArrayIterator<'a, T> {
     }
 }
 
-impl<'a, T: AnyCompatible + Clone> IntoIterator for &'a Array<T> {
+impl<'a, T: ArrayElement> IntoIterator for &'a Array<T> {
     type Item = T;
     type IntoIter = ArrayIterator<'a, T>;
 
@@ -231,7 +290,7 @@ impl<'a, T: AnyCompatible + Clone> IntoIterator for &'a Array<T> {
     }
 }
 
-impl<T: AnyCompatible + Clone> FromIterator<T> for Array<T> {
+impl<T: ArrayElement> FromIterator<T> for Array<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let items: Vec<T> = iter.into_iter().collect();
         Self::new(items)

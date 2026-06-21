@@ -137,3 +137,31 @@ fn test_map_last_key_wins() -> Result<()> {
     assert_eq!(map.get(&String::from("k"))?, Some(2));
     Ok(())
 }
+
+#[test]
+fn test_map_value_any_reads_heterogeneous() -> Result<()> {
+    // #1: a `Map<K, Any>` (e.g. the `DictAttrs.__dict__ : Map<str, Any>` IR
+    // keystone) is readable -- its accessors yield opaque, downcastable `Any`
+    // values -- even though `Any` is not `AnyCompatible`. Build a typed map and
+    // view it as `Map<String, Any>` (same object; K/V are phantom), the shape a
+    // generated `Map<str, Any>` field hands back.
+    let typed: Map<String, i64> = sample()?;
+    let erased: Map<String, Any> = Map::from_data(ObjectRefCore::into_data(typed));
+
+    assert_eq!(erased.len()?, 3);
+
+    // `get` yields an opaque `Any`; downcast it.
+    let a: Any = erased.get(&String::from("a"))?.expect("key a present");
+    assert_eq!(a.try_as::<i64>().unwrap(), 1);
+    assert_eq!(erased.get(&String::from("z"))?.is_none(), true);
+
+    // `values` yields `Vec<Any>`; downcast each.
+    let mut vals: Vec<i64> = erased
+        .values()?
+        .into_iter()
+        .map(|v| v.try_as::<i64>().unwrap())
+        .collect();
+    vals.sort();
+    assert_eq!(vals, vec![1, 2, 3]);
+    Ok(())
+}

@@ -312,6 +312,8 @@ class _ObjectRenderer:
                 return self._render_optional_field(schema)
             if schema.origin == "Map":
                 return self._render_map_field(schema)
+            if schema.origin == "Array":
+                return self._render_array_field(schema)
             narrowed = C_RUST.RUST_SCALAR_BY_SIZE.get((schema.origin, schema.size))
             if narrowed is not None:
                 return narrowed
@@ -366,6 +368,33 @@ class _ObjectRenderer:
         assert args  # TypeSchema's post_init fills a missing K/V pair with (Any, Any).
         params = ", ".join(render_rust_type(a, self._ty_render) for a in args)
         return f"{self._ty_render('Map')}<{params}>"
+
+    def _render_array_field(self, schema: NamedTypeSchema) -> str:
+        """Render a direct ``Array<T>`` struct field, allowing a type-erased element.
+
+        #1: an ``Array`` is always a single ``ObjectArc<ArrayObj>`` pointer and every
+        element is stored as a ``TVMFFIAny`` slot, so a concretely-renderable element
+        becomes a typed ``Array<T>`` (e.g. ``Array<PrimExpr>``) and *anything else* --
+        ``Any``, the bare base ``Object``/``ffi.Object``, or an element with no Rust
+        rendering at all (``Array<Array<Any>>``, ``Array<Dict>``, an array of a
+        skipped type) -- is stored type-erased as ``Array<Any>`` (``Any:
+        ArrayElement``), layout-identical and still iterable: each element reads back
+        as an ``Any`` and downcasts. An ``Array`` field therefore never degrades to a
+        bare opaque ``ObjectRef`` (which would hide that it is even an array). This is
+        FIELD-ONLY: ``Array<Any>`` is not ``AnyCompatible`` (no ``TryFrom<Any>``), so
+        it cannot marshal as a method arg/return -- ``render_rust_type`` stays strict
+        there and #0 omits such methods.
+        """
+        args = schema.args or ()
+        assert args  # TypeSchema's post_init fills a missing element type.
+        elem = args[0]
+        erased = elem.origin in ("Any", "Object", "ffi.Object") and not elem.args
+        if not erased:
+            try:
+                return render_rust_type(schema, self._ty_render)  # typed Array<T>
+            except UnsupportedTypeError:
+                erased = True  # element has no Rust rendering -> store as Array<Any>
+        return f"{self._ty_render('Array')}<{self._ty_render('Any')}>"
 
     def _render_optional_field(self, schema: NamedTypeSchema) -> str:
         """Render a direct ``Optional<T>`` field as ``tvm_ffi::Optional<T, AlignK, N>``.

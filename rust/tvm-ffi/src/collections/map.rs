@@ -117,13 +117,43 @@ fn any_into<T: AnyCompatible>(value: Any) -> crate::Result<T> {
     Ok(TryFromTemp::into_value(temp))
 }
 
-impl<K: AnyCompatible, V: AnyCompatible> Map<K, V> {
+/// Value types a [`Map`] can yield from its accessors.
+///
+/// Implemented for every `V: AnyCompatible` (converted to that concrete type)
+/// and for [`Any`] itself (returned opaque, to be downcast), so a `Map<K, Any>`
+/// -- e.g. the `DictAttrs.__dict__ : Map<str, Any>` IR keystone -- is readable,
+/// even though `Any` is not `AnyCompatible`. Mirrors [`crate::ArrayElement`].
+/// Keys stay `AnyCompatible` (you look up by a concrete key). Not for hand impl.
+pub trait MapValue: Sized {
+    /// Convert a value read out of the map (always delivered as an [`Any`]) into
+    /// the requested value type.
+    #[doc(hidden)]
+    fn map_value_from_any(value: Any) -> crate::Result<Self>;
+}
+
+impl<V: AnyCompatible> MapValue for V {
+    #[inline]
+    fn map_value_from_any(value: Any) -> crate::Result<Self> {
+        any_into(value)
+    }
+}
+
+impl MapValue for Any {
+    #[inline]
+    fn map_value_from_any(value: Any) -> crate::Result<Self> {
+        Ok(value)
+    }
+}
+
+impl<K: AnyCompatible, V: MapValue> Map<K, V> {
     /// Builds a map from key/value pairs by calling the global `ffi.Map`
     /// constructor (packed as `k0, v0, k1, v1, ...`). Later duplicate keys win,
-    /// matching the C++ constructor.
+    /// matching the C++ constructor. Construction needs `V: AnyCompatible` (the
+    /// values are marshalled in); reading back only needs `V: MapValue`.
     pub fn from_pairs<I>(pairs: I) -> crate::Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
+        V: AnyCompatible,
     {
         // Keep the keys/values alive while their non-owning `AnyView`s are in the
         // packed-args slice; `ffi.Map` copies (inc-refs) them into the new map.
@@ -160,7 +190,7 @@ impl<K: AnyCompatible, V: AnyCompatible> Map<K, V> {
         if any_into::<i64>(self.invoke("ffi.MapCount", Some(key))?)? == 0 {
             return Ok(None);
         }
-        Ok(Some(any_into::<V>(self.invoke("ffi.MapGetItem", Some(key))?)?))
+        Ok(Some(V::map_value_from_any(self.invoke("ffi.MapGetItem", Some(key))?)?))
     }
 
     /// Collects the keys (iteration order is the C++ map's, which is unspecified).
@@ -170,14 +200,14 @@ impl<K: AnyCompatible, V: AnyCompatible> Map<K, V> {
 
     /// Collects the values (same unspecified order as [`keys`](Map::keys)).
     pub fn values(&self) -> crate::Result<Vec<V>> {
-        self.collect_entries(|f| any_into::<V>(Self::iter_step(f, 1)?))
+        self.collect_entries(|f| V::map_value_from_any(Self::iter_step(f, 1)?))
     }
 
     /// Collects the `(key, value)` pairs.
     pub fn items(&self) -> crate::Result<Vec<(K, V)>> {
         self.collect_entries(|f| {
             let k = any_into::<K>(Self::iter_step(f, 0)?)?;
-            let v = any_into::<V>(Self::iter_step(f, 1)?)?;
+            let v = V::map_value_from_any(Self::iter_step(f, 1)?)?;
             Ok((k, v))
         })
     }
@@ -186,7 +216,16 @@ impl<K: AnyCompatible, V: AnyCompatible> Map<K, V> {
     /// the leading packed argument(s).
     fn invoke(&self, name: &str, key: Option<&K>) -> crate::Result<Any> {
         let f = Function::get_global(name)?;
-        let self_view = AnyView::from(self);
+        // View the map by raw object pointer (it is a single `kTVMFFIMap` pointer
+        // regardless of K/V), so `Map<_, Any>` -- where `Map` is not itself
+        // `AnyCompatible` -- can still pass itself as the leading argument. The
+        // borrow of `self` keeps the object alive for the view's lifetime.
+        let self_view = unsafe {
+            AnyView::from_raw_object(
+                TypeIndex::kTVMFFIMap as i32,
+                ObjectArc::as_raw(&self.data) as *mut TVMFFIObject,
+            )
+        };
         match key {
             Some(k) => f.call_packed(&[self_view, AnyView::from(k)]),
             None => f.call_packed(&[self_view]),

@@ -48,6 +48,29 @@ impl<'a> AnyView<'a> {
         }
     }
 
+    /// Build a non-owning view of a heap object straight from its type index and
+    /// raw object pointer, bypassing [`AnyCompatible`].
+    ///
+    /// A container (e.g. `Map<K, V>`) is a single object pointer regardless of its
+    /// element/parameter types, so it must be able to view *itself* even when those
+    /// parameters are not `AnyCompatible` (`Map<_, Any>`). The returned view borrows
+    /// `'a`; the caller must keep the object alive for that lifetime. No ref-count
+    /// change (a view does not own a reference).
+    ///
+    /// # Safety
+    /// `obj` must be a valid pointer to a live object whose runtime type matches
+    /// `type_index`, alive for the entire `'a`.
+    #[inline]
+    pub(crate) unsafe fn from_raw_object(type_index: i32, obj: *mut tvm_ffi_sys::TVMFFIObject) -> Self {
+        let mut data = TVMFFIAny::new();
+        data.type_index = type_index;
+        data.data_union.v_obj = obj;
+        Self {
+            data,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
     #[inline]
     pub fn type_index(&self) -> i32 {
         self.data.type_index
