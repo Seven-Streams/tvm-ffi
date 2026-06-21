@@ -205,9 +205,17 @@ impl<'a, T: AnyCompatible + Clone> Iterator for ArrayIterator<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index < self.len {
-            let item = self.array.get(self.index).ok();
+            // Do NOT silently turn a conversion error into `None` -- that would
+            // truncate iteration (stop early) and hide the failure. With
+            // subtype-aware downcast a base-typed `Array<Base>` over derived
+            // elements now converts fine; a remaining error is a genuine type
+            // mismatch and should fail loudly.
+            let item = self
+                .array
+                .get(self.index)
+                .unwrap_or_else(|e| panic!("Array::iter: element {}: {}", self.index, e));
             self.index += 1;
-            item
+            Some(item)
         } else {
             None
         }

@@ -30,6 +30,11 @@ pub mod object;
 pub mod optional;
 pub mod string;
 pub mod type_traits;
+
+// Subtype-aware downcast tests; needs `#[derive(Object)]` compiled inside the
+// crate (so `crate::` paths resolve) and the C++ fixture built under `example`.
+#[cfg(all(test, feature = "example"))]
+mod downcast_test;
 pub use tvm_ffi_sys;
 
 pub use crate::any::{Any, AnyView};

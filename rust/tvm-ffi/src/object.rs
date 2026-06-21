@@ -123,6 +123,54 @@ pub unsafe fn inc_ref_raw_object(handle: *mut TVMFFIObject) {
     unsafe { unsafe_::inc_ref(handle) }
 }
 
+/// Whether an object of runtime type `actual` is an instance of `target` --
+/// i.e. `target` is `actual` itself or one of its ancestors.
+///
+/// This is the subtype-aware downcast predicate used by the generated
+/// `try_cast_from_any_view`, so a value held at a base type (e.g. a `For`
+/// stored in a `Stmt` field or an `Array<Stmt>`) downcasts to its real subtype.
+/// It is a direct port of C++ `RuntimeTypeIndexMatch` (`include/tvm/ffi/object.h`):
+/// the index-only walk over the registered type hierarchy via `TVMFFIGetTypeInfo`.
+///
+/// Safe to call with any indices: an unregistered/invalid index resolves to a
+/// null `TVMFFITypeInfo` and yields `false`. Requires the concrete type's
+/// ancestry to be registered (always true for C++-defined types).
+#[inline]
+pub fn is_instance(actual: i32, target: i32) -> bool {
+    if actual == target {
+        return true;
+    }
+    // `kTVMFFIObject` (the base) equals `kTVMFFIStaticObjectBegin`; it matches any
+    // static object.
+    let object_base = TypeIndex::kTVMFFIStaticObjectBegin as i32;
+    if target == object_base {
+        return actual >= object_base;
+    }
+    // Non-objects never participate in the hierarchy, and a parent's index is
+    // always smaller than its descendants' (registration order), so a smaller
+    // `actual` cannot derive from `target`.
+    if actual < object_base || target < object_base || actual < target {
+        return false;
+    }
+    // SAFETY: `TVMFFIGetTypeInfo` returns null for an unknown index; every deref
+    // is null-checked, and `type_acenstors[t.type_depth]` is in bounds because
+    // `a.type_depth > t.type_depth` (an ancestor array has one entry per depth
+    // below the type's own).
+    unsafe {
+        let a = tvm_ffi_sys::TVMFFIGetTypeInfo(actual);
+        let t = tvm_ffi_sys::TVMFFIGetTypeInfo(target);
+        if a.is_null() || t.is_null() {
+            return false;
+        }
+        let (a, t) = (&*a, &*t);
+        if a.type_depth <= t.type_depth || a.type_acenstors.is_null() {
+            return false;
+        }
+        let ancestor = *a.type_acenstors.offset(t.type_depth as isize);
+        !ancestor.is_null() && (*ancestor).type_index == target
+    }
+}
+
 /// Unsafe operations on object
 pub(crate) mod unsafe_ {
     use tvm_ffi_sys::{

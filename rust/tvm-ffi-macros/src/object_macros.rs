@@ -155,13 +155,15 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
             ) {
                 type ContainerType = <#struct_name as #tvm_ffi_crate::object::ObjectRefCore>
                     ::ContainerType;
-                let type_index =
-                    <ContainerType as #tvm_ffi_crate::object::ObjectCore>::type_index();
-                data.type_index = type_index as i32;
-                data.small_str_len = 0;
                 let data_ptr = #tvm_ffi_crate::object::ObjectArc::<ContainerType>::as_raw(
                     &src.data
                 );
+                // Stamp the object's REAL header type_index (not the static
+                // `ContainerType` index) so a base-typed value keeps its true
+                // runtime type and can be downcast to its real subtype.
+                data.type_index =
+                    (*(data_ptr as *const  #tvm_ffi_crate::tvm_ffi_sys::TVMFFIObject)).type_index;
+                data.small_str_len = 0;
                 data.data_union.v_obj =
                     data_ptr as *mut ContainerType as *mut  #tvm_ffi_crate::tvm_ffi_sys::TVMFFIObject;
             }
@@ -198,13 +200,13 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
             ) {
                 type ContainerType = <#struct_name as #tvm_ffi_crate::object::ObjectRefCore>
                     ::ContainerType;
-                let type_index =
-                    <ContainerType as #tvm_ffi_crate::object::ObjectCore>::type_index();
-                data.type_index = type_index as i32;
-                data.small_str_len = 0;
                 let data_ptr = #tvm_ffi_crate::object::ObjectArc::into_raw(
                     src.data
                 );
+                // Stamp the object's REAL header type_index (see copy_to_any_view).
+                data.type_index =
+                    (*(data_ptr as *const  #tvm_ffi_crate::tvm_ffi_sys::TVMFFIObject)).type_index;
+                data.small_str_len = 0;
                 data.data_union.v_obj =
                     data_ptr as *mut ContainerType as *mut  #tvm_ffi_crate::tvm_ffi_sys::TVMFFIObject;
             }
@@ -227,7 +229,10 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
                     ::ContainerType;
                 let type_index =
                     <ContainerType as #tvm_ffi_crate::object::ObjectCore>::type_index();
-                if data.type_index == type_index as i32 {
+                // Subtype-aware downcast (a `For` IS-A `Stmt`): the lenient cast
+                // path accepts any value whose real type is `ContainerType` or a
+                // descendant. `check_any_strict` stays exact (marshaling contract).
+                if #tvm_ffi_crate::object::is_instance(data.type_index, type_index as i32) {
                     Ok(Self::copy_from_any_view_after_check(data))
                 } else {
                     Err(())

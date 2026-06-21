@@ -46,6 +46,10 @@ fn generate_example_lib() {
         "scripts/generate_optional_test_lib.py",
         "optional test library",
     );
+    run_generate_script(
+        "scripts/generate_downcast_test_lib.py",
+        "downcast test library",
+    );
 }
 
 /// Update the LD_LIBRARY_PATH environment variable
