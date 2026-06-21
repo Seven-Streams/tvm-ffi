@@ -88,6 +88,24 @@ RUST_ALIGN_MARKER = {
 #: The crate's layout-mirror type for a C++ ``ffi::Optional<T>`` struct field.
 RUST_OPTIONAL_TYPE = "tvm_ffi::Optional"
 
+#: Opaque object-reference fallback for a struct field whose precise type cannot
+#: be represented (``Array<Any>``, a reference to a skipped type, an unmapped
+#: ``ffi.*`` object like ``ffi.reflection.AccessPath``). Every such field is a
+#: single ``#[repr(C)]`` pointer, so substituting the base object reference is
+#: layout-safe; it is read via the runtime API / downcast through ``Any``. This
+#: degrades the one field instead of skipping the whole struct (which would
+#: cascade to every consumer).
+RUST_OPAQUE_OBJECT_REF = "tvm_ffi::ObjectRef"
+
+#: Container origins that are a single heap-object pointer (``ObjectArc<...Obj>``)
+#: regardless of their type parameters, so an unrepresentable instance degrades
+#: to the opaque :data:`RUST_OPAQUE_OBJECT_REF` (layout-safe -- all are one
+#: pointer wide). ``Union`` is excluded: it is stored inline as an ``Any``
+#: (two words), not a pointer, so it has no pointer fallback and still skips.
+#: ``Optional`` is excluded too: it has its own layout-mirror rendering (the size
+#: may be inline, not a pointer) -- see :meth:`_render_optional_field`.
+RUST_OPAQUE_POINTER_ORIGINS = frozenset({"Array", "List", "Dict", "Map", "tuple"})
+
 #: Origins whose Rust rendering does NOT implement ``AnyCompatible``: ``Any``
 #: (``tvm_ffi::Any``) and the bare base object (``tvm_ffi::Object``). A type is
 #: AnyCompatible iff none of these appear in it (every other renderable leaf --

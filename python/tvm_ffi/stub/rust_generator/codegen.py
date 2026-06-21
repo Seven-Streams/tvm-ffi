@@ -301,14 +301,50 @@ class _ObjectRenderer:
         the *only* position the mirror is used; elsewhere ``Optional`` is the
         native ``Option<T>``. A direct ``Map<K, V>`` field is a single pointer
         whose params are phantom, so it renders even with non-AnyCompatible K/V
-        (see :meth:`_render_map_field`). Non-scalar origins render plainly.
+        (see :meth:`_render_map_field`). Non-scalar origins render plainly. #0: any
+        unrepresentable single-pointer field (a skipped object ref, ``Array``/
+        ``List``/``Dict``/``Map`` of an unrepresentable element) degrades to the
+        opaque ``ObjectRef`` rather than skipping the struct -- see
+        :meth:`_render_opaque_field_or_raise`.
         """
-        if schema.origin == "Optional":
-            return self._render_optional_field(schema)
-        if schema.origin == "Map":
-            return self._render_map_field(schema)
-        narrowed = C_RUST.RUST_SCALAR_BY_SIZE.get((schema.origin, schema.size))
-        return narrowed if narrowed is not None else render_rust_type(schema, self._ty_render)
+        try:
+            if schema.origin == "Optional":
+                return self._render_optional_field(schema)
+            if schema.origin == "Map":
+                return self._render_map_field(schema)
+            narrowed = C_RUST.RUST_SCALAR_BY_SIZE.get((schema.origin, schema.size))
+            if narrowed is not None:
+                return narrowed
+            return render_rust_type(schema, self._ty_render)
+        except UnsupportedTypeError:
+            return self._render_opaque_field_or_raise(schema)
+
+    def _render_opaque_field_or_raise(self, schema: NamedTypeSchema) -> str:
+        """Degrade an unrepresentable object-pointer field to an opaque ref, else re-raise.
+
+        #0 graceful degradation: one unrepresentable field would otherwise skip
+        the whole struct, cascading to every type that references it. But a
+        single-pointer field -- any object reference (a generated/builtin/``ffi.*``
+        type key) or a pointer-shaped container (``Array``/``List``/``Dict``/
+        ``Map``/``tuple``, each one ``ObjectArc<...Obj>``) -- is layout-safe to
+        substitute with the base ``tvm_ffi::ObjectRef``: the struct compiles, the
+        field is read via the runtime API / downcast through ``Any``, and the
+        cascade is eliminated. Origins that are NOT a single object pointer
+        (``Union`` -- an inline two-word ``Any`` -- and scalars, plus an
+        ``Optional`` whose layout-mirror itself failed) have no pointer fallback,
+        so the original :class:`UnsupportedTypeError` is re-raised (struct
+        skipped). The reflected ``size`` guards the substitution: it degrades only
+        when the field is genuinely pointer-wide (``8`` bytes, or unknown in unit
+        tests that omit sizes).
+        """
+        # A dotted origin is an object type key (generated / builtin ``ffi.*``);
+        # the listed container origins are each a single ``ObjectArc<...Obj>``.
+        is_object_pointer = (
+            "." in schema.origin or schema.origin in C_RUST.RUST_OPAQUE_POINTER_ORIGINS
+        )
+        if is_object_pointer and schema.size in (None, 8):
+            return self.imports.record(C_RUST.RUST_OPAQUE_OBJECT_REF)
+        raise UnsupportedTypeError(schema.origin)
 
     def _render_map_field(self, schema: NamedTypeSchema) -> str:
         """Render a direct ``Map<K, V>`` struct field, allowing non-AnyCompatible K/V.
@@ -350,11 +386,15 @@ class _ObjectRenderer:
             )
         args = schema.args or ()
         assert args  # TypeSchema's post_init fills a missing inner type.
+        inner = "()"
         if _is_any_compatible(args[0]):
-            inner = render_rust_type(args[0], self._ty_render)
-            self._opt_inner[schema.name] = inner  # reused by the accessor pass
-        else:
-            inner = "()"
+            try:
+                inner = render_rust_type(args[0], self._ty_render)
+                self._opt_inner[schema.name] = inner  # reused by the accessor pass
+            except UnsupportedTypeError:
+                # #0: the inner type is itself skipped -> fall back to the opaque
+                # `()` marker (the layout-mirror keeps the field; no typed accessor).
+                inner = "()"
         opt = self.imports.record(C_RUST.RUST_OPTIONAL_TYPE)
         align = self.imports.record(marker)
         return f"{opt}<{inner}, {align}, {schema.size}>"
@@ -442,7 +482,21 @@ class _ObjectRenderer:
         blocks: list[list[str]] = []
         if native:  # `native` implies `has_init` (see `_native_blocker`)
             blocks.append(self._new_fn_native())
-        blocks += [self._method_fn(m) for m in methods]
+        # #0 graceful degradation: a method whose signature mentions an
+        # unrepresentable type (a skipped type, `Dict`/`List`/`tuple`/`Union`, ...)
+        # is OMITTED rather than skipping the whole type -- unlike a field, a method
+        # has no opaque fallback, but dropping it keeps the struct + its other
+        # members usable. (Field bindings remain; reach the dropped method via the
+        # runtime `Function` API.)
+        for method in methods:
+            try:
+                blocks.append(self._method_fn(method))
+            except UnsupportedTypeError as e:
+                print(
+                    f"{C.TERM_YELLOW}[Warning] object {self.info.type_key}: skipping method "
+                    f"{method.schema.name!r} ({e}); call it via the runtime Function API"
+                    f"{C.TERM_RESET}"
+                )
         blocks += self._optional_accessor_blocks()
         if not blocks:
             return []
@@ -486,8 +540,20 @@ class _ObjectRenderer:
                 )
                 continue
             # Reuse the inner rendered in the struct-field pass; re-render on miss
-            # so this pass is independent of pass ordering.
-            inner = self._opt_inner.get(field.name) or render_rust_type(args[0], self._ty_render)
+            # so this pass is independent of pass ordering. #0: a skipped inner has
+            # no typed accessor (the field is emitted via the `()`-marker mirror).
+            inner = self._opt_inner.get(field.name)
+            if inner is None:
+                try:
+                    inner = render_rust_type(args[0], self._ty_render)
+                except UnsupportedTypeError:
+                    print(
+                        f"{C.TERM_YELLOW}[Warning] object {self.info.type_key}: optional field "
+                        f"{field.name!r} has no typed accessor (inner type is skipped); the field "
+                        f"is emitted -- read/write it via the runtime tvm_ffi::optional API"
+                        f"{C.TERM_RESET}"
+                    )
+                    continue
             self.imports.record("tvm_ffi::Result")
             name, obj = field.name, self.obj_struct
             ident = _rust_ident(name)  # bare-identifier spelling; `name` stays the FFI field name
@@ -746,44 +812,20 @@ def _renders(obj_info: ObjectInfo, ty_map: dict[str, str]) -> bool:
     return True
 
 
-def _collect_object_keys(schema: TypeSchema, keys: set[str], ty_map: dict[str, str]) -> None:
-    """Collect the generated-tree object type keys ``schema`` references (recursive).
-
-    A generated-tree object key is a dotted, non-``ffi.*`` origin with no
-    ``ty_map`` entry -- exactly the origins :meth:`_ObjectRenderer._ty_render`
-    passes through (and checks). Container args (``Array<X>``, ``Map<K, V>``,
-    ``Optional<T>``, ...) are walked so a nested object reference is captured.
-    ``Callable`` is type-erased: ``render_rust_type`` renders it as the opaque
-    ``tvm_ffi::Function`` and never touches its signature, so its args reference
-    nothing and must NOT be collected (else a ``Callable[[Skipped]]`` field would
-    falsely mark its owner unbuildable). A reflected *method*'s own signature IS
-    rendered, but that is handled by destructuring in :func:`_type_record`, not
-    by recursing through the method's ``Callable`` schema here.
-    """
-    origin = schema.origin
-    if "." in origin and not origin.startswith("ffi.") and ty_map.get(origin) is None:
-        keys.add(origin)
-    if origin == "Callable":
-        return  # type-erased: its args are not rendered, so they reference nothing
-    for arg in schema.args or ():
-        _collect_object_keys(arg, keys, ty_map)
-
-
-#: Per-(type_key) cache of ``(own_renders, parent_key, refs)`` records, scoped to
-#: the current ``(registry resolver, ty_map)`` so a monkeypatched resolver (tests)
-#: or a different ``ty_map`` invalidates it. Records are reference-INDEPENDENT
-#: (own-origin renderability + static structure), so caching them is always safe
-#: -- only the buildability *verdict* (which depends on the cycle context) is left
-#: uncached and recomputed per query.
+#: Per-(type_key) cache of ``(own_renders, parent_key)`` records, scoped to the
+#: current ``(registry resolver, ty_map)`` so a monkeypatched resolver (tests) or
+#: a different ``ty_map`` invalidates it. Both are reference-INDEPENDENT (own-body
+#: renderability + the static parent link), so caching is always safe.
 _BUILDABLE_RECORDS: dict = {"key": None, "data": {}}
 
 
-def _type_record(
-    type_key: str, ty_map: dict[str, str]
-) -> tuple[bool, str | None, frozenset[str]] | None:
-    """Return the cached ``(own_renders, parent_key, refs)`` record for ``type_key``.
+def _type_record(type_key: str, ty_map: dict[str, str]) -> tuple[bool, str | None] | None:
+    """Return the cached ``(own_renders, parent_key)`` record (``None`` if unresolvable).
 
-    ``None`` when ``type_key`` cannot be resolved from the registry.
+    ``own_renders`` is whether the type's OWN body renders -- with #0 field
+    degradation, so it is False only when a field is genuinely unrepresentable
+    (a non-pointer ``Dict`` / ``List`` / ``Union`` / ``tuple`` / scalar that has
+    no opaque fallback), not merely because it references a skipped type.
     """
     cache_key = (object_info_from_type_key, id(ty_map))
     if _BUILDABLE_RECORDS["key"] != cache_key:
@@ -796,58 +838,39 @@ def _type_record(
         except Exception:
             cache[type_key] = None  # unresolvable
         else:
-            refs: set[str] = set()
-            for field in info.fields:
-                _collect_object_keys(field, refs, ty_map)
-            for method in info.methods:
-                # `_method_fn` renders only the return type + params (a member's
-                # `self` at args[1] is not rendered); the method's own `Callable`
-                # wrapper is not, so destructure rather than recurse through it.
-                margs = method.schema.args or ()
-                if margs:
-                    rendered = [margs[0], *(margs[2:] if method.is_member else margs[1:])]
-                    for sub in rendered:
-                        _collect_object_keys(sub, refs, ty_map)
-            cache[type_key] = (_renders(info, ty_map), info.parent_type_key, frozenset(refs))
+            cache[type_key] = (_renders(info, ty_map), info.parent_type_key)
     return cache[type_key]
 
 
-def _base_buildable(
-    type_key: str | None, ty_map: dict[str, str], _visiting: frozenset[str] = frozenset()
-) -> bool:
-    """Whether ``type_key`` and everything it needs can be generated.
+def _base_buildable(type_key: str | None, ty_map: dict[str, str]) -> bool:
+    """Whether ``type_key`` can be generated -- its own body AND its ancestor chain.
 
-    Checks ``type_key``'s own body, its whole ancestor chain, AND every type it
-    transitively references -- the reference recursion is what makes a skip
-    propagate to *consumers* at any depth, not just the type directly holding an
-    unsupported field.
+    This is NOT reference-aware: a type that merely *references* a skipped type
+    still generates, because #0 degrades the offending field to an opaque
+    ``ObjectRef`` (see :meth:`_ObjectRenderer._render_opaque_field_or_raise`) --
+    so the only things that block generation are an own non-pointer unrepresentable
+    field (``own_renders`` False) or an unbuildable ancestor (a ``base`` embed
+    cannot be made opaque -- it carries the object header). Rules: roots
+    (``None`` / ``ffi.Object``) and crate builtins (mapped in ``ty_map``) are
+    buildable; an unmapped ``ffi.*`` key is NOT (the crate has no Rust type for
+    it); an unresolvable key is lenient-buildable (only skip on *provable*
+    unrenderability). The recursion is over the parent chain only (a tree), so it
+    terminates without cycle handling.
 
-    Used for a derived type's parent chain (a skipped ancestor leaves its
-    ``<Parent>Obj`` un-emitted) and for any referenced type (referencing a skipped
-    type dangles). Rules: roots (``None`` / ``ffi.Object``) and crate-provided builtins
-    (mapped in ``ty_map``) are buildable; an *unmapped* ``ffi.*`` key is NOT
-    (``ffi.*`` is the crate's own namespace, exposed only via ``ty_map``, so e.g.
-    ``ffi.Enum`` has no Rust type); a key unresolvable from the registry is
-    lenient-buildable (only skip on *provable* unrenderability). A type already on
-    the visiting path is assumed buildable, so a pure reference cycle does not
-    make its members unbuildable (greatest-fixpoint semantics).
+    Consequence: ``_base_buildable(X)`` is True iff ``generate_rust_object(X)``
+    succeeds -- so a typed field reference always points at a generated type (no
+    dangling), and a reference to a genuinely-skipped type is degraded by the
+    field renderer.
     """
     if type_key in (None, "ffi.Object") or type_key in ty_map:
         return True
     if type_key.startswith("ffi."):
         return False  # unmapped ffi.* builtin: the crate has no Rust type for it
-    if type_key in _visiting:
-        return True  # cycle back-edge: do not let a pure cycle mark itself unbuildable
     record = _type_record(type_key, ty_map)
     if record is None:
         return True  # cannot prove unbuildable -> do not skip
-    own_renders, parent_key, refs = record
-    if not own_renders:
-        return False
-    visiting = _visiting | {type_key}
-    return _base_buildable(parent_key, ty_map, visiting) and all(
-        _base_buildable(ref, ty_map, visiting) for ref in refs
-    )
+    own_renders, parent_key = record
+    return own_renders and _base_buildable(parent_key, ty_map)
 
 
 def generate_rust_object(

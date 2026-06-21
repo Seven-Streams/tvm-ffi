@@ -933,20 +933,23 @@ def test_render_array_non_any_compatible_element_is_unsupported(schema: TypeSche
     "type_key",
     ["ffi.reflection.AccessPath", "ffi.reflection.AccessStep", "ffi.SomethingUnexposed"],
 )
-def test_rust_unmapped_ffi_builtin_field_is_unsupported(type_key: str) -> None:
-    # C1: an `ffi.*` builtin absent from the ty_map is a crate type the Rust crate
-    # does not expose (e.g. `ffi.reflection.AccessPath`). Referencing it must skip
-    # the enclosing object, NOT emit a `use tvm_ffi::reflection::AccessPath;` for a
-    # nonexistent crate path (the old passthrough did exactly that -> E0432).
+def test_rust_unmapped_ffi_object_field_degrades_to_opaque(type_key: str) -> None:
+    # #0: an `ffi.*` object absent from the ty_map (e.g. `ffi.reflection.AccessPath`)
+    # has no typed crate mirror, but it is still a single object pointer -- so the
+    # FIELD degrades to the opaque `tvm_ffi::ObjectRef` and the enclosing struct is
+    # emitted (no cascade), NOT a `use tvm_ffi::reflection::AccessPath;` for a
+    # nonexistent crate path (which C1's old passthrough produced -> E0432).
     info = ObjectInfo(
         fields=[NamedTypeSchema("p", TypeSchema(type_key))],
         methods=[],
         type_key="cpp_rust_test.Refs",
         parent_type_key="ffi.Object",
     )
-    with pytest.raises(UnsupportedTypeError) as exc:
-        _gen_rust_object(info)
-    assert exc.value.origin == type_key
+    text, imports = _gen_rust_object(info)
+    assert "struct RefsObj {" in text  # the struct is emitted, not skipped
+    assert "    pub p: ObjectRef," in text  # the field degraded to the opaque ref
+    assert RustUse("tvm_ffi::ObjectRef") in imports.items
+    assert not any("reflection" in u.path for u in imports.items)  # no dangling import
 
 
 def test_ty_render_dedups_same_path() -> None:
@@ -1023,6 +1026,19 @@ def _gen_rust_object(info: ObjectInfo) -> tuple[str, RustImports]:
     imports = RustImports()
     generate_rust_object(block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), info)
     return "\n".join(block.lines), imports
+
+
+def _unrepresentable_field(name: str = "bad") -> NamedTypeSchema:
+    """Build a field that GENUINELY has no Rust rendering and no #0 opaque fallback.
+
+    ``Union`` (a Variant) is stored inline as an ``Any`` (two words), not a single
+    pointer, so -- unlike ``Array``/``List``/``Dict``/``Map``/object refs, which #0
+    degrades to an opaque ``ObjectRef`` -- it cannot be substituted and still skips
+    its owning struct. Use this anywhere a test needs a type to actually be skipped.
+    """
+    return NamedTypeSchema(
+        name, TypeSchema("Union", (TypeSchema("int"), TypeSchema("str"))), size=16, alignment=8
+    )
 
 
 def _expr_info(*, mutable: bool = True) -> ObjectInfo:
@@ -1509,10 +1525,11 @@ def test_rust_optional_object_inner_field_skips_accessor(
     assert "optional field 'obj' has no typed accessor" in capsys.readouterr().out
 
 
-def test_rust_optional_object_method_arg_is_unsupported() -> None:
+def test_rust_optional_object_method_arg_omits_method() -> None:
     # `Optional<ObjectRef>` in a method signature would render `Option<Object>`,
-    # which is not AnyCompatible; render must raise so the object is skipped rather
-    # than emit non-compiling bindings.
+    # which is not AnyCompatible. #0: the method is OMITTED (with a warning) rather
+    # than skipping the whole object -- a method signature is not a layout pointer,
+    # so it has no opaque fallback, but dropping just the method keeps the type.
     info = _native_point_info()
     info.methods = [
         FuncInfo(
@@ -1526,9 +1543,9 @@ def test_rust_optional_object_method_arg_is_unsupported() -> None:
             is_member=False,
         )
     ]
-    with pytest.raises(UnsupportedTypeError) as exc:
-        _gen_rust_object(info)
-    assert exc.value.origin == "Optional"
+    text, _ = _gen_rust_object(info)  # object survives -- no raise
+    assert "struct PointObj" in text
+    assert "pub fn f(" not in text  # the unrepresentable method is omitted
 
 
 def test_rust_optional_field_unsupported_alignment_skips() -> None:
@@ -1548,6 +1565,42 @@ def test_rust_optional_field_unsupported_alignment_skips() -> None:
     with pytest.raises(UnsupportedTypeError) as exc:
         _gen_rust_object(info)
     assert exc.value.origin == "Optional"
+
+
+def test_rust_optional_inner_referencing_skipped_type_degrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #0: an `Optional<T>` field whose inner `T` is AnyCompatible (a generated
+    # object ref, so it passes the accessor's AnyCompatible guard) but was itself
+    # SKIPPED must NOT emit a typed accessor over a non-existent type. The field
+    # degrades to the layout-mirror with the `()` marker (`Optional<(), A, N>`) and
+    # the accessor is omitted -- never a broken `Result<Option<()>>` or
+    # `Result<Option<Skipped>>`. The owner still generates (no cascade).
+    skipped = ObjectInfo(
+        fields=[_unrepresentable_field("u")],  # genuine Union field -> ir.Skipped skips
+        methods=[],
+        type_key="ir.Skipped",
+        parent_type_key="ffi.Object",
+    )
+    holder = ObjectInfo(
+        fields=[
+            NamedTypeSchema(
+                "opt", TypeSchema("Optional", (TypeSchema("ir.Skipped"),)), size=8, alignment=8
+            )
+        ],
+        methods=[],
+        type_key="ir.OptHolder",
+        parent_type_key="ffi.Object",
+        mutable=True,
+    )
+    fixtures = {"ir.Skipped": skipped, "ir.OptHolder": holder}
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
+    text, imports = _gen_rust_object(holder)  # owner survives
+    assert "struct OptHolderObj {" in text
+    assert "    pub opt: Optional<(), Align8, 8>," in text  # `()` marker, imported leaves
+    assert "pub fn opt(" not in text  # no typed accessor over the skipped inner
+    assert "Option<()>" not in text  # never a broken accessor signature
+    assert not any(u.path == "crate::ir::Skipped" for u in imports.items)  # no dangling import
 
 
 def _native_point3d_info() -> ObjectInfo:
@@ -1772,11 +1825,13 @@ def test_rust_multilevel_inheritance_no_field_flattening(monkeypatch: pytest.Mon
 
 
 def test_rust_skipped_base_skips_descendant_transitively(monkeypatch: pytest.MonkeyPatch) -> None:
-    # D: a base with an unsupported field (here a `Dict`) is itself skipped, so its
-    # `<Base>Obj` is never emitted. A subclass embedding `base: <Base>Obj` would not
-    # compile, so it is skipped transitively naming the unbuildable base.
+    # D: a base with a GENUINELY unsupported field (a `Union` -- no pointer
+    # fallback, so #0 cannot degrade it) is itself skipped, so its `<Base>Obj` is
+    # never emitted. A subclass embedding `base: <Base>Obj` would not compile, so
+    # it is skipped transitively naming the unbuildable base (a `base` embed cannot
+    # be made opaque -- it carries the object header).
     base = ObjectInfo(
-        fields=[NamedTypeSchema("m", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))))],
+        fields=[_unrepresentable_field("m")],
         methods=[],
         type_key="cpp_rust_test.Base",
         parent_type_key="ffi.Object",
@@ -1789,10 +1844,10 @@ def test_rust_skipped_base_skips_descendant_transitively(monkeypatch: pytest.Mon
     )
     fixtures = {"cpp_rust_test.Base": base, "cpp_rust_test.Child": child}
     monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
-    # The base itself is unsupported (the `Dict` field has no Rust rendering).
+    # The base itself is unsupported (the `Union` field has no Rust rendering).
     with pytest.raises(UnsupportedTypeError) as base_exc:
         _gen_rust_object(base)
-    assert base_exc.value.origin == "Dict"
+    assert base_exc.value.origin == "Union"
     # The child is skipped transitively, the error naming the unbuildable base.
     with pytest.raises(UnsupportedTypeError) as child_exc:
         _gen_rust_object(child)
@@ -1804,7 +1859,7 @@ def test_rust_skipped_grandparent_skips_whole_subtree(monkeypatch: pytest.Monkey
     # unsupported field; Mid renders on its own but embeds RootObj; Leaf embeds
     # MidObj. Both Mid and Leaf are skipped (each naming its immediate parent).
     root = ObjectInfo(
-        fields=[NamedTypeSchema("t", TypeSchema("tuple", (TypeSchema("int"), TypeSchema("int"))))],
+        fields=[_unrepresentable_field("t")],
         methods=[],
         type_key="cpp_rust_test.Root",
         parent_type_key="ffi.Object",
@@ -1867,12 +1922,14 @@ def test_rust_unmapped_ffi_base_is_skipped() -> None:
     assert exc.value.origin == "ffi.Enum"
 
 
-def test_rust_field_referencing_skipped_type_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
-    # X: a field whose type was itself skipped (here `S` has a `Dict` field) must
-    # not leave a dangling `use`/field type. The referencing type is skipped, and
-    # no import for the skipped type is recorded (the raise precedes the record).
+def test_rust_field_referencing_skipped_type_degrades(monkeypatch: pytest.MonkeyPatch) -> None:
+    # #0: a field whose type was itself skipped (here `S` has a genuine `Union`
+    # field) is still an object pointer, so the field degrades to the opaque
+    # `ObjectRef` and the referencing struct survives -- no cascade, and no
+    # dangling `use` for the skipped type. (`S` itself, with its non-pointer
+    # `Union` field, still skips.)
     skipped = ObjectInfo(
-        fields=[NamedTypeSchema("m", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))))],
+        fields=[_unrepresentable_field("m")],
         methods=[],
         type_key="ir.S",
         parent_type_key="ffi.Object",
@@ -1885,12 +1942,14 @@ def test_rust_field_referencing_skipped_type_is_skipped(monkeypatch: pytest.Monk
     )
     fixtures = {"ir.S": skipped, "relax.User": user}
     monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
-    imports = RustImports()
-    block = _rust_object_block("relax.User")
-    with pytest.raises(UnsupportedTypeError) as exc:
-        generate_rust_object(block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), user)
-    assert exc.value.origin == "ir.S"
-    # the skipped type's import was never recorded (raise before record)
+    # `S` itself is genuinely unrepresentable (non-pointer `Union` field) -> skipped.
+    with pytest.raises(UnsupportedTypeError):
+        _gen_rust_object(skipped)
+    # `User` survives: its `s` field degrades to the opaque ref, no `crate::ir::S` import.
+    text, imports = _gen_rust_object(user)
+    assert "struct UserObj {" in text
+    assert "    pub s: ObjectRef," in text
+    assert RustUse("tvm_ffi::ObjectRef") in imports.items
     assert not any(u.path == "crate::ir::S" for u in imports.items)
 
 
@@ -1917,13 +1976,13 @@ def test_rust_cyclic_type_references_terminate(monkeypatch: pytest.MonkeyPatch) 
     assert "use crate::m::B;" in {u.as_use_line() for u in imports_a.items}
 
 
-def test_rust_multi_hop_skip_propagates_to_consumers(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Round 3: `Mid` own-renders but references the SKIPPED `Leaf` (Dict field), so
-    # `Mid` is skipped (1-hop). Reference-aware buildability propagates that: a
-    # `Consumer` whose field is `Mid` is skipped too -- it must NOT emit a dangling
-    # `use crate::ir::Mid;` for a type the crate never generates (the round-3 bug).
+def test_rust_multi_hop_degradation_stops_cascade(monkeypatch: pytest.MonkeyPatch) -> None:
+    # #0: only the genuine root (`Leaf`, with a non-pointer `Union` field) skips.
+    # `Mid` references `Leaf` via a pointer field, so that field degrades to the
+    # opaque ref and `Mid` survives -- which means `Consumer`'s field to `Mid` is
+    # buildable and renders the typed `Mid`. The whole multi-hop cascade is gone.
     leaf = ObjectInfo(
-        fields=[NamedTypeSchema("m", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))))],
+        fields=[_unrepresentable_field("m")],
         methods=[],
         type_key="ir.Leaf",
         parent_type_key="ffi.Object",
@@ -1942,25 +2001,26 @@ def test_rust_multi_hop_skip_propagates_to_consumers(monkeypatch: pytest.MonkeyP
     )
     fixtures = {"ir.Leaf": leaf, "ir.Mid": mid, "relax.Consumer": consumer}
     monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
-    with pytest.raises(UnsupportedTypeError):  # Leaf: own unsupported field
+    with pytest.raises(UnsupportedTypeError):  # Leaf: genuine non-pointer Dict field -> skip
         _gen_rust_object(leaf)
-    with pytest.raises(UnsupportedTypeError) as mid_exc:  # Mid: 1-hop ref to skipped Leaf
-        _gen_rust_object(mid)
-    assert mid_exc.value.origin == "ir.Leaf"
-    imports = RustImports()
-    block = _rust_object_block("relax.Consumer")
-    with pytest.raises(UnsupportedTypeError) as cons_exc:  # Consumer: 2-hop, reference-aware
-        generate_rust_object(block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), consumer)
-    assert cons_exc.value.origin == "ir.Mid"
-    assert not any(u.path == "crate::ir::Mid" for u in imports.items)  # no dangling import
+    # Mid survives: its `leaf` field degrades to the opaque ref.
+    text_mid, _ = _gen_rust_object(mid)
+    assert "struct MidObj {" in text_mid
+    assert "    pub leaf: ObjectRef," in text_mid
+    # Consumer survives with a TYPED `Mid` field (Mid is buildable now -> no degrade).
+    text_cons, imports = _gen_rust_object(consumer)
+    assert "struct ConsumerObj {" in text_cons
+    assert "    pub mid: Mid," in text_cons
+    assert RustUse("crate::ir::Mid") in imports.items
 
 
-def test_rust_cycle_referencing_skipped_type_skips_all(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Round 3 (greatest-fixpoint): a reference cycle A<->B where A *also* references
-    # a SKIPPED `Leaf` must mark BOTH A and B unbuildable -- the cycle must not
-    # rescue them. (Naive memoization of the verdict would wrongly cache B=True.)
+def test_rust_cycle_referencing_skipped_type_degrades(monkeypatch: pytest.MonkeyPatch) -> None:
+    # #0: a reference cycle A<->B where A *also* references a SKIPPED `Leaf`. With
+    # field degradation, only `Leaf` (genuine non-pointer `Union` field) skips; A's
+    # `l` field degrades to the opaque ref, so A and B both build. Buildability is
+    # own-body + base only (not reference-aware), so the cycle is a non-issue.
     leaf = ObjectInfo(
-        fields=[NamedTypeSchema("m", TypeSchema("List", (TypeSchema("int"),)))],
+        fields=[_unrepresentable_field("m")],
         methods=[],
         type_key="m.Leaf",
         parent_type_key="ffi.Object",
@@ -1983,8 +2043,12 @@ def test_rust_cycle_referencing_skipped_type_skips_all(monkeypatch: pytest.Monke
     fixtures = {"m.Leaf": leaf, "m.A": a, "m.B": b}
     monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
     ty = RC.RUST_TY_MAP_DEFAULTS.copy()
-    assert rust_codegen._base_buildable("m.A", ty) is False
-    assert rust_codegen._base_buildable("m.B", ty) is False  # the cycle does not rescue B
+    assert rust_codegen._base_buildable("m.A", ty) is True  # `l` degrades, A builds
+    assert rust_codegen._base_buildable("m.B", ty) is True
+    assert rust_codegen._base_buildable("m.Leaf", ty) is False  # genuine Union field
+    text_a, _ = _gen_rust_object(a)
+    assert "    pub b: B," in text_a  # B is buildable -> typed
+    assert "    pub l: ObjectRef," in text_a  # Leaf is skipped -> degraded
 
 
 def test_rust_callable_field_referencing_skipped_type_does_not_skip(
@@ -2018,13 +2082,13 @@ def test_rust_callable_field_referencing_skipped_type_does_not_skip(
     assert "    pub cb: Function," in text  # type-erased; no reference to Leaf
 
 
-def test_rust_method_arg_referencing_skipped_type_skips_owner(
+def test_rust_method_arg_referencing_skipped_type_omits_method(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Round 3 (companion to the Callable guard): a reflected method's signature IS
-    # rendered by `_method_fn`, so a method param referencing a SKIPPED type must
-    # still skip the owner -- and reference-aware buildability must agree, so the
-    # owner's consumers cascade-skip. Confirms method refs survive the Callable fix.
+    # #0: a reflected method whose signature renders a SKIPPED type (here a `Dict`
+    # arg -- a genuinely unrepresentable, non-pointer leaf) is OMITTED, but the
+    # owner survives with its other members. Buildability is own-body + base only,
+    # so the owner stays buildable and its consumers do not cascade-skip.
     leaf = ObjectInfo(
         fields=[NamedTypeSchema("m", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))))],
         methods=[],
@@ -2036,19 +2100,32 @@ def test_rust_method_arg_referencing_skipped_type_skips_owner(
         methods=[
             FuncInfo(
                 NamedTypeSchema(
-                    "use_leaf", TypeSchema("Callable", (TypeSchema("None"), TypeSchema("ir.Leaf")))
+                    "use_dict",
+                    TypeSchema(
+                        "Callable",
+                        (
+                            TypeSchema("None"),
+                            TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))),
+                        ),
+                    ),
                 ),
                 is_member=False,
-            )
+            ),
+            FuncInfo(
+                NamedTypeSchema("get_x", TypeSchema("Callable", (TypeSchema("int"),))),
+                is_member=False,
+            ),
         ],
         type_key="relax.Owner2",
         parent_type_key="ffi.Object",
     )
     fixtures = {"ir.Leaf": leaf, "relax.Owner2": owner}
     monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: fixtures[key])
-    with pytest.raises(UnsupportedTypeError):  # method param renders the skipped Leaf
-        _gen_rust_object(owner)
-    assert rust_codegen._base_buildable("relax.Owner2", RC.RUST_TY_MAP_DEFAULTS.copy()) is False
+    text, _ = _gen_rust_object(owner)  # owner survives -- no raise
+    assert "    pub x: i64," in text
+    assert "use_dict" not in text  # method with the skipped Dict arg is omitted
+    assert "pub fn get_x(" in text  # the representable method stays
+    assert rust_codegen._base_buildable("relax.Owner2", RC.RUST_TY_MAP_DEFAULTS.copy()) is True
 
 
 def test_rust_object_root_struct_and_impl() -> None:
@@ -2198,14 +2275,13 @@ def test_rust_method_any_return_stays_any_not_anyview() -> None:
 
 
 def _has_dict_info() -> ObjectInfo:
-    # A `Dict` field is genuinely unsupported (no Rust type at all), so this stays
-    # a skip fixture for the generic skip-handling tests below. (An untyped
-    # `Map<Any, Any>` field now renders -- see ``test_rust_map_any_field_renders``
-    # -- because as a field a `Map` is a single pointer with phantom params.)
+    # A `Union` field is genuinely unsupported with no #0 pointer fallback (a
+    # Variant is an inline two-word `Any`, not a single pointer), so this stays a
+    # skip fixture for the generic skip-handling tests below. (A `Dict`/`List`/
+    # `Map`/`Array` field of an unrepresentable element now degrades to an opaque
+    # `ObjectRef` -- single pointer -- so those no longer skip; only `Union` does.)
     return ObjectInfo(
-        fields=[
-            NamedTypeSchema("cfg", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int")))),
-        ],
+        fields=[_unrepresentable_field("cfg")],
         methods=[],
         type_key="demo.HasDict",
         parent_type_key="ffi.Object",
@@ -2223,15 +2299,17 @@ def test_rust_object_unsupported_raises() -> None:
         generate_rust_object(
             block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), _has_dict_info()
         )
-    assert exc.value.origin == "Dict"
+    assert exc.value.origin == "Union"
     assert RustUse("tvm_ffi::Tensor") in imports.items  # pre-seeded use kept
 
 
 def test_rust_stage3_skipped_type_not_counted_as_defined(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A skipped object must not enter `defined_types`: another object referencing
-    # it keeps its `use` in the import section (previously dropped -> E0412).
+    # A skipped object (genuine `Union` field) must not enter `defined_types`. #0:
+    # the referencing object does NOT keep a `use crate::demo::HasDict` -- its
+    # field degrades to the opaque `ObjectRef`, so there is no reference to the
+    # skipped type and no dangling import (E0412 cannot occur).
     rs = tmp_path / "demo.rs"
     rs.write_text(
         "\n".join(
@@ -2258,7 +2336,10 @@ def test_rust_stage3_skipped_type_not_counted_as_defined(
             parent_type_key="ffi.Object",
         ),
     }
+    # Both the stage-3 driver (stub_cli) and the buildability probe (rust_codegen)
+    # resolve through the same registry in the real system; patch both.
     monkeypatch.setattr(stub_cli, "object_info_from_type_key", lambda key: infos[key])
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: infos[key])
     info = FileInfo.from_file(rs)
     assert info is not None
     _stage_3(
@@ -2271,16 +2352,18 @@ def test_rust_stage3_skipped_type_not_counted_as_defined(
     text = "\n".join(info.lines)
     assert "[Skipped] object demo.HasDict" in capsys.readouterr().out
     assert "struct HasDictObj" not in text  # skipped block reset to bare markers
-    assert "    pub child: HasDict," in text  # the referencing object still renders
-    assert "use crate::demo::HasDict;" in text  # ... and keeps its (crate::-rooted) import
+    assert "    pub child: ObjectRef," in text  # the referencing object degrades the field
+    assert "use crate::demo::HasDict;" not in text  # no dangling import for the skipped type
 
 
 def test_rust_stage3_skipped_base_skips_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # D end-to-end: a base with an unsupported field (`List`) is skipped, and its
-    # subclass is skipped transitively -- NOT emitted referencing a missing
-    # `BaseObj` (which would be E0412). Neither struct lands in the output.
+    # D end-to-end: a base with a genuinely unsupported field (`Union` -- no #0
+    # pointer fallback) is skipped, and its subclass is skipped transitively --
+    # NOT emitted referencing a missing `BaseObj` (which would be E0412; a `base`
+    # embed cannot degrade to an opaque ref -- it carries the object header).
+    # Neither struct lands in the output.
     rs = tmp_path / "demo.rs"
     rs.write_text(
         "\n".join(
@@ -2300,7 +2383,7 @@ def test_rust_stage3_skipped_base_skips_child(
     )
     infos = {
         "demo.Base": ObjectInfo(
-            fields=[NamedTypeSchema("m", TypeSchema("List", (TypeSchema("int"),)))],
+            fields=[_unrepresentable_field("m")],
             methods=[],
             type_key="demo.Base",
             parent_type_key="ffi.Object",
@@ -2332,12 +2415,13 @@ def test_rust_stage3_skipped_base_skips_child(
     assert "struct ChildObj" not in text  # not emitted referencing a missing BaseObj
 
 
-def test_rust_stage3_field_ref_to_skipped_type_drops_import(
+def test_rust_stage3_field_ref_to_skipped_type_degrades(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # X end-to-end: `S` is skipped (Dict field); `User` has a field of type `S`.
-    # `User` is skipped too -- NOT emitted with a dangling `pub s: S` and a
-    # `use crate::demo::S;` import that points at a type the crate never defines.
+    # #0 end-to-end: `S` is skipped (genuine Union field); `User` has a field of
+    # type `S`. `User` is NOT skipped -- the `s` field (a single object pointer)
+    # degrades to the opaque `ObjectRef`, so `User` is emitted WITHOUT a dangling
+    # `pub s: S` or a `use crate::demo::S;` import for the type the crate omits.
     rs = tmp_path / "demo.rs"
     rs.write_text(
         "\n".join(
@@ -2357,9 +2441,7 @@ def test_rust_stage3_field_ref_to_skipped_type_drops_import(
     )
     infos = {
         "demo.S": ObjectInfo(
-            fields=[
-                NamedTypeSchema("m", TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))))
-            ],
+            fields=[_unrepresentable_field("m")],
             methods=[],
             type_key="demo.S",
             parent_type_key="ffi.Object",
@@ -2384,19 +2466,22 @@ def test_rust_stage3_field_ref_to_skipped_type_drops_import(
     )
     text = "\n".join(info.lines)
     out = capsys.readouterr().out
-    assert "[Skipped] object demo.S" in out
-    assert "[Skipped] object demo.User" in out  # referencing type skipped too
-    assert "struct UserObj" not in text
+    assert "[Skipped] object demo.S" in out  # genuine Union field -> skipped
+    assert "[Skipped] object demo.User" not in out  # User survives via degrade
+    assert "struct UserObj" in text
+    assert "    pub s: ObjectRef," in text  # `s` degraded to the opaque ref
     assert "use crate::demo::S;" not in text  # no dangling import for the skipped type
 
 
-def test_rust_stage3_multi_hop_skip_drops_consumer_import(
+def test_rust_stage3_multi_hop_skip_keeps_consumer_import(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Round 3 end-to-end (the reported dangling-import bug across modules):
-    # `Consumer` (relax) has a field of cross-module `ir.Mid`; `Mid` references the
-    # skipped `ir.Leaf` (Dict field). Reference-aware buildability skips `Consumer`
-    # and drops the `use crate::ir::Mid;` import for a type the crate never emits.
+    # #0 end-to-end across modules: `Consumer` (relax) has a field of cross-module
+    # `ir.Mid`; `Mid` references the skipped `ir.Leaf` (genuine Dict field). With
+    # degradation the cascade stops at the FIRST hop -- `Mid`'s `leaf` field
+    # degrades to `ObjectRef`, so `Mid` stays buildable, and `Consumer` keeps its
+    # typed `pub mid: Mid` field and the `use crate::ir::Mid;` import. Only `Leaf`
+    # (the genuine non-pointer field) is skipped.
     rs = tmp_path / "relax.rs"
     rs.write_text(
         "\n".join(
@@ -2446,9 +2531,10 @@ def test_rust_stage3_multi_hop_skip_drops_consumer_import(
     )
     text = "\n".join(info.lines)
     out = capsys.readouterr().out
-    assert "[Skipped] object relax.Consumer" in out  # skipped via the 2-hop chain
-    assert "struct ConsumerObj" not in text
-    assert "use crate::ir::Mid;" not in text  # no dangling import for the skipped Mid
+    assert "[Skipped] object relax.Consumer" not in out  # survives -- Mid is buildable
+    assert "struct ConsumerObj" in text
+    assert "    pub mid: Mid," in text  # typed: Mid degrades internally but stays buildable
+    assert "use crate::ir::Mid;" in text  # Mid is emitted, so the import is valid
 
 
 def test_rust_bytes_field_maps_to_crate_bytes() -> None:
@@ -2502,9 +2588,10 @@ def test_rust_map_any_field_renders() -> None:
     assert "[Skipped]" not in text  # the object is NOT skipped
 
 
-def test_rust_map_value_genuinely_unsupported_still_skips() -> None:
-    # The relaxation is only for phantom-OK params: a `Map` value that is not a
-    # valid Rust type at all (here a `Dict`) still skips the object.
+def test_rust_map_value_unsupported_field_degrades() -> None:
+    # #0: a `Map` field whose value is not a valid Rust type at all (here a `Dict`)
+    # cannot render as a typed `Map<K, V>`, but the field is still a single pointer,
+    # so it degrades to the opaque `ObjectRef` -- the object is NOT skipped.
     info = ObjectInfo(
         fields=[
             NamedTypeSchema(
@@ -2513,15 +2600,57 @@ def test_rust_map_value_genuinely_unsupported_still_skips() -> None:
                     "Map",
                     (TypeSchema("str"), TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int")))),
                 ),
+                size=8,
+                alignment=8,
             ),
         ],
         methods=[],
         type_key="ir.Bad",
         parent_type_key="ffi.Object",
     )
-    with pytest.raises(UnsupportedTypeError) as exc:
+    text, _ = _gen_rust_object(info)  # object survives
+    assert "    pub bad: ObjectRef," in text
+
+
+@pytest.mark.parametrize(
+    ("origin", "args"),
+    [
+        ("List", (TypeSchema("int"),)),  # List has no Rust type at all
+        ("Dict", (TypeSchema("str"), TypeSchema("int"))),  # nor does Dict
+        ("Array", (TypeSchema("Object"),)),  # Array<Object>: element not AnyCompatible
+        ("Array", (TypeSchema("Any"),)),  # Array<Any>: element type-erased
+    ],
+)
+def test_rust_pointer_container_field_degrades(origin: str, args: tuple[TypeSchema, ...]) -> None:
+    # #0: every single-pointer container field (`ObjectArc<...Obj>`, size 8) whose
+    # element cannot be rendered degrades to the opaque `ObjectRef` rather than
+    # skipping the owning struct -- the cascade-killer for the real library.
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("c", TypeSchema(origin, args), size=8, alignment=8)],
+        methods=[],
+        type_key="ir.PtrHolder",
+        parent_type_key="ffi.Object",
+    )
+    text, imports = _gen_rust_object(info)  # object survives
+    assert "struct PtrHolderObj {" in text
+    assert "    pub c: ObjectRef," in text
+    assert RustUse("tvm_ffi::ObjectRef") in imports.items
+
+
+def test_rust_non_pointer_container_field_does_not_degrade() -> None:
+    # The #0 fallback is guarded by the reflected `size`: a container-origin field
+    # that is NOT pointer-wide (size != 8 -- e.g. an inline/by-value layout) has no
+    # safe opaque substitution, so it still skips rather than corrupt the layout.
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("c", TypeSchema("Array", (TypeSchema("Any"),)), size=24, alignment=8)
+        ],
+        methods=[],
+        type_key="ir.WideHolder",
+        parent_type_key="ffi.Object",
+    )
+    with pytest.raises(UnsupportedTypeError):
         _gen_rust_object(info)
-    assert exc.value.origin == "Dict"
 
 
 def test_rust_map_any_field_unskips_cascade(monkeypatch: pytest.MonkeyPatch) -> None:

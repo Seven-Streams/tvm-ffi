@@ -50,7 +50,9 @@ pub use crate::error::{
 };
 pub use crate::extra::module::Module;
 pub use crate::function::Function;
-pub use crate::object::{Object, ObjectArc, ObjectCore, ObjectCoreWithExtraItems, ObjectRefCore};
+pub use crate::object::{
+    Object, ObjectArc, ObjectCore, ObjectCoreWithExtraItems, ObjectRef, ObjectRefCore,
+};
 pub use crate::optional::{
     resolve_field, Align1, Align16, Align2, Align4, Align8, FieldAccess, Optional,
 };
