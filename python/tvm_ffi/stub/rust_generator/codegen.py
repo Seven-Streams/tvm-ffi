@@ -94,6 +94,31 @@ def _rust_ident(name: str) -> str:
 _DEFAULT_STRING_ORIGINS = frozenset({"str", "ffi.String"})
 
 
+def _is_nullable_object_field(field: NamedTypeSchema) -> bool:
+    """Whether ``field`` is a generated ObjectRef field whose C++ type is nullable.
+
+    True for a field the C++ reflection marked ``nullable`` (its ref type is a
+    ``_NULLABLE`` ObjectRef) AND whose origin is a generated object type key
+    (dotted, not an ``ffi.*`` builtin). Such a field is one nullable pointer
+    whose null state is the C++ default ``T()``, so it renders as ``Option<A>``
+    (niche-optimized to the same single pointer, ``None`` == null) and the
+    builder defaults it to ``None`` -- the construct-time nullability the C++
+    field already has. Containers (``Array``/``Map``/``Optional``, all bare
+    origins) and ``ffi.*`` builtins (the crate owns their rendering) are
+    excluded; for those the ``nullable`` mark is ignored.
+    """
+    return field.nullable and "." in field.origin and not field.origin.startswith("ffi.")
+
+
+def _has_builder_default(field: NamedTypeSchema) -> bool:
+    """Whether the native builder pre-fills ``field`` (vs. requiring it be set).
+
+    True for a field with a registered static default OR a nullable ObjectRef
+    field (:func:`_is_nullable_object_field`), which defaults to ``None``.
+    """
+    return field.default is not MISSING or _is_nullable_object_field(field)
+
+
 def _default_expr(field: NamedTypeSchema) -> str | None:
     """Render ``field``'s registered default as a Rust expression (``None``: can't).
 
@@ -107,6 +132,11 @@ def _default_expr(field: NamedTypeSchema) -> str | None:
     yields ``None`` (the caller then blocks native construction rather than
     emitting a type-mismatched default).
     """
+    if _is_nullable_object_field(field):
+        # A nullable ObjectRef field is rendered `Option<A>`; its default is the
+        # null pointer, i.e. Rust `None`. (Takes precedence over `field.default`,
+        # which is unused for these -- C++ registers no static default for them.)
+        return "None"
     value = field.default
     origin = field.origin
     if isinstance(value, bool):
@@ -139,7 +169,7 @@ def _native_blocker(info: ObjectInfo) -> str | None:
             return f"field {field.name!r} is an ffi::Optional (view-only, C++-constructed)"
         if field.default_is_factory:
             return f"field {field.name!r} uses a default factory (FFI-only)"
-        if field.default is not MISSING and _default_expr(field) is None:
+        if _has_builder_default(field) and _default_expr(field) is None:
             return f"the default value of field {field.name!r} has no Rust rendering"
     parent = info.parent_type_key
     if parent in (None, "ffi.Object") or _native_eligible(parent):
@@ -291,7 +321,7 @@ class _ObjectRenderer:
             mapped = origin
         return self.imports.record(mapped)
 
-    def render_struct_field(self, schema: NamedTypeSchema) -> str:
+    def render_struct_field(self, schema: NamedTypeSchema) -> str:  # noqa: PLR0911
         """Render a directly-laid-out struct field type, width-correct for scalars.
 
         An ``int32_t`` field must render as ``i32``, not the schema-erased
@@ -301,11 +331,13 @@ class _ObjectRenderer:
         the *only* position the mirror is used; elsewhere ``Optional`` is the
         native ``Option<T>``. A direct ``Map<K, V>`` field is a single pointer
         whose params are phantom, so it renders even with non-AnyCompatible K/V
-        (see :meth:`_render_map_field`). Non-scalar origins render plainly. #0: any
-        unrepresentable single-pointer field (a skipped object ref, ``Array``/
-        ``List``/``Dict``/``Map`` of an unrepresentable element) degrades to the
-        opaque ``ObjectRef`` rather than skipping the struct -- see
-        :meth:`_render_opaque_field_or_raise`.
+        (see :meth:`_render_map_field`). A nullable ObjectRef field (``_NULLABLE``)
+        renders as ``Option<A>`` -- a single nullable pointer, default-constructible
+        to ``None`` (see :meth:`_render_nullable_object_field`). Non-scalar origins
+        render plainly. #0: any unrepresentable single-pointer field (a skipped
+        object ref, ``Array``/``List``/``Dict``/``Map`` of an unrepresentable
+        element) degrades to the opaque ``ObjectRef`` rather than skipping the
+        struct -- see :meth:`_render_opaque_field_or_raise`.
         """
         try:
             if schema.origin == "Optional":
@@ -314,12 +346,33 @@ class _ObjectRenderer:
                 return self._render_map_field(schema)
             if schema.origin == "Array":
                 return self._render_array_field(schema)
+            if _is_nullable_object_field(schema):
+                return self._render_nullable_object_field(schema)
             narrowed = C_RUST.RUST_SCALAR_BY_SIZE.get((schema.origin, schema.size))
             if narrowed is not None:
                 return narrowed
             return render_rust_type(schema, self._ty_render)
         except UnsupportedTypeError:
             return self._render_opaque_field_or_raise(schema)
+
+    def _render_nullable_object_field(self, schema: NamedTypeSchema) -> str:
+        """Render a nullable ObjectRef field as ``Option<A>`` (a single nullable pointer).
+
+        A C++ ``_NULLABLE`` ObjectRef field (e.g. ``span``) is one pointer, null
+        on most real nodes. ``Option<A>`` is niche-optimized to the same single
+        pointer (``None`` == the null/`nullptr` bit pattern), so it is
+        layout-identical to the C++ field, constructible (``None`` default, vs.
+        the view-only ``Optional<T, A, N>`` layout-mirror which Rust cannot
+        build), and a null field reads back as ``None`` rather than
+        reinterpreting a null pointer as a live ref-counted handle (UB).
+        Degrades to ``Option<ObjectRef>`` (still nullable) when the referenced
+        type itself is skipped.
+        """
+        try:
+            inner = self._ty_render(schema.origin)
+        except UnsupportedTypeError:
+            inner = self.imports.record(C_RUST.RUST_OPAQUE_OBJECT_REF)
+        return f"Option<{inner}>"
 
     def _render_opaque_field_or_raise(self, schema: NamedTypeSchema) -> str:
         """Degrade an unrepresentable object-pointer field to an opaque ref, else re-raise.
@@ -620,7 +673,7 @@ class _ObjectRenderer:
         # Entries bind by name; memory order just mirrors the struct definition.
         for field in _layout_fields(self.info.fields):
             fid = _rust_ident(field.name)
-            if field.default is MISSING:
+            if not _has_builder_default(field):
                 lines.append(f"    {fid},")  # the unwrapped local
             else:
                 lines.append(f"    {fid}: self.{fid},")
@@ -661,7 +714,7 @@ class _ObjectRenderer:
             f"let {_rust_ident(field.name)} = self.{_rust_ident(field.name)}.ok_or_else(|| "
             f'tvm_ffi::Error::new(tvm_ffi::VALUE_ERROR, "field `{field.name}` is not set", ""))?;'
             for field in _layout_fields(self.info.fields)
-            if field.default is MISSING
+            if not _has_builder_default(field)
         ]
 
     def _new_fn_native(self) -> list[str]:
@@ -684,7 +737,7 @@ class _ObjectRenderer:
             lines.append(f"        {self.base_field}: None,")
         for field in _layout_fields(self.info.fields):
             fid = _rust_ident(field.name)
-            if field.default is MISSING:
+            if not _has_builder_default(field):
                 lines.append(f"        {fid}: None,")
             else:
                 # `_native_blocker` already guaranteed the default renders.
@@ -711,7 +764,7 @@ class _ObjectRenderer:
         lines = [f"pub struct {builder} {{", f"    {bf}: {base_store},"]
         for field in fields:
             ty = self.render_struct_field(field)
-            store = ty if field.default is not MISSING else f"Option<{ty}>"
+            store = ty if _has_builder_default(field) else f"Option<{ty}>"
             lines.append(f"    {_rust_ident(field.name)}: {store},")
         lines += ["}", ""]
 
@@ -727,7 +780,7 @@ class _ObjectRenderer:
         for field in fields:
             ty = self.render_struct_field(field)
             fid = _rust_ident(field.name)
-            value = fid if field.default is not MISSING else f"Some({fid})"
+            value = fid if _has_builder_default(field) else f"Some({fid})"
             inner += [
                 f"pub fn {fid}(mut self, {fid}: {ty}) -> Self {{",
                 f"    self.{fid} = {value};",

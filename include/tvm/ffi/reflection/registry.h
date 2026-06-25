@@ -52,6 +52,30 @@ namespace reflection {
  * before they are filled into final C metadata
  */
 using _MetadataType = std::vector<std::pair<String, Any>>;  // NOLINT(bugprone-reserved-identifier)
+
+/*!
+ * \brief Whether a reflected field of C++ type \p T is a nullable ObjectRef.
+ *
+ * True only when \p T is an ObjectRef subclass -- not an ``ffi::Optional<T>``
+ * (which carries its own nullability) and not a non-object scalar / ``String``
+ * (which has no ``_type_is_nullable``) -- whose ref type opts into the nullable
+ * contract via ``_type_is_nullable``. That flag is set by
+ * ``TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE`` (e.g. ``Span``) and cleared by
+ * ``..._NOTNULLABLE`` (e.g. ``Shape``). Such a field is one nullable pointer
+ * whose null state is the default ``T()``, so a code generator can render it as
+ * an optional / default-constructible (null) field rather than a required one.
+ * The ``if constexpr`` guard is required: ``T::_type_is_nullable`` is only a
+ * valid member access on an ObjectRef subclass.
+ */
+template <typename T>
+constexpr bool IsNullableObjectRefField() {
+  if constexpr (std::is_base_of_v<ObjectRef, T> && !is_optional_type_v<T>) {
+    return T::_type_is_nullable;
+  } else {
+    return false;
+  }
+}
+
 /*!
  * \brief Builder for TVMFFIFieldInfo
  * \sa TVMFFIFieldInfo
@@ -939,6 +963,12 @@ class ObjectDef : public ReflectionDefBase {
     info.default_value_or_factory = AnyView(nullptr).CopyToTVMFFIAny();
     info.doc = TVMFFIByteArray{nullptr, 0};
     info.metadata_.emplace_back("type_schema", ::tvm::ffi::details::TypeSchema<T>::v());
+    // A nullable ObjectRef field (C++ `_NULLABLE`) is one nullable pointer whose
+    // null state is the default `T()`; surface it so a generator can render the
+    // field as optional / default-constructible (null) instead of required.
+    if constexpr (IsNullableObjectRefField<T>()) {
+      info.metadata_.emplace_back("nullable", true);
+    }
     // apply field info traits
     ((ApplyFieldInfoTrait(&info, std::forward<ExtraArgs>(extra_args)), ...));
     // call register

@@ -99,7 +99,10 @@ class NamedTypeSchema(TypeSchema):
 
     ``default`` is the registered static default value (:data:`MISSING` when
     none); ``default_is_factory`` marks a ``default_factory`` registration,
-    whose value only exists by calling the factory through FFI.
+    whose value only exists by calling the factory through FFI. ``nullable``
+    marks a field whose C++ type is a nullable ObjectRef (``_NULLABLE``): one
+    nullable pointer whose null state is the default ``T()``, which a backend may
+    render as an optional / default-constructible field.
     """
 
     name: str
@@ -108,6 +111,7 @@ class NamedTypeSchema(TypeSchema):
     alignment: int | None = None
     default: Any = MISSING
     default_is_factory: bool = False
+    nullable: bool = False
 
     def __init__(
         self,
@@ -118,6 +122,7 @@ class NamedTypeSchema(TypeSchema):
         alignment: int | None = None,
         default: Any = MISSING,
         default_is_factory: bool = False,
+        nullable: bool = False,
     ) -> None:
         """Initialize a `NamedTypeSchema` with the given name, schema and field metadata."""
         super().__init__(origin=schema.origin, args=schema.args)
@@ -127,6 +132,7 @@ class NamedTypeSchema(TypeSchema):
         self.alignment = alignment
         self.default = default
         self.default_is_factory = default_is_factory
+        self.nullable = nullable
 
 
 @dataclasses.dataclass
@@ -217,6 +223,7 @@ class ObjectInfo:
                     alignment=field.alignment,
                     default=field.c_default,
                     default_is_factory=field.c_default_factory is not MISSING,
+                    nullable=bool(field.metadata.get("nullable", False)),
                 )
                 for field in type_info.fields
             ],

@@ -471,6 +471,12 @@ class OverloadObjectDef : private ObjectDef<Class> {
     info.default_value_or_factory = AnyView(nullptr).CopyToTVMFFIAny();
     info.doc = TVMFFIByteArray{nullptr, 0};
     info.metadata_.emplace_back("type_schema", ::tvm::ffi::details::TypeSchema<T>::v());
+    // A nullable ObjectRef field (C++ `_NULLABLE`) is one nullable pointer whose
+    // null state is the default `T()`; surface it so a generator can render the
+    // field as optional / default-constructible (null) instead of required.
+    if constexpr (IsNullableObjectRefField<T>()) {
+      info.metadata_.emplace_back("nullable", true);
+    }
     // apply field info traits
     ((ApplyFieldInfoTrait(&info, std::forward<ExtraArgs>(extra_args)), ...));
     // call register

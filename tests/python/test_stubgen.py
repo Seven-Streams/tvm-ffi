@@ -1567,6 +1567,77 @@ def test_rust_optional_field_unsupported_alignment_skips() -> None:
     assert exc.value.origin == "Optional"
 
 
+def _nullable_node_info(*, mutable: bool = True) -> ObjectInfo:
+    """Root with a required scalar `x` and a nullable ObjectRef field `span`.
+
+    `span`'s C++ type is a `_NULLABLE` ObjectRef, so reflection marks the field
+    `nullable=True`. The generator renders it `Option<Span>` and defaults it to
+    `None`, so the type stays natively constructible without span being set.
+    """
+    return ObjectInfo(
+        fields=[
+            NamedTypeSchema("x", TypeSchema("int")),
+            NamedTypeSchema("span", TypeSchema("demo.Span"), size=8, alignment=8, nullable=True),
+        ],
+        methods=[],
+        type_key="cpp_rust_test.Node",
+        parent_type_key="ffi.Object",
+        has_init=True,
+        mutable=mutable,
+    )
+
+
+def test_rust_nullable_object_field_is_optional_and_defaulted() -> None:
+    text, _ = _gen_rust_object(_nullable_node_info())
+    # A nullable ObjectRef field renders as Option<A> (one nullable pointer,
+    # None == null) -- NOT a required non-null `Span`, and NOT the view-only
+    # Optional<T, A, N> layout-mirror (which Rust cannot construct).
+    assert "pub span: Option<Span>," in text
+    assert "Optional<" not in text  # not the layout-mirror
+    assert "Option<Option<Span>>" not in text  # builder slot is a single Option
+    # The type stays natively constructible: span is defaulted to None.
+    assert "pub fn ffi_new() -> NodeBuilder {" in text
+    assert "span: None," in text  # ffi_new prefills the null default
+    # Setter takes Option<Span> (pass Some(s) or keep the None default); the
+    # value is assigned directly, not wrapped in the unset-sentinel Some(..).
+    assert "pub fn span(mut self, span: Option<Span>) -> Self {" in text
+    assert "self.span = span;" in text
+    # build_obj moves span straight in and never requires it ...
+    assert "span: self.span," in text
+    assert "self.span.ok_or_else" not in text
+    assert "field `span` is not set" not in text
+    # ... while the required scalar still goes through the unset-check path.
+    assert "self.x.ok_or_else" in text
+
+
+def test_rust_non_nullable_object_field_stays_required() -> None:
+    # The SAME field without the nullable mark stays a required non-null `Span`,
+    # bound via the unset-checked builder slot (gate regression guard).
+    info = _nullable_node_info()
+    info.fields = [
+        NamedTypeSchema("x", TypeSchema("int")),
+        NamedTypeSchema("span", TypeSchema("demo.Span"), size=8, alignment=8),  # nullable=False
+    ]
+    text, _ = _gen_rust_object(info)
+    assert "pub span: Span," in text  # plain non-null ref
+    assert "pub span: Option<Span>," not in text
+    assert "self.span.ok_or_else" in text  # required
+
+
+def test_rust_nullable_mark_on_ffi_builtin_is_ignored() -> None:
+    # The nullable -> Option<A> treatment targets generated object types; an
+    # `ffi.*` builtin (the crate owns its rendering) keeps its mapped type even
+    # when marked nullable, so it is not turned into Option<Tensor>.
+    info = _nullable_node_info()
+    info.fields = [
+        NamedTypeSchema("x", TypeSchema("int")),
+        NamedTypeSchema("t", TypeSchema("ffi.Tensor"), size=8, alignment=8, nullable=True),
+    ]
+    text, _ = _gen_rust_object(info)
+    assert "pub t: Tensor," in text  # mapped builtin
+    assert "pub t: Option<Tensor>," not in text
+
+
 def test_rust_optional_inner_referencing_skipped_type_degrades(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
