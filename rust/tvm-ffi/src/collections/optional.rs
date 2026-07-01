@@ -50,15 +50,7 @@ use std::mem::MaybeUninit;
 /// - `T` is trivially copyable with no destructor, and
 /// - `T`'s Rust in-memory representation is identical to the C++ field type
 ///   (e.g. `i32` ↔ `int32_t`, `f64` ↔ `double`, `bool` ↔ `bool`).
-///
-/// Sealed via the private `Sealed` supertrait: only the scalar set in
-/// `optional_pod!` below can implement it, so the contract can't break downstream.
-pub unsafe trait OptionalPod: Copy + private::Sealed {}
-
-mod private {
-    /// Seals `OptionalPod`: unreachable outside this module.
-    pub trait Sealed {}
-}
+pub unsafe trait OptionalPod: Copy {}
 
 /// Layout-mirror of `std::optional<T>`: `{ T value @0; bool engaged @sizeof(T) }`.
 #[repr(C)]
@@ -190,13 +182,12 @@ impl<T: OptionalPod + Debug> Debug for Optional<T> {
     }
 }
 
-// Registers each supported scalar from one list: the seal, the `OptionalPod` impl,
-// and a compile-time guard that `Optional<T>` matches the `std::optional<T>`
-// footprint (`size == round_up(size_of::<T>()+1, align)`). One list keeps the impl
-// and its layout check from drifting.
+// Registers each supported scalar from one list: the `OptionalPod` impl and a
+// compile-time guard that `Optional<T>` matches the `std::optional<T>` footprint
+// (`size == round_up(size_of::<T>()+1, align)`). One list keeps the impl and its
+// layout check from drifting.
 macro_rules! optional_pod {
     ($($t:ty),* $(,)?) => { $(
-        impl private::Sealed for $t {}
         // SAFETY: fixed-width scalar; repr matches the C++ field and uses the
         // `std::optional` fallback (layout proven by the `const` block below).
         unsafe impl OptionalPod for $t {}

@@ -19,5 +19,6 @@
 /// Collection types
 pub mod array;
 pub mod optional;
+pub mod map;
 pub mod shape;
 pub mod tensor;
