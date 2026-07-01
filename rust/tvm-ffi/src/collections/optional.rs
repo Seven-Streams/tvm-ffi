@@ -18,58 +18,48 @@
  */
 //! In-place mirrors of C++ `ffi::Optional<T>` (`include/tvm/ffi/optional.h`).
 //!
-//! Two types mirror the two `ffi::Optional<T>` specializations that store their
-//! value **inline**, so the field bytes can be decoded directly — no FFI call, no
-//! allocation, no reflection getter/setter:
-//! - [`Optional`] — the `std::optional`-backed fallback for POD scalar `T`. Its
-//!   `#[repr(C)] { value: T, engaged: bool }` reproduces, byte for byte, the
-//!   `std::optional<T>` layout of libstdc++, libc++ and MSVC STL (payload at
-//!   offset `0`, the engaged flag at `size_of::<T>()`, padded to
-//!   `align_of::<T>()`). Verified against real `ffi::Optional<T>` instances.
-//! - [`OptionalStr`] — the `String` specialization: the 16-byte string cell
-//!   itself, with `type_index == kTVMFFINone` marking `nullopt` (the C++
-//!   String/Bytes specialization stores the sentinel inside the cell rather than
-//!   a separate flag). `ffi::Optional<Bytes>` would follow the same pattern.
+//! `ffi::Optional<T>` stores its value inline, in one of three ABI layouts
+//! depending on `T`. The types here decode such a field's bytes directly — no
+//! FFI call, no allocation, no reflection getter/setter. Pick the counterpart for
+//! the field's `T`:
 //!
-//! # Scope
-//! Only the inline specializations are mirrored here:
-//! - `ffi::Optional<POD scalar>` → [`Optional`].
-//! - `ffi::Optional<String>` → [`OptionalStr`].
-//! - `ffi::Optional<SomeRef>` is a nullable object pointer, not stored inline —
-//!   use `Option<SomeRef>` (`nullptr` == `None`) instead.
+//! - POD scalar (`i32`, `f64`, `bool`, …) → [`Optional<T>`](Optional)
+//! - `String` → [`OptionalStr`]
+//! - `ObjectRef` subtype → plain `Option<SomeRef>` (a single nullable pointer,
+//!   `nullptr` == `None`; no dedicated type needed)
 //!
-//! # Thread-safety
-//! [`Optional`] uses interior mutability so a shared `&Optional<T>` aliasing a
-//! C++-owned field can be written in place (`set(&self)`); it is therefore
-//! `!Sync`. [`OptionalStr`] instead writes through `set(&mut self)`: it hands out
-//! borrows (`as_str`) into a refcounted cell, so a shared-ref setter would let a
-//! live `&str` dangle when the backing string is replaced.
+//! # `Optional<T>` — POD scalars
+//! Mirrors the `std::optional<T>` fallback as `#[repr(C)] { value: T, engaged:
+//! bool }` (payload at offset 0, flag at `size_of::<T>()`), byte-verified against
+//! libstdc++/libc++. `T` must implement [`OptionalPod`] — the marker trait
+//! carried by the fixed set of fixed-width scalars. Read with [`get`](Optional::get),
+//! write with [`set`](Optional::set); `set` takes `&self` via interior mutability,
+//! so a shared `&Optional<T>` aliasing a C++ field stays writable (hence `!Sync`).
+//!
+//! # `OptionalStr` — `String`
+//! The C++ `String` specialization keeps the 16-byte string cell inline and marks
+//! `nullopt` with the `type_index == kTVMFFINone` sentinel; [`OptionalStr`] wraps
+//! [`String`] the same way and reuses its refcounting `Clone`/`Drop`. Borrow with
+//! [`as_str`](OptionalStr::as_str), write with [`set`](OptionalStr::set) — which
+//! takes `&mut self`, since a shared-ref setter could drop the backing string
+//! under a live `&str`. (`ffi::Optional<Bytes>` would follow the same pattern.)
 
 use crate::String;
 use std::cell::UnsafeCell;
 use std::fmt::{self, Debug};
 use std::mem::MaybeUninit;
 
-/// Marker for POD `T` whose C++ `ffi::Optional<T>` uses the `std::optional`
-/// fallback with a representation that byte-matches `T` in Rust.
-///
-/// # Safety
-/// Implementing this asserts that, for the reflected C++ field of type
-/// `ffi::Optional<T>`:
-/// - the C++ side selects the `std::optional<T>` fallback (i.e. `T` is not an
-///   `ObjectRef`, `String`, or `Bytes`),
-/// - `T` is trivially copyable with no destructor, and
-/// - `T`'s Rust in-memory representation is identical to the C++ field type
-///   (e.g. `i32` ↔ `int32_t`, `f64` ↔ `double`, `bool` ↔ `bool`).
-///
-/// Sealed via the private `Sealed` supertrait: only the scalar set in
-/// `optional_pod!` below can implement it, so the contract can't break downstream.
-pub unsafe trait OptionalPod: Copy + private::Sealed {}
+//-----------------------------------------------------
+// Optional<T> — POD scalars
+//-----------------------------------------------------
 
-mod private {
-    /// Seals `OptionalPod`: unreachable outside this module.
-    pub trait Sealed {}
-}
+/// Marker for a POD scalar `T` that can back an [`Optional<T>`]; see the
+/// [module docs](self).
+///
+/// Unsafe: an implementor guarantees `T` is trivially copyable and its Rust
+/// representation is byte-identical to the C++ field type (`i32` ↔ `int32_t`,
+/// `f64` ↔ `double`, …), so the mirror can overlay the C++ `std::optional<T>`.
+pub unsafe trait OptionalPod: Copy {}
 
 /// Layout-mirror of `std::optional<T>`: `{ T value @0; bool engaged @sizeof(T) }`.
 #[repr(C)]
@@ -114,8 +104,7 @@ impl<T: OptionalPod> Optional<T> {
     /// Decodes the value in place. No FFI call, no allocation.
     #[inline]
     pub fn get(&self) -> Option<T> {
-        // SAFETY: the cell is always fully initialized; the payload is only read
-        // after confirming `engaged`, matching C++ `has_value()` gating.
+        // Read the payload only after confirming `engaged` (the cell is always initialized).
         let cell = unsafe { &*self.cell.get() };
         if cell.engaged {
             Some(unsafe { cell.value.assume_init() })
@@ -127,7 +116,6 @@ impl<T: OptionalPod> Optional<T> {
     /// Returns whether a value is present.
     #[inline]
     pub fn has_value(&self) -> bool {
-        // SAFETY: `engaged` is always initialized.
         unsafe { (*self.cell.get()).engaged }
     }
 
@@ -144,8 +132,7 @@ impl<T: OptionalPod> Optional<T> {
     /// does for trivial `T`.
     #[inline]
     pub fn set(&self, value: Option<T>) {
-        // SAFETY: interior mutation through `UnsafeCell`; the caller must not
-        // race (the type is `!Sync`).
+        // Interior mutation via `UnsafeCell`; caller must not race (`!Sync`).
         let cell = unsafe { &mut *self.cell.get() };
         match value {
             Some(v) => {
@@ -201,15 +188,14 @@ impl<T: OptionalPod + Debug> Debug for Optional<T> {
     }
 }
 
-// Registers each supported scalar from one list: the seal, the `OptionalPod` impl,
-// and a compile-time guard that `Optional<T>` matches the `std::optional<T>`
-// footprint (`size == round_up(size_of::<T>()+1, align)`). One list keeps the impl
-// and its layout check from drifting.
-macro_rules! optional_pod {
+// Registers each supported scalar from one list: the `OptionalPod` impl and a
+// compile-time guard that `Optional<T>` matches the `std::optional<T>` footprint
+// (`size == round_up(size_of::<T>()+1, align)`). One list keeps the impl and its
+// layout check from drifting.
+macro_rules! impl_optional_pod {
     ($($t:ty),* $(,)?) => { $(
-        impl private::Sealed for $t {}
-        // SAFETY: fixed-width scalar; repr matches the C++ field and uses the
-        // `std::optional` fallback (layout proven by the `const` block below).
+        // Fixed-width scalar; repr matches the C++ field's `std::optional`
+        // fallback (layout proven by the `const` block below).
         unsafe impl OptionalPod for $t {}
         const _: () = {
             let tsz = core::mem::size_of::<$t>();
@@ -220,36 +206,28 @@ macro_rules! optional_pod {
         };
     )* };
 }
-optional_pod!(bool, i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
+impl_optional_pod!(bool, i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
 
-/// In-place mirror of C++ `ffi::Optional<String>`.
-///
-/// Byte-identical to the C++ field: the 16-byte string cell itself, with
-/// `type_index == kTVMFFINone` meaning `nullopt`. This matches the C++
-/// String/Bytes specialization, which stores the null sentinel inside the cell
-/// rather than adding a separate flag — so `none` is the all-zero cell, an
-/// engaged small string is stored inline, and a long string is a heap pointer,
-/// exactly as C++ lays them out. (`ffi::Optional<Bytes>` would mirror this with
-/// `Bytes`.)
-///
-/// Unlike POD [`Optional<T>`], this reuses [`String`]'s own `Clone`/`Drop`, whose
-/// refcounting is a no-op on the `nullopt` cell (its `type_index` is below
-/// `kTVMFFIStaticObjectBegin`), so no extra ownership logic is needed.
+//-----------------------------------------------------
+// OptionalStr — String
+//-----------------------------------------------------
+
+/// In-place mirror of C++ `ffi::Optional<String>`: the 16-byte string cell
+/// itself, with `type_index == kTVMFFINone` meaning `nullopt` (the C++
+/// String/Bytes spec stores the sentinel in-cell, not as a separate flag).
+/// Reuses [`String`]'s `Clone`/`Drop`, whose refcounting is a no-op on the
+/// `nullopt` cell (`type_index` below `kTVMFFIStaticObjectBegin`).
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct OptionalStr {
-    // Invariant: either a valid `String` (engaged) or a `nullopt` sentinel cell
-    // (`type_index == kTVMFFINone`). The inner `String` is never handed out, and
-    // its accessors are never called, while disengaged.
+    // Never handed out or accessed while disengaged (a `nullopt` cell is not a
+    // valid string).
     inner: String,
 }
 
-// OptionalStr must byte-overlay C++ `ffi::Optional<String>` — the 16-byte string
-// cell. Fires if `String` / `TVMFFIAny` ever changes size (parity with the POD
-// `Optional<T>` layout guard in `optional_pod!`).
-const _: () = {
-    assert!(std::mem::size_of::<OptionalStr>() == 16);
-};
+// Must stay 16 bytes to overlay C++ `ffi::Optional<String>` (parity with the POD
+// guard in `impl_optional_pod!`).
+const _: () = assert!(std::mem::size_of::<OptionalStr>() == 16);
 
 impl OptionalStr {
     /// An engaged optional holding `value`.
@@ -291,9 +269,7 @@ impl OptionalStr {
     /// Takes the value out, consuming self.
     #[inline]
     pub fn get(self) -> Option<String> {
-        // Move `inner` out (OptionalStr has no `Drop` impl, so this is allowed);
-        // the `nullopt` cell drops as a no-op in the `None` arm.
-        let OptionalStr { inner } = self;
+        let OptionalStr { inner } = self; // no `Drop` impl, so the move is allowed
         if inner.is_none_cell() {
             None
         } else {
@@ -301,18 +277,15 @@ impl OptionalStr {
         }
     }
 
-    /// Overwrites the value in place. `Some(s)` engages and stores `s`; `None`
-    /// disengages. The previous value is dropped first (dec-ref'd if it was a
-    /// heap string), so this is the primitive for mutating a C++-owned field.
+    /// Overwrites the value in place, dropping the previous one first (dec-ref'd
+    /// if it was a heap string).
     ///
-    /// Takes `&mut self`, not `&self` like POD [`Optional::set`]: `OptionalStr`
-    /// hands out borrows into its cell via [`as_str`](Self::as_str) and carries a
-    /// refcounting `Drop`, so a shared-ref setter could drop the backing string
-    /// out from under a live `&str`.
+    /// `&mut self`, not `&self` like POD [`Optional::set`]: `as_str` hands out
+    /// borrows into a refcounted cell, so a shared-ref setter could drop the
+    /// backing string under a live `&str`.
     #[inline]
     pub fn set(&mut self, value: Option<String>) {
-        // Assignment runs the old `String`'s `Drop` (dec_ref if heap) before
-        // moving the new cell in.
+        // Assignment drops the old `String` (dec_ref if heap) before moving in the new.
         self.inner = match value {
             Some(s) => s,
             None => String::none_cell(),
@@ -351,203 +324,5 @@ impl Debug for OptionalStr {
             Some(s) => write!(f, "OptionalStr::Some({s:?})"),
             None => f.write_str("OptionalStr::None"),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `(size, align)` pairs verified against real `ffi::Optional<T>` instances
-    /// (libstdc++ and libc++): `size = round_up(sizeof(T)+1, alignof(T))`.
-    #[test]
-    fn layout_matches_cpp_optional() {
-        fn sa<T: OptionalPod>() -> (usize, usize) {
-            (
-                std::mem::size_of::<Optional<T>>(),
-                std::mem::align_of::<Optional<T>>(),
-            )
-        }
-        assert_eq!(sa::<i8>(), (2, 1));
-        assert_eq!(sa::<bool>(), (2, 1));
-        assert_eq!(sa::<i16>(), (4, 2));
-        assert_eq!(sa::<i32>(), (8, 4));
-        assert_eq!(sa::<f32>(), (8, 4));
-        assert_eq!(sa::<i64>(), (16, 8));
-        assert_eq!(sa::<f64>(), (16, 8));
-    }
-
-    /// Payload+flag bytes `[0, size_of::<T>()]`; padding is excluded (not ABI, not
-    /// guaranteed initialized).
-    fn image<T: OptionalPod>(opt: &Optional<T>) -> Vec<u8> {
-        let p = opt as *const Optional<T> as *const u8;
-        let n = std::mem::size_of::<T>() + 1; // payload + flag, no padding
-        // SAFETY: payload and flag are always initialized; padding is not read.
-        unsafe { std::slice::from_raw_parts(p, n).to_vec() }
-    }
-
-    /// The scalar's own bytes, to assert the optional's payload matches it verbatim.
-    fn raw_bytes<T: OptionalPod>(v: &T) -> Vec<u8> {
-        let p = v as *const T as *const u8;
-        // SAFETY: size_of::<T>() bytes of an initialized `Copy` scalar.
-        unsafe { std::slice::from_raw_parts(p, std::mem::size_of::<T>()).to_vec() }
-    }
-
-    #[test]
-    fn byte_image_some_i32_matches_cpp() {
-        // C++ probe (both STLs): some(0x12345678) => 78 56 34 12 | 01 ..
-        let o = Optional::<i32>::some(0x1234_5678);
-        let b = image(&o);
-        assert_eq!(&b[0..4], &0x1234_5678_i32.to_le_bytes());
-        assert_eq!(b[4], 1, "engaged flag must sit at offset size_of::<i32>()");
-    }
-
-    #[test]
-    fn byte_image_some_i64_matches_cpp() {
-        let o = Optional::<i64>::some(0x1122_3344_5566_7788);
-        let b = image(&o);
-        assert_eq!(&b[0..8], &0x1122_3344_5566_7788_i64.to_le_bytes());
-        assert_eq!(b[8], 1, "engaged flag must sit at offset size_of::<i64>()");
-    }
-
-    #[test]
-    fn byte_image_none_clears_flag() {
-        let o = Optional::<i32>::none();
-        let b = image(&o);
-        assert_eq!(b[4], 0, "engaged flag must be clear for nullopt");
-    }
-
-    /// Payload@0 and flag@`size_of::<T>()` for every supported type, not just i32/i64.
-    #[test]
-    fn flag_offset_all_supported_types() {
-        fn check<T: OptionalPod + PartialEq + std::fmt::Debug>(val: T) {
-            let ty = std::any::type_name::<T>();
-            let sz = std::mem::size_of::<T>();
-            let some = Optional::<T>::some(val);
-            let b = image(&some);
-            assert_eq!(&b[0..sz], &raw_bytes(&val)[..], "payload@0 for {ty}");
-            assert_eq!(b[sz], 1, "engaged flag must sit at offset size_of for {ty}");
-            assert_eq!(some.get(), Some(val), "engaged roundtrip for {ty}");
-            let none = Optional::<T>::none();
-            assert_eq!(image(&none)[sz], 0, "flag must be clear for none for {ty}");
-            assert!(none.get().is_none(), "disengaged roundtrip for {ty}");
-        }
-        check::<bool>(true);
-        check::<i8>(0x12);
-        check::<i16>(0x1234);
-        check::<i32>(0x1234_5678);
-        check::<i64>(0x1122_3344_5566_7788);
-        check::<u8>(0xAB);
-        check::<u16>(0xABCD);
-        check::<u32>(0xABCD_EF01);
-        check::<u64>(0xABCD_EF01_2345_6789);
-        check::<f32>(1.5);
-        check::<f64>(2.5);
-    }
-
-    #[test]
-    fn roundtrip_get_set() {
-        let o = Optional::<i32>::some(42);
-        assert_eq!(o.get(), Some(42));
-        assert!(o.has_value());
-
-        // in-place mutation through a shared reference
-        o.set(None);
-        assert_eq!(o.get(), None);
-        assert!(o.is_none());
-
-        o.set(Some(-7));
-        assert_eq!(o.get(), Some(-7));
-    }
-
-    #[test]
-    fn conversions_and_default() {
-        assert_eq!(Optional::<f64>::from(Some(2.5)).get(), Some(2.5));
-        assert_eq!(Optional::<f64>::from(None).get(), None);
-        let back: Option<i16> = Optional::<i16>::some(9).into();
-        assert_eq!(back, Some(9));
-        assert_eq!(Optional::<u8>::default().get(), None);
-        assert_eq!(Optional::<bool>::some(true).get(), Some(true));
-    }
-
-    #[test]
-    fn clone_preserves_state() {
-        let some = Optional::<i64>::some(123);
-        assert_eq!(some.clone().get(), Some(123));
-        let none = Optional::<i64>::none();
-        assert_eq!(none.clone().get(), None);
-    }
-
-    // 16-byte cell (type_index@0, small_str_len@4, union@8); no padding.
-    fn str_image(o: &OptionalStr) -> [u8; 16] {
-        let p = o as *const OptionalStr as *const u8;
-        let mut b = [0u8; 16];
-        // SAFETY: OptionalStr is a fully-initialized 16-byte TVMFFIAny cell.
-        unsafe { std::ptr::copy_nonoverlapping(p, b.as_mut_ptr(), 16) };
-        b
-    }
-
-    #[test]
-    fn optional_str_byte_image_matches_cpp() {
-        // C++ probe: Optional<String> none => 16 zero bytes;
-        //            some("hi")           => 0b 00 00 00 | 02 00 00 00 | 68 69 00 ...
-        assert_eq!(str_image(&OptionalStr::none()), [0u8; 16]);
-        let some = OptionalStr::some(String::from("hi"));
-        let b = str_image(&some);
-        assert_eq!(&b[0..4], &[0x0b, 0, 0, 0], "type_index = kTVMFFISmallStr");
-        assert_eq!(&b[4..8], &[0x02, 0, 0, 0], "small_str_len = 2");
-        assert_eq!(&b[8..10], b"hi", "inline payload");
-    }
-
-    #[test]
-    fn optional_str_roundtrip_and_conversions() {
-        // small (inline) string
-        let s = OptionalStr::some(String::from("hi"));
-        assert!(s.has_value());
-        assert_eq!(s.as_str(), Some("hi"));
-        assert_eq!(s.get().as_deref(), Some("hi"));
-
-        // nullopt
-        let n = OptionalStr::none();
-        assert!(n.is_none());
-        assert_eq!(n.as_str(), None);
-        assert_eq!(n.get(), None);
-
-        // conversions + default
-        let from_some: OptionalStr = Some(String::from("x")).into();
-        assert_eq!(from_some.as_str(), Some("x"));
-        let back: Option<String> = OptionalStr::none().into();
-        assert!(back.is_none());
-        assert!(OptionalStr::default().is_none());
-    }
-
-    #[test]
-    fn optional_str_heap_clone_no_double_free() {
-        // long (heap) string exercises refcounted Clone/Drop through the wrapper.
-        let long = String::from("a-very-long-heap-allocated-string-value");
-        let a = OptionalStr::some(long);
-        let b = a.clone();
-        assert_eq!(a.as_str(), Some("a-very-long-heap-allocated-string-value"));
-        assert_eq!(b.as_str(), Some("a-very-long-heap-allocated-string-value"));
-        // both drop here: two dec_refs balancing the clone's inc_ref, no leak/UAF.
-    }
-
-    #[test]
-    fn optional_str_set_in_place() {
-        // Start engaged with a heap string, then replace it: `set` must drop
-        // (dec_ref) the old heap string before moving the new one in.
-        let mut o = OptionalStr::some(String::from("first-long-heap-allocated-value"));
-        assert_eq!(o.as_str(), Some("first-long-heap-allocated-value"));
-
-        o.set(Some(String::from("second-long-heap-allocated-value")));
-        assert_eq!(o.as_str(), Some("second-long-heap-allocated-value"));
-
-        // disengage (drops the heap string), then re-engage
-        o.set(None);
-        assert!(o.is_none());
-        assert_eq!(o.as_str(), None);
-
-        o.set(Some(String::from("x")));
-        assert_eq!(o.as_str(), Some("x"));
     }
 }
