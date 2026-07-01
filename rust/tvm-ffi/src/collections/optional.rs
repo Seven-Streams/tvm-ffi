@@ -16,37 +16,36 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! In-place `Optional<T>` mirror of C++ `ffi::Optional<T>` for POD `T`.
+//! In-place mirrors of C++ `ffi::Optional<T>` (`include/tvm/ffi/optional.h`).
 //!
-//! This is the Rust counterpart of the `std::optional`-backed
-//! `ffi::Optional<T>` specialization (`include/tvm/ffi/optional.h`, the
-//! non-`ObjectRef` / non-`String` / non-`Bytes` fallback). It is
-//! **memory-layout-compatible** with that C++ type: a `#[repr(C)]`
-//! `{ value: T, engaged: bool }` reproduces, byte for byte, the
-//! `std::optional<T>` layout used by libstdc++, libc++ and MSVC STL — the
-//! payload at offset `0`, the engaged flag at offset `size_of::<T>()`, padded
-//! to `align_of::<T>()`. This was verified against real `ffi::Optional<T>`
-//! instances under both libstdc++ and libc++.
-//!
-//! Because the layout is known, values are decoded **in place**:
-//! [`Optional::get`] reads the flag and payload directly from the field bytes
-//! with no FFI call and no allocation, and [`Optional::set`] writes them back.
-//! This is the in-place-decode design, in contrast to routing every access
-//! through the reflection getter/setter.
+//! Two types mirror the two `ffi::Optional<T>` specializations that store their
+//! value **inline**, so the field bytes can be decoded directly — no FFI call, no
+//! allocation, no reflection getter/setter:
+//! - [`Optional`] — the `std::optional`-backed fallback for POD scalar `T`. Its
+//!   `#[repr(C)] { value: T, engaged: bool }` reproduces, byte for byte, the
+//!   `std::optional<T>` layout of libstdc++, libc++ and MSVC STL (payload at
+//!   offset `0`, the engaged flag at `size_of::<T>()`, padded to
+//!   `align_of::<T>()`). Verified against real `ffi::Optional<T>` instances.
+//! - [`OptionalStr`] — the `String` specialization: the 16-byte string cell
+//!   itself, with `type_index == kTVMFFINone` marking `nullopt` (the C++
+//!   String/Bytes specialization stores the sentinel inside the cell rather than
+//!   a separate flag). `ffi::Optional<Bytes>` would follow the same pattern.
 //!
 //! # Scope
-//! Only the `std::optional` fallback specialization is mirrored here, i.e. POD
-//! `T` that is neither an `ObjectRef`, a [`String`](crate::String), nor
-//! [`Bytes`](crate::Bytes):
-//! - `ffi::Optional<SomeRef>` is a nullable object pointer — use
-//!   `Option<SomeRef>` (`nullptr` == `None`) instead.
-//! - `ffi::Optional<String>` / `ffi::Optional<Bytes>` carry a null sentinel
-//!   inside the string container and are out of scope for this module.
+//! Only the inline specializations are mirrored here:
+//! - `ffi::Optional<POD scalar>` → [`Optional`].
+//! - `ffi::Optional<String>` → [`OptionalStr`].
+//! - `ffi::Optional<SomeRef>` is a nullable object pointer, not stored inline —
+//!   use `Option<SomeRef>` (`nullptr` == `None`) instead.
 //!
 //! # Thread-safety
-//! [`Optional<T>`] uses interior mutability so a shared `&Optional<T>` aliasing
-//! a C++-owned field can be written in place; it is therefore `!Sync`.
+//! [`Optional`] uses interior mutability so a shared `&Optional<T>` aliasing a
+//! C++-owned field can be written in place (`set(&self)`); it is therefore
+//! `!Sync`. [`OptionalStr`] instead writes through `set(&mut self)`: it hands out
+//! borrows (`as_str`) into a refcounted cell, so a shared-ref setter would let a
+//! live `&str` dangle when the backing string is replaced.
 
+use crate::String;
 use std::cell::UnsafeCell;
 use std::fmt::{self, Debug};
 use std::mem::MaybeUninit;
@@ -223,6 +222,138 @@ macro_rules! optional_pod {
 }
 optional_pod!(bool, i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
 
+/// In-place mirror of C++ `ffi::Optional<String>`.
+///
+/// Byte-identical to the C++ field: the 16-byte string cell itself, with
+/// `type_index == kTVMFFINone` meaning `nullopt`. This matches the C++
+/// String/Bytes specialization, which stores the null sentinel inside the cell
+/// rather than adding a separate flag — so `none` is the all-zero cell, an
+/// engaged small string is stored inline, and a long string is a heap pointer,
+/// exactly as C++ lays them out. (`ffi::Optional<Bytes>` would mirror this with
+/// `Bytes`.)
+///
+/// Unlike POD [`Optional<T>`], this reuses [`String`]'s own `Clone`/`Drop`, whose
+/// refcounting is a no-op on the `nullopt` cell (its `type_index` is below
+/// `kTVMFFIStaticObjectBegin`), so no extra ownership logic is needed.
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct OptionalStr {
+    // Invariant: either a valid `String` (engaged) or a `nullopt` sentinel cell
+    // (`type_index == kTVMFFINone`). The inner `String` is never handed out, and
+    // its accessors are never called, while disengaged.
+    inner: String,
+}
+
+// OptionalStr must byte-overlay C++ `ffi::Optional<String>` — the 16-byte string
+// cell. Fires if `String` / `TVMFFIAny` ever changes size (parity with the POD
+// `Optional<T>` layout guard in `optional_pod!`).
+const _: () = {
+    assert!(std::mem::size_of::<OptionalStr>() == 16);
+};
+
+impl OptionalStr {
+    /// An engaged optional holding `value`.
+    #[inline]
+    pub fn some(value: String) -> Self {
+        Self { inner: value }
+    }
+
+    /// A disengaged optional (`nullopt`).
+    #[inline]
+    pub fn none() -> Self {
+        Self {
+            inner: String::none_cell(),
+        }
+    }
+
+    /// Whether a value is present.
+    #[inline]
+    pub fn has_value(&self) -> bool {
+        !self.inner.is_none_cell()
+    }
+
+    /// Whether the optional is `nullopt`.
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        self.inner.is_none_cell()
+    }
+
+    /// Borrows the engaged string as `&str`, or `None` when `nullopt`.
+    #[inline]
+    pub fn as_str(&self) -> Option<&str> {
+        if self.has_value() {
+            Some(self.inner.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// Takes the value out, consuming self.
+    #[inline]
+    pub fn get(self) -> Option<String> {
+        // Move `inner` out (OptionalStr has no `Drop` impl, so this is allowed);
+        // the `nullopt` cell drops as a no-op in the `None` arm.
+        let OptionalStr { inner } = self;
+        if inner.is_none_cell() {
+            None
+        } else {
+            Some(inner)
+        }
+    }
+
+    /// Overwrites the value in place. `Some(s)` engages and stores `s`; `None`
+    /// disengages. The previous value is dropped first (dec-ref'd if it was a
+    /// heap string), so this is the primitive for mutating a C++-owned field.
+    ///
+    /// Takes `&mut self`, not `&self` like POD [`Optional::set`]: `OptionalStr`
+    /// hands out borrows into its cell via [`as_str`](Self::as_str) and carries a
+    /// refcounting `Drop`, so a shared-ref setter could drop the backing string
+    /// out from under a live `&str`.
+    #[inline]
+    pub fn set(&mut self, value: Option<String>) {
+        // Assignment runs the old `String`'s `Drop` (dec_ref if heap) before
+        // moving the new cell in.
+        self.inner = match value {
+            Some(s) => s,
+            None => String::none_cell(),
+        };
+    }
+}
+
+impl Default for OptionalStr {
+    /// `nullopt`, matching the C++ default constructor.
+    #[inline]
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+impl From<Option<String>> for OptionalStr {
+    #[inline]
+    fn from(value: Option<String>) -> Self {
+        match value {
+            Some(s) => Self::some(s),
+            None => Self::none(),
+        }
+    }
+}
+
+impl From<OptionalStr> for Option<String> {
+    #[inline]
+    fn from(value: OptionalStr) -> Self {
+        value.get()
+    }
+}
+
+impl Debug for OptionalStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.as_str() {
+            Some(s) => write!(f, "OptionalStr::Some({s:?})"),
+            None => f.write_str("OptionalStr::None"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +476,78 @@ mod tests {
         assert_eq!(some.clone().get(), Some(123));
         let none = Optional::<i64>::none();
         assert_eq!(none.clone().get(), None);
+    }
+
+    // 16-byte cell (type_index@0, small_str_len@4, union@8); no padding.
+    fn str_image(o: &OptionalStr) -> [u8; 16] {
+        let p = o as *const OptionalStr as *const u8;
+        let mut b = [0u8; 16];
+        // SAFETY: OptionalStr is a fully-initialized 16-byte TVMFFIAny cell.
+        unsafe { std::ptr::copy_nonoverlapping(p, b.as_mut_ptr(), 16) };
+        b
+    }
+
+    #[test]
+    fn optional_str_byte_image_matches_cpp() {
+        // C++ probe: Optional<String> none => 16 zero bytes;
+        //            some("hi")           => 0b 00 00 00 | 02 00 00 00 | 68 69 00 ...
+        assert_eq!(str_image(&OptionalStr::none()), [0u8; 16]);
+        let some = OptionalStr::some(String::from("hi"));
+        let b = str_image(&some);
+        assert_eq!(&b[0..4], &[0x0b, 0, 0, 0], "type_index = kTVMFFISmallStr");
+        assert_eq!(&b[4..8], &[0x02, 0, 0, 0], "small_str_len = 2");
+        assert_eq!(&b[8..10], b"hi", "inline payload");
+    }
+
+    #[test]
+    fn optional_str_roundtrip_and_conversions() {
+        // small (inline) string
+        let s = OptionalStr::some(String::from("hi"));
+        assert!(s.has_value());
+        assert_eq!(s.as_str(), Some("hi"));
+        assert_eq!(s.get().as_deref(), Some("hi"));
+
+        // nullopt
+        let n = OptionalStr::none();
+        assert!(n.is_none());
+        assert_eq!(n.as_str(), None);
+        assert_eq!(n.get(), None);
+
+        // conversions + default
+        let from_some: OptionalStr = Some(String::from("x")).into();
+        assert_eq!(from_some.as_str(), Some("x"));
+        let back: Option<String> = OptionalStr::none().into();
+        assert!(back.is_none());
+        assert!(OptionalStr::default().is_none());
+    }
+
+    #[test]
+    fn optional_str_heap_clone_no_double_free() {
+        // long (heap) string exercises refcounted Clone/Drop through the wrapper.
+        let long = String::from("a-very-long-heap-allocated-string-value");
+        let a = OptionalStr::some(long);
+        let b = a.clone();
+        assert_eq!(a.as_str(), Some("a-very-long-heap-allocated-string-value"));
+        assert_eq!(b.as_str(), Some("a-very-long-heap-allocated-string-value"));
+        // both drop here: two dec_refs balancing the clone's inc_ref, no leak/UAF.
+    }
+
+    #[test]
+    fn optional_str_set_in_place() {
+        // Start engaged with a heap string, then replace it: `set` must drop
+        // (dec_ref) the old heap string before moving the new one in.
+        let mut o = OptionalStr::some(String::from("first-long-heap-allocated-value"));
+        assert_eq!(o.as_str(), Some("first-long-heap-allocated-value"));
+
+        o.set(Some(String::from("second-long-heap-allocated-value")));
+        assert_eq!(o.as_str(), Some("second-long-heap-allocated-value"));
+
+        // disengage (drops the heap string), then re-engage
+        o.set(None);
+        assert!(o.is_none());
+        assert_eq!(o.as_str(), None);
+
+        o.set(Some(String::from("x")));
+        assert_eq!(o.as_str(), Some("x"));
     }
 }

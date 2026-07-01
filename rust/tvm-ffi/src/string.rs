@@ -284,6 +284,27 @@ impl String {
     pub fn as_str(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
     }
+
+    /// Whether the underlying cell is the `nullopt` sentinel
+    /// (`type_index == kTVMFFINone`). Such a cell is NOT a valid string — string
+    /// accessors must not be called on it — and only exists inside
+    /// [`OptionalStr`](crate::OptionalStr).
+    #[inline]
+    pub(crate) fn is_none_cell(&self) -> bool {
+        self.data.type_index == TypeIndex::kTVMFFINone as i32
+    }
+
+    /// A `nullopt` sentinel cell (`type_index == kTVMFFINone`, all-zero), mirroring
+    /// the C++ `Optional<String>` disengaged state. NOT a valid string; only used to
+    /// build [`OptionalStr`](crate::OptionalStr). Cloning/dropping it is a no-op
+    /// (its `type_index` is below `kTVMFFIStaticObjectBegin`).
+    #[inline]
+    pub(crate) fn none_cell() -> Self {
+        // `TVMFFIAny::new()` is exactly the all-zero `kTVMFFINone` cell.
+        Self {
+            data: TVMFFIAny::new(),
+        }
+    }
 }
 
 impl<T> From<T> for String
