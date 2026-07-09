@@ -22,7 +22,7 @@ use std::sync::atomic::AtomicU64;
 use crate::derive::ObjectRef;
 pub use tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 /// Object related ABI handling
-use tvm_ffi_sys::{TVMFFIObject, COMBINED_REF_COUNT_BOTH_ONE};
+use tvm_ffi_sys::{TVMFFIGetTypeInfo, TVMFFIObject, COMBINED_REF_COUNT_BOTH_ONE};
 
 /// Object type is by default the TVMFFIObject
 #[repr(C)]
@@ -121,6 +121,44 @@ pub struct ObjectRef {
 #[inline]
 pub unsafe fn inc_ref_raw_object(handle: *mut TVMFFIObject) {
     unsafe { unsafe_::inc_ref(handle) }
+}
+
+/// Returns `true` if `obj_type_index` is the same type as, or a subtype
+/// (descendant) of, `base_type_index`.
+///
+/// Uses the runtime type-info ancestor table: single inheritance means the
+/// object is a descendant of `base` exactly when its depth exceeds `base`'s and
+/// `ancestors[depth(base)]` is `base` (an O(1) lookup, no chain walk). This
+/// backs the subtype-aware `AnyCompatible` check for object refs, so a base ref
+/// (e.g. a generic [`ObjectRef`]) accepts any of its descendant object types,
+/// mirroring C++ `IsInstance` / Python `isinstance`.
+///
+/// # Safety
+/// The indices are read through `TVMFFIGetTypeInfo`; unregistered indices make
+/// the function return `false` rather than misbehave.
+#[inline]
+pub unsafe fn type_index_is_instance(obj_type_index: i32, base_type_index: i32) -> bool {
+    if obj_type_index == base_type_index {
+        return true;
+    }
+    unsafe {
+        let info = TVMFFIGetTypeInfo(obj_type_index);
+        let base_info = TVMFFIGetTypeInfo(base_type_index);
+        if info.is_null() || base_info.is_null() {
+            return false;
+        }
+        let base_depth = (*base_info).type_depth;
+        // A descendant is strictly deeper than its ancestor.
+        if (*info).type_depth <= base_depth {
+            return false;
+        }
+        let ancestors = (*info).type_acenstors;
+        if ancestors.is_null() {
+            return false;
+        }
+        let anc = *ancestors.offset(base_depth as isize);
+        !anc.is_null() && (*anc).type_index == base_type_index
+    }
 }
 
 /// Unsafe operations on object

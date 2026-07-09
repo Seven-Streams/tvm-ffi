@@ -1014,13 +1014,9 @@ def test_render_optional_value_positions() -> None:
 @pytest.mark.parametrize(
     ("schema", "origin"),
     [
-        # `Any` is not `AnyCompatible`, so the crate's Map/Option bounds reject it.
-        pytest.param(TypeSchema("Map"), "Map", id="bare-map-fills-any"),
-        pytest.param(
-            TypeSchema("Map", (TypeSchema("str"), TypeSchema("Any"))), "Map", id="map-any-value"
-        ),
-        pytest.param(TypeSchema("Optional", (TypeSchema("Any"),)), "Optional", id="optional-any"),
-        # A genuinely unsupported origin buried inside a container still bubbles up.
+        # A genuinely unsupported origin buried inside a container still bubbles
+        # up. (`Any` is NOT here anymore -- it renders as `ObjectRef`; see
+        # `test_render_any_element_maps_to_objectref`.)
         pytest.param(
             TypeSchema("Array", (TypeSchema("Dict", (TypeSchema("str"), TypeSchema("int"))),)),
             "Dict",
@@ -1031,6 +1027,10 @@ def test_render_optional_value_positions() -> None:
             "List",
             id="map-of-list",
         ),
+        # NB: `void*` (`ctypes.c_void_p`) is rejected at leaf resolution
+        # (`_ObjectRenderer._ty_render`), not by `render_rust_type` itself, so it
+        # is covered by `test_rust_void_ptr_unsupported` (which uses the real
+        # renderer), not this `_rust_render` double.
     ],
 )
 def test_render_unsupported_nested_raises(schema: TypeSchema, origin: str) -> None:
@@ -1453,6 +1453,21 @@ def _optional_field_info(fields: list[NamedTypeSchema], *, has_init: bool = True
             id="objref",
         ),
         pytest.param(
+            TypeSchema("Object"),
+            "Optional<ObjectRef>",
+            "tvm_ffi::object::ObjectRef",
+            id="objref-generic",
+        ),
+        # `Any` payload gets the element treatment: it renders as `ObjectRef`
+        # inside the 16-byte cell mirror (`Optional<Any>` would not compile --
+        # `Any` is not `AnyCompatible`).
+        pytest.param(
+            TypeSchema("Any"),
+            "Optional<ObjectRef>",
+            "tvm_ffi::object::ObjectRef",
+            id="any-as-objref",
+        ),
+        pytest.param(
             TypeSchema("Array", (TypeSchema("int"),)),
             "Optional<Array<i64>>",
             "tvm_ffi::Array",
@@ -1491,31 +1506,34 @@ def test_rust_optional_field_builder_store_and_setter() -> None:
 
 
 @pytest.mark.parametrize(
-    ("payload", "origin"),
+    "schema",
     [
-        # `Any` / bare `Object` have no `AnyCompatible` crate rendering.
-        pytest.param(TypeSchema("Any"), "Optional", id="any"),
-        pytest.param(TypeSchema("Object"), "Optional", id="object"),
-        pytest.param(TypeSchema("ffi.Object"), "Optional", id="ffi-object"),
-        # `void*`: dotted key with no Rust rendering; without the non-element
-        # rule it would pass through as a bogus `use ctypes::c_void_p`.
-        pytest.param(TypeSchema("ctypes.c_void_p"), "Optional", id="void-ptr"),
+        # `void*` (`ctypes.c_void_p`) has no Rust rendering: a dotted name that is
+        # NOT an object type key. `_ty_render` rejects it at leaf resolution, so
+        # it is a loud skip in EVERY position -- a plain field, a container
+        # element, and an Optional payload -- instead of a silent, uncompilable
+        # `pub x: c_void_p` + `use ctypes::c_void_p`.
+        pytest.param(TypeSchema("ctypes.c_void_p"), id="field"),
+        pytest.param(TypeSchema("Array", (TypeSchema("ctypes.c_void_p"),)), id="array-element"),
+        pytest.param(
+            TypeSchema("Optional", (TypeSchema("ctypes.c_void_p"),)), id="optional-payload"
+        ),
     ],
 )
-def test_rust_optional_field_unsupported_payloads(payload: TypeSchema, origin: str) -> None:
-    schema = NamedTypeSchema("x", TypeSchema("Optional", (payload,)), size=16)
+def test_rust_void_ptr_unsupported(schema: TypeSchema) -> None:
+    field = NamedTypeSchema("x", schema, size=16)
     with pytest.raises(UnsupportedTypeError) as exc:
-        _gen_rust_object(_optional_field_info([schema], has_init=False))
-    assert exc.value.origin == origin
+        _gen_rust_object(_optional_field_info([field], has_init=False))
+    assert exc.value.origin == "ctypes.c_void_p"
 
 
 @pytest.mark.parametrize(
     ("payload", "size"),
     [
-        # 8-byte fields can only come from pre-#657 reflection (the removed
-        # ptr-based / std::optional layouts).
-        pytest.param(TypeSchema("cpp_rust_test.Point"), 8, id="stale-ptr-layout"),
-        pytest.param(TypeSchema("int"), 8, id="stale-std-optional-int"),
+        # Any size other than the 16-byte `TVMFFIAny` cell is unsupported: C++
+        # `ffi::Optional<T>` is uniformly 16 bytes for storage-enabled `T`, so
+        # an 8-byte reflected Optional is not a mirrorable layout.
+        pytest.param(TypeSchema("int"), 8, id="scalar-8-not-cell"),
         # `std::string` folds to "str" but is the ~40-byte std::optional fallback.
         pytest.param(TypeSchema("str"), 40, id="std-string-alias"),
     ],
@@ -1528,34 +1546,68 @@ def test_rust_optional_field_layout_size_guard(payload: TypeSchema, size: int) -
 
 
 @pytest.mark.parametrize(
-    ("schema", "origin"),
+    ("schema", "expected"),
     [
-        # `Array<Any>`/`Array<Object>` violate the crate bounds even as bare
-        # field types; nested occurrences bubble up through the recursive render.
-        pytest.param(TypeSchema("Array", (TypeSchema("Any"),)), "Array", id="array-any"),
-        pytest.param(TypeSchema("Array", (TypeSchema("Object"),)), "Array", id="array-object"),
+        # `Any` in element/payload position renders as the single-pointer
+        # `ObjectRef` handle (AnyCompatible, layout-identical -- the container is
+        # pointer-only). Same treatment as a generic `Object`
+        # (`test_render_object_element_maps_to_objectref`).
+        pytest.param(TypeSchema("Array", (TypeSchema("Any"),)), "Array<ObjectRef>", id="array-any"),
+        pytest.param(
+            TypeSchema("Map", (TypeSchema("str"), TypeSchema("Any"))),
+            "Map<String, ObjectRef>",
+            id="map-any-value",
+        ),
+        pytest.param(
+            TypeSchema("Optional", (TypeSchema("Any"),)), "Option<ObjectRef>", id="optional-any"
+        ),
+        # A bare `Map` fills to (Any, Any) -> both sides render `ObjectRef`.
+        pytest.param(TypeSchema("Map"), "Map<ObjectRef, ObjectRef>", id="bare-map-fills-any"),
+        # Nested: the `Any` normalization applies at every element depth.
         pytest.param(
             TypeSchema("Map", (TypeSchema("str"), TypeSchema("Array", (TypeSchema("Any"),)))),
-            "Array",
+            "Map<String, Array<ObjectRef>>",
             id="map-of-array-any",
         ),
         pytest.param(
             TypeSchema("Optional", (TypeSchema("Array", (TypeSchema("Any"),)),)),
-            "Array",
+            "Option<Array<ObjectRef>>",
             id="optional-array-any",
+        ),
+    ],
+)
+def test_render_any_element_maps_to_objectref(schema: TypeSchema, expected: str) -> None:
+    text, imports = _rust_render(schema)
+    assert text == expected
+    assert RustUse("tvm_ffi::object::ObjectRef") in imports.items
+
+
+@pytest.mark.parametrize(
+    ("schema", "expected"),
+    [
+        # A generic/opaque object renders as the single-pointer `ObjectRef`
+        # handle in every container/value position (it IS `AnyCompatible`).
+        pytest.param(TypeSchema("Object"), "ObjectRef", id="bare-object"),
+        pytest.param(TypeSchema("ffi.Object"), "ObjectRef", id="bare-ffi-object"),
+        pytest.param(
+            TypeSchema("Array", (TypeSchema("Object"),)), "Array<ObjectRef>", id="array-object"
         ),
         pytest.param(
             TypeSchema("Map", (TypeSchema("str"), TypeSchema("Object"))),
-            "Map",
+            "Map<String, ObjectRef>",
             id="map-object-value",
         ),
-        pytest.param(TypeSchema("Optional", (TypeSchema("Object"),)), "Optional", id="opt-object"),
+        pytest.param(
+            TypeSchema("Optional", (TypeSchema("Object"),)),
+            "Option<ObjectRef>",
+            id="optional-object-value",
+        ),
     ],
 )
-def test_render_non_element_origins_raise(schema: TypeSchema, origin: str) -> None:
-    with pytest.raises(UnsupportedTypeError) as exc:
-        _rust_render(schema)
-    assert exc.value.origin == origin
+def test_render_object_element_maps_to_objectref(schema: TypeSchema, expected: str) -> None:
+    text, imports = _rust_render(schema)
+    assert text == expected
+    assert RustUse("tvm_ffi::object::ObjectRef") in imports.items
 
 
 def test_rust_optional_engaged_default_is_unsupported() -> None:
@@ -1751,12 +1803,11 @@ def test_rust_object_immutable_has_no_derefmut() -> None:
     assert "fn test() -> Result<i64> {" in text  # static unaffected
 
 
-def test_rust_object_field_of_type_object_shares_boilerplate_use() -> None:
-    # Regression for an E0252 "Object defined multiple times" collision: a root
-    # object's boilerplate `Object` (the struct `base`) and a field whose type
-    # is itself `ffi.Object` both record the crate-root re-export path
-    # `tvm_ffi::Object`, so they dedup to a single `use` -- no second
-    # `use ...::Object;` that would fail to compile.
+def test_rust_object_field_of_type_object_maps_to_objectref() -> None:
+    # The struct `base` is the embedded 24-byte `Object` data struct (spelled
+    # literally by codegen), while a field whose C++ type is a generic
+    # `ffi.Object` is a single-pointer `ObjectRef` handle. The two are distinct
+    # types with distinct leaves, so both `use`s coexist without collision.
     info = ObjectInfo(
         fields=[NamedTypeSchema("child", TypeSchema("ffi.Object"))],
         methods=[],
@@ -1765,9 +1816,10 @@ def test_rust_object_field_of_type_object_shares_boilerplate_use() -> None:
     )
     text, imports = _gen_rust_object(info)
     assert "    base: Object," in text  # boilerplate Object as the struct base
-    assert "    pub child: Object," in text  # the field binds the same type
+    assert "    pub child: ObjectRef," in text  # a generic object field is a ref
     uses = [u.as_use_line() for u in imports.items]
     assert uses.count("use tvm_ffi::Object;") == 1
+    assert uses.count("use tvm_ffi::object::ObjectRef;") == 1
 
 
 def test_rust_method_any_return_stays_any_not_anyview() -> None:
@@ -1808,11 +1860,15 @@ def test_rust_method_any_return_stays_any_not_anyview() -> None:
 
 
 def _has_map_info() -> ObjectInfo:
-    # A bare `Map` fills to the unsupported `Map<Any, Any>`: the canonical
-    # still-skipped fixture now that typed Maps render.
+    # A `Map` whose value is the unsupported `List`: the canonical still-skipped
+    # fixture. (A bare `Map<Any, Any>` now renders `Map<ObjectRef, ObjectRef>`,
+    # so the skip is driven by the genuinely-unrepresentable `List` element.)
     return ObjectInfo(
         fields=[
-            NamedTypeSchema("cfg", TypeSchema("Map")),
+            NamedTypeSchema(
+                "cfg",
+                TypeSchema("Map", (TypeSchema("str"), TypeSchema("List", (TypeSchema("int"),)))),
+            ),
         ],
         methods=[],
         type_key="demo.HasMap",
@@ -1831,7 +1887,7 @@ def test_rust_object_unsupported_raises() -> None:
         generate_rust_object(
             block, RC.RUST_TY_MAP_DEFAULTS.copy(), imports, Options(), _has_map_info()
         )
-    assert exc.value.origin == "Map"
+    assert exc.value.origin == "List"
     assert RustUse("tvm_ffi::Tensor") in imports.items  # pre-seeded use kept
 
 
@@ -2087,7 +2143,7 @@ def test_rust_global_funcs_block_is_noop() -> None:
     assert imports.items == []
 
 
-def test_rust_object_no_init_no_methods_has_no_impl() -> None:
+def test_rust_object_no_init_no_methods_has_only_ref_helpers() -> None:
     info = ObjectInfo(
         fields=[NamedTypeSchema("value", TypeSchema("int"))],
         methods=[],
@@ -2097,5 +2153,26 @@ def test_rust_object_no_init_no_methods_has_no_impl() -> None:
     )
     text, _ = _gen_rust_object(info)
     assert "struct PlainObj {" in text
-    assert "impl Plain {" not in text  # no new, no methods -> no impl block
-    assert "fn new" not in text
+    # The impl block is always present for the `same_as`/`downcast` ref helpers,
+    # but with no constructor or reflected methods.
+    assert "impl Plain {" in text
+    assert "pub fn same_as<" in text
+    assert "pub fn downcast<" in text
+    assert "fn ffi_new" not in text
+
+
+def test_rust_object_ref_helpers_and_derived_upcast() -> None:
+    # Every ref gets `same_as` + `downcast`; a derived type additionally gets the
+    # offset-0 upcast `From<Derived> for <ParentRef>`.
+    text, _ = _gen_rust_object(_add_info())
+    assert "pub fn same_as<O: tvm_ffi::ObjectRefCore>(&self, other: &O) -> bool {" in text
+    assert "pub fn downcast<N: tvm_ffi::ObjectCore>(&self) -> Option<&N> {" in text
+    assert "impl From<Add> for Expr {" in text
+    assert "ObjectArc::from_raw(ObjectArc::into_raw(arc) as *const ExprObj)" in text
+
+
+def test_rust_root_object_has_ref_helpers_but_no_upcast() -> None:
+    # A root object (parent `ffi.Object`) has no ref-typed parent, so no upcast.
+    text, _ = _gen_rust_object(_expr_info())
+    assert "pub fn same_as<" in text
+    assert "impl From<Expr>" not in text

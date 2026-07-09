@@ -145,3 +145,80 @@ fn test_object_arc_option_size() {
         std::mem::size_of::<ObjectArc<TestIntObj>>()
     );
 }
+
+// Compile-only: mirrors the exact shape stubgen now emits for an object with a
+// generic-object field. If `ObjectRef` failed the crate's container/optional
+// `AnyCompatible` bounds (or the derives rejected it) in any of these positions,
+// this would not build. Never instantiated (the type key is unregistered), so
+// the runtime `type_index()` lookup is never triggered.
+#[repr(C)]
+#[derive(tvm_ffi::derive::Object)]
+#[type_key = "test.ObjRefHolder"]
+#[allow(dead_code)]
+struct ObjRefHolderObj {
+    base: Object,
+    child: tvm_ffi::object::ObjectRef,
+    kids: tvm_ffi::Array<tvm_ffi::object::ObjectRef>,
+    named: tvm_ffi::Map<tvm_ffi::String, tvm_ffi::object::ObjectRef>,
+    maybe: tvm_ffi::Optional<tvm_ffi::object::ObjectRef>,
+}
+
+#[repr(C)]
+#[derive(tvm_ffi::derive::ObjectRef, Clone)]
+#[allow(dead_code)]
+struct ObjRefHolder {
+    data: ObjectArc<ObjRefHolderObj>,
+}
+
+#[test]
+fn test_type_index_is_instance() {
+    use tvm_ffi::object::type_index_is_instance;
+
+    // Runtime indices read from live heap objects (all subtypes of Object).
+    // Use `Array`/`Shape` (both heap objects) rather than a short string, which
+    // would be stored inline as a small-string POD, not a heap `ffi.Str`.
+    let shape_ti = Any::from(Shape::from(vec![1, 2])).type_index();
+    let array_ti = Any::from(Array::new(vec![Shape::from(vec![1])])).type_index();
+    let obj_ti = Object::type_index();
+
+    unsafe {
+        // Reflexive.
+        assert!(type_index_is_instance(shape_ti, shape_ti));
+        assert!(type_index_is_instance(obj_ti, obj_ti));
+        // Subtype: every builtin object is-a Object.
+        assert!(type_index_is_instance(shape_ti, obj_ti));
+        assert!(type_index_is_instance(array_ti, obj_ti));
+        // Not a subtype: Object is not a Shape; Shape and Array are unrelated siblings.
+        assert!(!type_index_is_instance(obj_ti, shape_ti));
+        assert!(!type_index_is_instance(shape_ti, array_ti));
+    }
+}
+
+#[test]
+fn test_objectref_base_carries_runtime_type() {
+    use tvm_ffi::object::ObjectRef;
+
+    let shape_ti = Any::from(Shape::from(vec![1, 2])).type_index();
+
+    // Upcast a concrete Shape into the generic base `ObjectRef`, moving the one
+    // owned reference from the typed arc into an `ObjectArc<Object>` (the Shape
+    // container embeds `Object` at offset 0, so the pointer is unchanged).
+    let shape = Shape::from(vec![7, 8, 9]);
+    let raw = unsafe { ObjectArc::into_raw(<Shape as ObjectRefCore>::into_data(shape)) };
+    let base_arc = unsafe { ObjectArc::<Object>::from_raw(raw as *const Object) };
+    let base: ObjectRef = <ObjectRef as ObjectRefCore>::from_data(base_arc);
+
+    // A base ref must (1) tag the Any with the object's RUNTIME type index (not
+    // the static `Object` container index)...
+    let any = Any::from(base);
+    assert_eq!(
+        any.type_index(),
+        shape_ti,
+        "base ObjectRef must tag Any with the object's runtime type index"
+    );
+
+    // ...and (2) the subtype-aware check must still cast it back to the concrete
+    // `Shape` (before the fix this failed: Shape's index != Object's index).
+    let back = Shape::try_from(any).expect("subtype-tagged Any must cast back to Shape");
+    let _ = back;
+}

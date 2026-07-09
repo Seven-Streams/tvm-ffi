@@ -32,7 +32,10 @@ RUST_TY_MAP_DEFAULTS = {
     "Callable": "tvm_ffi::Function",
     "Array": "tvm_ffi::Array",  # the crate's own Array<T>, NOT Vec
     "Map": "tvm_ffi::Map",  # the crate's own Map<K, V>, NOT HashMap
-    "Object": "tvm_ffi::Object",
+    # A generic/opaque object VALUE is the single-pointer `ObjectRef` handle
+    # (AnyCompatible, niche-optimizable), NOT the 24-byte `Object` data struct
+    # (which is only ever the embedded struct `base`, spelled literally by codegen).
+    "Object": "tvm_ffi::object::ObjectRef",
     "Tensor": "tvm_ffi::Tensor",
     "Shape": "tvm_ffi::Shape",
     "Device": "tvm_ffi::DLDevice",
@@ -43,7 +46,7 @@ RUST_TY_MAP_DEFAULTS = {
     "ffi.Bytes": "tvm_ffi::Bytes",
     "ffi.Module": "tvm_ffi::Module",
     "ffi.Error": "tvm_ffi::Error",
-    "ffi.Object": "tvm_ffi::Object",
+    "ffi.Object": "tvm_ffi::object::ObjectRef",
     "ffi.Tensor": "tvm_ffi::Tensor",
     "ffi.Shape": "tvm_ffi::Shape",
     "ffi.Function": "tvm_ffi::Function",
@@ -68,13 +71,10 @@ RUST_SCALAR_BY_SIZE = {
 #: raises wherever one appears and the enclosing object is skipped.
 RUST_UNSUPPORTED_ORIGINS = frozenset({"Dict", "List", "Union", "tuple"})
 
-#: Origins whose rendering cannot satisfy the crate's ``AnyCompatible``
-#: element/payload bounds (``ctypes.c_void_p`` -- ``void*`` -- has no Rust
-#: rendering at all): raise and skip the object.
-RUST_NON_ELEMENT_ORIGINS = frozenset({"Any", "Object", "ffi.Object", "ctypes.c_void_p"})
-
 #: In-place mirror of an ``Optional<T>`` FIELD: C++ ``ffi::Optional<T>`` is
-#: uniformly a single 16-byte ``TVMFFIAny`` for every ``T`` with Any storage.
+#: uniformly a single 16-byte ``TVMFFIAny`` for every storage-enabled ``T``
+#: (the #657 ABI -- layout independent of ``T``, ``nullopt == kTVMFFINone``,
+#: including ``Optional<ObjectRef>``; there is no pointer-sized niche form).
 RUST_OPTIONAL_PATH = "tvm_ffi::Optional"
 #: Any other reflected field size is the ``std::optional`` fallback of
 #: storage-disabled types, which has no mirror.

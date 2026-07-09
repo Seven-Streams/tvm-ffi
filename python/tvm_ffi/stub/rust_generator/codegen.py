@@ -34,8 +34,8 @@ from . import consts as C_RUST
 from .utils import (
     RustImports,
     UnsupportedTypeError,
-    _check_element,
     _deref_impl,
+    _element_rust_type,
     _packed_args_expr,
     _packed_call_lines,
     render_rust_type,
@@ -87,7 +87,8 @@ def _optional_default_expr(field: NamedTypeSchema) -> str | None:
 
     Only the ``None`` default is supported: an engaged default's type-erased
     value can disagree with the payload's kind or width, so it is treated as
-    unrenderable (``ffi_new`` is then skipped loudly).
+    unrenderable (``ffi_new`` is then skipped loudly). The disengaged value is
+    the uniform 16-byte Any-cell mirror's ``Optional::none()``.
     """
     if field.default is not None:
         return None
@@ -218,13 +219,17 @@ class _ObjectRenderer:
     def _ty_render(self, origin: str) -> str:
         """Resolve a leaf origin to its Rust name and record its ``use``.
 
-        Unmapped dotted names (object type keys) pass through; an unmapped bare
-        origin (e.g. ``const char*``) has no Rust rendering and raises, which
-        skips the enclosing object.
+        Unmapped dotted names (object type keys, ``pkg.Type`` -> ``pkg::Type``)
+        pass through. An unmapped bare origin (e.g. ``const char*``) or a
+        ``ctypes.*`` sentinel (``ctypes.c_void_p`` -- ``void*`` -- is dotted but
+        is not an object key and has no Rust rendering) raises, skipping the
+        enclosing object. Rejecting here covers every position uniformly (field,
+        container element, method arg/return), so no separate element blocklist
+        is needed.
         """
         mapped = self.ty_map.get(origin)
         if mapped is None:
-            if "." not in origin:
+            if "." not in origin or origin.startswith("ctypes."):
                 raise UnsupportedTypeError(origin)
             mapped = origin
         return self.imports.record(mapped)
@@ -245,13 +250,16 @@ class _ObjectRenderer:
     def _render_optional_field(self, schema: NamedTypeSchema) -> str:
         """Render an ``Optional<T>`` FIELD as the uniform ``tvm_ffi::Optional<T>`` mirror.
 
-        The payload rules are exactly the container-element rules; the size
-        guard rejects the ``std::optional`` fallback layout of storage-disabled
-        types.
+        C++ ``ffi::Optional<T>`` is uniformly a single 16-byte ``TVMFFIAny`` for
+        every storage-enabled ``T`` -- including ``Optional<ObjectRef>`` (the
+        #657 ABI: layout independent of ``T``, ``nullopt == kTVMFFINone``). There
+        is no pointer-sized niche form. The payload rules are exactly the
+        container-element rules (``Any`` -> ``ObjectRef``); the size guard
+        rejects the ``std::optional`` fallback layout of storage-disabled types.
         """
         (payload,) = schema.args or (None,)  # Optional always has exactly one argument
         assert payload is not None
-        _check_element("Optional", payload)
+        payload_ty = _element_rust_type(payload, self._ty_render)
         if schema.size not in (None, C_RUST.RUST_OPTIONAL_FIELD_SIZE):
             raise UnsupportedTypeError(
                 "Optional",
@@ -262,7 +270,7 @@ class _ObjectRenderer:
         # No width recovery: the Any cell stores the widened v_int64/v_float64,
         # so the schema-erased scalar is the correct mirror for every C++ width.
         opt = self.imports.record(C_RUST.RUST_OPTIONAL_PATH)
-        return f"{opt}<{render_rust_type(payload, self._ty_render)}>"
+        return f"{opt}<{payload_ty}>"
 
     def render_param(self, schema: TypeSchema) -> str:
         """Render an argument type (a top-level ``Any`` is the non-owning ``AnyView``)."""
@@ -313,6 +321,7 @@ class _ObjectRenderer:
         lines += _deref_impl(leaf, obj_struct, "data", self.info.mutable)
         if not self.is_root:
             lines += _deref_impl(obj_struct, base_type, "base", self.info.mutable)
+            lines += self._upcast_lines()
 
         # Native (FFI-free) construction whenever the whole chain is eligible;
         # there is no FFI fallback -- a blocked constructor is skipped loudly.
@@ -331,27 +340,85 @@ class _ObjectRenderer:
         lines.pop()  # every section above ends with a `""` separator
         return lines
 
+    def _ref_helper_lines(self) -> list[str]:
+        """`same_as` (pointer identity) and `downcast` (checked concrete retype).
+
+        Present on every generated ref, mirroring the C++ ref-class
+        `ObjectRef::same_as` and `obj.as<N>()`: pass code compares object
+        identity and narrows a base handle to a concrete node. `downcast`
+        returns a borrow of `N` iff the object header's runtime type index
+        equals `N`'s.
+        """
+        self.imports.record("tvm_ffi::ObjectRefCore")
+        return [
+            "/// C++ `ObjectRef::same_as`: pointer identity of the underlying object.",
+            "pub fn same_as<O: tvm_ffi::ObjectRefCore>(&self, other: &O) -> bool {",
+            "    unsafe {",
+            "        ObjectArc::as_raw(&self.data) as *const u8",
+            "            == ObjectArc::as_raw(<O as tvm_ffi::ObjectRefCore>::data(other)) as *const u8",
+            "    }",
+            "}",
+            "",
+            "/// Checked downcast to a concrete object `N` (C++ `obj.as<N>()`):",
+            "/// `Some(&N)` iff the runtime header type index matches, else `None`.",
+            "pub fn downcast<N: tvm_ffi::ObjectCore>(&self) -> Option<&N> {",
+            "    unsafe {",
+            "        let raw = ObjectArc::as_raw(&self.data) as *const N;",
+            "        let header = raw as *const tvm_ffi::tvm_ffi_sys::TVMFFIObject;",
+            "        if (*header).type_index == <N as tvm_ffi::ObjectCore>::type_index() {",
+            "            Some(&*raw)",
+            "        } else {",
+            "            None",
+            "        }",
+            "    }",
+            "}",
+        ]
+
     def _impl_block(self, native: bool) -> list[str]:
-        """Emit `impl <T> { ffi_new; methods }`; empty list when there's nothing to emit."""
+        """Emit `impl <T> { same_as; downcast; ffi_new; methods }`."""
         methods = [
             m for m in self.info.methods if m.schema.name.rsplit(".", 1)[-1] != "__ffi_init__"
         ]
-        if not native and not methods:
-            return []
+
+        sections: list[list[str]] = [self._ref_helper_lines()]
+        if native:  # `native` implies `has_init` (see `_native_blocker`)
+            sections.append(self._new_fn_native())
+        sections += [self._method_fn(method) for method in methods]
 
         inner: list[str] = []
-        if native:  # `native` implies `has_init` (see `_native_blocker`)
-            inner += self._new_fn_native()
-            if methods:
+        for i, section in enumerate(sections):
+            if i:
                 inner.append("")
-        for i, method in enumerate(methods):
-            inner += self._method_fn(method)
-            if i != len(methods) - 1:
-                inner.append("")
+            inner += section
 
         return [
             f"impl {self.leaf} {{",
             *[f"    {line}" if line else "" for line in inner],
+            "}",
+            "",
+        ]
+
+    def _upcast_lines(self) -> list[str]:
+        """`impl From<Leaf> for <ParentRef>` -- offset-0 prefix retype (upcast).
+
+        Sound because `<Leaf>Obj` embeds the parent as its offset-0 `base`, so
+        the object pointer is unchanged; only the arc's static type moves
+        (ownership transfers, no refcount change). Emitted for derived types
+        only -- the parent's ref is the generated `<ParentLeaf>`; a root object
+        has no ref-typed parent (its `base` is the bare `Object` data struct).
+        """
+        self.imports.record("tvm_ffi::ObjectRefCore")
+        parent_ref = self.base_type[:-3]  # `<ParentLeaf>Obj` -> `<ParentLeaf>`
+        parent_obj = self.base_type
+        return [
+            f"impl From<{self.leaf}> for {parent_ref} {{",
+            f"    fn from(x: {self.leaf}) -> {parent_ref} {{",
+            f"        let arc = <{self.leaf} as tvm_ffi::ObjectRefCore>::into_data(x);",
+            "        let up = unsafe {",
+            f"            ObjectArc::from_raw(ObjectArc::into_raw(arc) as *const {parent_obj})",
+            "        };",
+            f"        <{parent_ref} as tvm_ffi::ObjectRefCore>::from_data(up)",
+            "    }",
             "}",
             "",
         ]

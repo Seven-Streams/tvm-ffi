@@ -28,6 +28,7 @@ use tvm_ffi::AnyView;
 use tvm_ffi::Object;
 use tvm_ffi::ObjectArc;
 use tvm_ffi::ObjectCore;
+use tvm_ffi::ObjectRefCore;
 use tvm_ffi::Result;
 // tvm-ffi-stubgen(end)
 
@@ -62,6 +63,28 @@ impl DerefMut for IntPair {
 }
 
 impl IntPair {
+    /// C++ `ObjectRef::same_as`: pointer identity of the underlying object.
+    pub fn same_as<O: tvm_ffi::ObjectRefCore>(&self, other: &O) -> bool {
+        unsafe {
+            ObjectArc::as_raw(&self.data) as *const u8
+                == ObjectArc::as_raw(<O as tvm_ffi::ObjectRefCore>::data(other)) as *const u8
+        }
+    }
+
+    /// Checked downcast to a concrete object `N` (C++ `obj.as<N>()`):
+    /// `Some(&N)` iff the runtime header type index matches, else `None`.
+    pub fn downcast<N: tvm_ffi::ObjectCore>(&self) -> Option<&N> {
+        unsafe {
+            let raw = ObjectArc::as_raw(&self.data) as *const N;
+            let header = raw as *const tvm_ffi::tvm_ffi_sys::TVMFFIObject;
+            if (*header).type_index == <N as tvm_ffi::ObjectCore>::type_index() {
+                Some(&*raw)
+            } else {
+                None
+            }
+        }
+    }
+
     pub fn ffi_new() -> IntPairBuilder {
         IntPairBuilder {
             base: Object::new(),
