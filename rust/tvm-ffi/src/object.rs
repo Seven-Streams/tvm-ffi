@@ -126,27 +126,50 @@ pub unsafe fn inc_ref_raw_object(handle: *mut TVMFFIObject) {
 /// Returns `true` if `obj_type_index` is the same type as, or a subtype
 /// (descendant) of, `base_type_index`.
 ///
-/// Uses the runtime type-info ancestor table: single inheritance means the
-/// object is a descendant of `base` exactly when its depth exceeds `base`'s and
-/// `ancestors[depth(base)]` is `base` (an O(1) lookup, no chain walk). This
-/// backs the subtype-aware `AnyCompatible` check for object refs, so a base ref
-/// (e.g. a generic [`ObjectRef`]) accepts any of its descendant object types,
-/// mirroring C++ `IsInstance` / Python `isinstance`.
+/// Ports C++ `RuntimeTypeIndexMatch` (`include/tvm/ffi/object.h`): the common
+/// and non-object cases are answered with cheap integer comparisons *before* any
+/// type-info lookup, so only two registered object indices ever reach
+/// `TVMFFIGetTypeInfo`. The tail then uses the runtime ancestor table -- single
+/// inheritance means the object is a descendant of `base` exactly when its depth
+/// exceeds `base`'s and `ancestors[depth(base)]` is `base` (an O(1) lookup, no
+/// chain walk). This backs the subtype-aware `AnyCompatible` check for object
+/// refs, so a base ref (e.g. a generic [`ObjectRef`]) accepts any of its
+/// descendant object types, mirroring C++ `IsInstance` / Python `isinstance`.
 ///
 /// # Safety
-/// The indices are read through `TVMFFIGetTypeInfo`; unregistered indices make
-/// the function return `false` rather than misbehave.
+/// `TVMFFIGetTypeInfo` *aborts the process* (it never returns null) on an
+/// unregistered index, so it must never be reached with a non-object index. The
+/// pre-filters below guarantee that: a non-object index (`< kTVMFFIStaticObjectBegin`:
+/// a POD, small str/bytes, or a reserved gap) and the generic-`Object` target
+/// are resolved by integer comparison alone, matching C++. Reaching the lookup
+/// with an unregistered *object-range* index (only possible from a corrupt or
+/// foreign `Any`) aborts, exactly as the C++ path does.
 #[inline]
 pub unsafe fn type_index_is_instance(obj_type_index: i32, base_type_index: i32) -> bool {
+    // Identical type: always a match (also the only way a non-object matches).
     if obj_type_index == base_type_index {
         return true;
     }
+    // Every object is-a generic `Object` (`kTVMFFIObject == kTVMFFIStaticObjectBegin`).
+    if base_type_index == TypeIndex::kTVMFFIStaticObjectBegin as i32 {
+        return obj_type_index >= TypeIndex::kTVMFFIStaticObjectBegin as i32;
+    }
+    // A non-object index (either side) can only match through the exact equality
+    // handled above; short-circuit here so the abort-prone `TVMFFIGetTypeInfo` is
+    // never called on a POD / reserved-gap / out-of-range index.
+    if obj_type_index < TypeIndex::kTVMFFIStaticObjectBegin as i32
+        || base_type_index < TypeIndex::kTVMFFIStaticObjectBegin as i32
+    {
+        return false;
+    }
+    // Invariant: a parent's type index is always smaller than its descendant's.
+    if obj_type_index < base_type_index {
+        return false;
+    }
     unsafe {
+        // Both indices are registered object types now, so the lookups succeed.
         let info = TVMFFIGetTypeInfo(obj_type_index);
         let base_info = TVMFFIGetTypeInfo(base_type_index);
-        if info.is_null() || base_info.is_null() {
-            return false;
-        }
         let base_depth = (*base_info).type_depth;
         // A descendant is strictly deeper than its ancestor.
         if (*info).type_depth <= base_depth {
