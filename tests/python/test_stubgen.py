@@ -1606,6 +1606,80 @@ def test_rust_unmapped_ffi_key_keeps_crate_path() -> None:
     assert RustUse("tvm_ffi::Opaque") in imports.items
 
 
+def test_rust_keyword_field_raw_ident_all_positions() -> None:
+    # `tirx.TensorIntrin` has a field literally named `impl` (F2): every CODE
+    # position must escape to the raw identifier `r#impl` -- struct field,
+    # builder store, setter fn/param/assign, ffi_new literal, unwrap `let`,
+    # and the build literal -- while MESSAGE text keeps the original name.
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("desc", TypeSchema("int")),
+            NamedTypeSchema("impl", TypeSchema("int")),
+            NamedTypeSchema("type", TypeSchema("int"), default=7),
+        ],
+        methods=[],
+        type_key="tirx.TensorIntrin",
+        parent_type_key="ffi.Object",
+        has_init=True,
+    )
+    text, _ = _gen_rust_object(info)
+    # struct field
+    assert "    pub r#impl: i64," in text
+    assert "    pub r#type: i64," in text
+    # builder store (required -> Option<T>, defaulted -> bare)
+    assert "    r#impl: Option<i64>," in text
+    assert "    r#type: i64," in text
+    # setter: fn name, param, assignment
+    assert "pub fn r#impl(mut self, r#impl: i64) -> Self {" in text
+    assert "    self.r#impl = Some(r#impl);" in text
+    assert "    self.r#type = r#type;" in text
+    # ffi_new literal (unset / prefilled default)
+    assert "        r#impl: None," in text
+    assert "        r#type: 7," in text
+    # unwrap `let` escapes the ident; the error message keeps the C++ name
+    assert "let r#impl = self.r#impl.ok_or_else" in text
+    assert '"field `impl` is not set"' in text
+    # build literal: unwrapped local shorthand / defaulted move
+    assert "    r#impl," in text
+    assert "    r#type: self.r#type," in text
+    # the plain sibling stays unescaped
+    assert "    pub desc: i64," in text
+
+
+def test_rust_keyword_method_raw_ident_keeps_ffi_name() -> None:
+    # A reflected method named `match`: the Rust `fn` ident is escaped, the
+    # FFI lookup string keeps the reflected spelling.
+    info = ObjectInfo(
+        fields=[],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema("match", TypeSchema("Callable", (TypeSchema("int"),))),
+                is_member=False,
+            )
+        ],
+        type_key="tirx.TensorIntrin",
+        parent_type_key="ffi.Object",
+        has_init=False,
+    )
+    text, _ = _gen_rust_object(info)
+    assert "pub fn r#match() -> Result<i64> {" in text
+    assert '"match")?;' in text  # from_type_method_cached(.., "match")
+
+
+def test_rust_non_raw_ident_field_skips() -> None:
+    # `self`/`crate`/`super`/`Self` cannot be identifiers even raw: loud skip.
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("self", TypeSchema("int"))],
+        methods=[],
+        type_key="tirx.Bad",
+        parent_type_key="ffi.Object",
+        has_init=False,
+    )
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _gen_rust_object(info)
+    assert exc.value.origin == "self"
+
+
 def test_rust_cross_module_ref_in_container_and_method() -> None:
     # Every position funnels through `_ty_render`: a container element and a
     # method return of a cross-module key record the same rooted import.

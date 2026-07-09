@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Callable
 
 from ..utils import UnsupportedTypeError
 from . import consts as C
-from .consts import RUST_UNSUPPORTED_ORIGINS
+from .consts import RUST_KEYWORDS, RUST_NON_RAW_IDENTS, RUST_UNSUPPORTED_ORIGINS
 
 if TYPE_CHECKING:
     from tvm_ffi.core import TypeSchema
@@ -96,6 +96,26 @@ class RustImports:
             )
         self.items.append(probe)
         return probe.leaf
+
+
+def _escape_ident(name: str) -> str:
+    """Escape a reflected field/method name into a valid Rust identifier.
+
+    A Rust-keyword name (``impl``, ``type``, ``match``, ...) becomes the raw
+    identifier ``r#<name>``, valid in every code position the generator emits
+    (struct fields, builder fields, setters, ``let`` bindings, literals, ``fn``
+    names). The few names rustc rejects even raw (``crate``/``self``/``Self``/
+    ``super``/``_``) have no rendering: raise, skipping the object loudly.
+    Message strings and FFI lookup names keep the original spelling -- escape
+    only at code positions.
+    """
+    if name in RUST_NON_RAW_IDENTS:
+        raise UnsupportedTypeError(
+            name, f"name {name!r} cannot be a Rust identifier (not even raw: `r#{name}`)"
+        )
+    if name in RUST_KEYWORDS:
+        return f"r#{name}"
+    return name
 
 
 def _element_rust_type(elem: TypeSchema, ty_render: Callable[[str], str]) -> str:

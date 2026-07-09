@@ -36,6 +36,7 @@ from .utils import (
     UnsupportedTypeError,
     _deref_impl,
     _element_rust_type,
+    _escape_ident,
     _packed_args_expr,
     _packed_call_lines,
     render_rust_type,
@@ -334,7 +335,8 @@ class _ObjectRenderer:
             f"    base: {base_type},",
         ]
         for field in _layout_fields(self.info.fields):
-            lines.append(f"    pub {field.name}: {self.render_struct_field(field)},")
+            name = _escape_ident(field.name)
+            lines.append(f"    pub {name}: {self.render_struct_field(field)},")
         lines += ["}", ""]
 
         lines += [
@@ -462,10 +464,11 @@ class _ObjectRenderer:
         lines = [f"{self.obj_struct} {{", base_entry]
         # Entries bind by name; memory order just mirrors the struct definition.
         for field in _layout_fields(self.info.fields):
+            name = _escape_ident(field.name)
             if field.default is MISSING:
-                lines.append(f"    {field.name},")  # the unwrapped local
+                lines.append(f"    {name},")  # the unwrapped local
             else:
-                lines.append(f"    {field.name}: self.{field.name},")
+                lines.append(f"    {name}: self.{name},")
         lines.append("}")
         return lines
 
@@ -493,8 +496,11 @@ class _ObjectRenderer:
 
     def _unwrap_lines(self) -> list[str]:
         """``let <f> = self.<f>.ok_or_else(..)?;`` for every field without a default."""
+        # Code positions escape keyword names; the error message keeps the
+        # original spelling (it names the reflected field, not the Rust ident).
         return [
-            f"let {field.name} = self.{field.name}.ok_or_else(|| tvm_ffi::Error::new("
+            f"let {_escape_ident(field.name)} = self.{_escape_ident(field.name)}"
+            ".ok_or_else(|| tvm_ffi::Error::new("
             f'tvm_ffi::VALUE_ERROR, "field `{field.name}` is not set", ""))?;'
             for field in _layout_fields(self.info.fields)
             if field.default is MISSING
@@ -519,11 +525,12 @@ class _ObjectRenderer:
         else:
             lines.append("        base: None,")
         for field in _layout_fields(self.info.fields):
+            name = _escape_ident(field.name)
             if field.default is MISSING:
-                lines.append(f"        {field.name}: None,")
+                lines.append(f"        {name}: None,")
             else:
                 # `_native_blocker` already guaranteed the default renders.
-                lines.append(f"        {field.name}: {_default_expr(field)},")
+                lines.append(f"        {name}: {_default_expr(field)},")
         lines += ["    }", "}"]
         return lines
 
@@ -546,7 +553,7 @@ class _ObjectRenderer:
         for field in fields:
             ty = self.render_struct_field(field)
             store = ty if field.default is not MISSING else f"Option<{ty}>"
-            lines.append(f"    {field.name}: {store},")
+            lines.append(f"    {_escape_ident(field.name)}: {store},")
         lines += ["}", ""]
 
         inner: list[str] = []
@@ -560,10 +567,11 @@ class _ObjectRenderer:
             ]
         for field in fields:
             ty = self.render_struct_field(field)
-            value = field.name if field.default is not MISSING else f"Some({field.name})"
+            name = _escape_ident(field.name)
+            value = name if field.default is not MISSING else f"Some({name})"
             inner += [
-                f"pub fn {field.name}(mut self, {field.name}: {ty}) -> Self {{",
-                f"    self.{field.name} = {value};",
+                f"pub fn {name}(mut self, {name}: {ty}) -> Self {{",
+                f"    self.{name} = {value};",
                 "    self",
                 "}",
                 "",
@@ -625,8 +633,11 @@ class _ObjectRenderer:
         if method.is_member or params:
             self.imports.record("tvm_ffi::AnyView")
         packed = _packed_args_expr(params, method.is_member)
+        # The FFI lookup string keeps the reflected name; only the Rust `fn`
+        # identifier is keyword-escaped.
         getter = self._cached_getter_lines("f", ffi_name)
-        header = f"pub fn {ffi_name}({', '.join(sig_parts)}) -> Result<{ret}> {{"
+        fn_name = _escape_ident(ffi_name)
+        header = f"pub fn {fn_name}({', '.join(sig_parts)}) -> Result<{ret}> {{"
         return [header, *_packed_call_lines("f", getter, packed, ret), "}"]
 
 

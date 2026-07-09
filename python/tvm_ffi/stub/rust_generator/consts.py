@@ -85,3 +85,20 @@ RUST_OPTIONAL_FIELD_SIZE = 16
 RUST_MOD_MAP = {
     "ffi": "tvm_ffi",
 }
+
+#: Rust keywords (strict + reserved, all editions): a reflected field/method
+#: named after one must be emitted as the raw identifier ``r#<name>`` in every
+#: code position (struct field, builder, setter, `let`, literals, `fn` names);
+#: message/FFI-name strings keep the original spelling.
+RUST_KEYWORDS = frozenset(
+    # strict
+    "as break const continue crate dyn else enum extern false fn for if impl in let loop "
+    "match mod move mut pub ref return self Self static struct super trait true type unsafe "
+    "use where while async await "
+    # reserved
+    "abstract become box do final gen macro override priv try typeof unsized virtual yield".split()
+)
+
+#: Names that cannot be identifiers at all -- raw or otherwise (``r#self`` etc.
+#: are rejected by rustc): a field so named has no rendering, skip loudly.
+RUST_NON_RAW_IDENTS = frozenset({"crate", "self", "Self", "super", "_"})
