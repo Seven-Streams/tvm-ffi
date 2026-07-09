@@ -120,8 +120,9 @@ def _native_blocker(info: ObjectInfo) -> str | None:
     The native builder allocates the struct directly, binding every own
     field from its setter or a stubgen-rendered default and silently
     bypassing any C++ constructor logic -- that is the opted-in behavior, so
-    native is used whenever possible. There is no FFI fallback: a blocked
-    type gets no generated constructor at all (the user hand-writes one).
+    native is used whenever possible. A layout-padded type (hidden C++ state
+    the literal cannot fill) gets the FFI constructor instead (F6); other
+    blocked types get no generated constructor (the user hand-writes one).
     """
     if not info.has_init:
         return "the type has no reflected constructor"
@@ -130,6 +131,17 @@ def _native_blocker(info: ObjectInfo) -> str | None:
             return f"field {field.name!r} uses a default factory (FFI-only)"
         if field.default is not MISSING and _default_expr(field) is None:
             return f"the default value of field {field.name!r} has no Rust rendering"
+    try:
+        gap_blocker = (
+            "the C++ layout has non-reflected gaps (the mirror needs explicit padding)"
+            if any(pad for pad, _ in _padded_layout(_layout_fields(info.fields)))
+            else None
+        )
+    except UnsupportedTypeError:
+        # Also blocks CHILDREN of irreproducible parents via `_native_eligible`.
+        gap_blocker = "the C++ field offsets cannot be reproduced by #[repr(C)]"
+    if gap_blocker is not None:
+        return gap_blocker
     parent = info.parent_type_key
     if parent in (None, "ffi.Object") or _native_eligible(parent):
         return None
@@ -171,34 +183,41 @@ def _layout_fields(fields: list[NamedTypeSchema]) -> list[NamedTypeSchema]:
     return sorted(fields, key=lambda f: f.offset)
 
 
-def _warn_offset_mismatch(type_key: str | None, fields: list[NamedTypeSchema]) -> None:
-    """Warn when ``#[repr(C)]`` cannot reproduce the recorded field offsets.
+def _padded_layout(fields: list[NamedTypeSchema]) -> list[tuple[int, NamedTypeSchema]]:
+    """Explicit padding bytes to insert before each offset-sorted field.
 
-    Recomputes each field's ``#[repr(C)]`` placement from the previous field's
-    end. Reflection has no ``alignof``, so alignment is approximated from
-    ``size`` (largest power of two, capped at 8) -- exact for scalars, but
-    composite FFI structs like ``DLDevice`` can trigger a false positive. A
-    mismatch only warns; the binding is still emitted. Fields without
-    offset/size metadata are skipped and reset the running position.
+    ``#[repr(C)]``'s natural alignment padding reproduces the C++ gap between
+    properly aligned fields on its own (alignment is approximated from ``size``
+    -- largest power of two, capped at 8 -- exact for scalars). Any gap BEYOND
+    that is non-reflected C++ state (a hidden member, e.g. ``ir.Op``'s):
+    those bytes become an explicit ``[u8; N]`` pad so every reflected field
+    sits at its recorded offset instead of silently misreading memory (F6).
+    A recorded offset the layout cannot reach even with padding (repr(C) is
+    already past it) raises: fail-closed skip, never a misaligned mirror.
+    Fields without offset/size metadata reset the check (synthetic infos).
     """
+    out: list[tuple[int, NamedTypeSchema]] = []
     prev_end: int | None = None
     for field in fields:
+        pad = 0
         if field.offset is None or field.size is None:
             prev_end = None
-            continue
-        if prev_end is not None:
-            align = min(8, field.size & -field.size)
-            placed = (prev_end + align - 1) // align * align
-            if placed != field.offset:
-                print(
-                    f"{C.TERM_YELLOW}[Warning] object {type_key}: field "
-                    f"{field.name!r} is at C++ offset {field.offset}, but the "
-                    f"generated #[repr(C)] layout places it at offset {placed}; "
-                    f"the Rust struct may not match the C++ object layout"
-                    f"{C.TERM_RESET}"
-                )
-        # Resync to the recorded offset so one hole yields one warning.
-        prev_end = field.offset + field.size
+        else:
+            if prev_end is not None:
+                if field.offset < prev_end:
+                    raise UnsupportedTypeError(
+                        field.name,
+                        f"field {field.name!r} is recorded at C++ offset {field.offset}, "
+                        f"but the #[repr(C)] layout is already at {prev_end}: no field "
+                        "ordering or padding can reproduce this layout",
+                    )
+                align = min(8, field.size & -field.size)
+                natural = (prev_end + align - 1) // align * align
+                if field.offset != natural and field.offset > prev_end:
+                    pad = field.offset - prev_end
+            prev_end = field.offset + field.size
+        out.append((pad, field))
+    return out
 
 
 @dataclasses.dataclass
@@ -225,6 +244,16 @@ class _ObjectRenderer:
     #: for derived types; unused for roots, whose ``base`` is the bare
     #: ``tvm_ffi::Object`` data struct with no generated ref).
     parent_ref: str = ""
+    #: Name of the synthesized parent-embed slot (struct field, builder store,
+    #: builder setter, locals). ``base`` normally; ``__base`` when a REFLECTED
+    #: field is itself named ``base`` (e.g. ``tirx.Ramp``'s base expression) --
+    #: E0124/E0592 otherwise. C++ reserves ``__``-prefixed identifiers, so no
+    #: reflected field can collide with the renamed slot.
+    base_slot: str = "base"
+    #: Whether the struct needed explicit ``[u8; N]`` padding (non-reflected
+    #: C++ state; see :func:`_padded_layout`). Set by :meth:`body`; routes
+    #: construction to the C++ ``__ffi_init__`` instead of the native builder.
+    has_hidden_gaps: bool = False
 
     def _ty_render(self, origin: str) -> str:
         """Resolve a leaf origin to its Rust name and record its ``use``.
@@ -346,6 +375,8 @@ class _ObjectRenderer:
             self.base_type = self.imports.record("tvm_ffi::Object")
         else:
             self._resolve_parent()
+        if any(field.name == "base" for field in self.info.fields):
+            self.base_slot = "__base"  # dodge the reflected `base` (E0124)
         # C++ `_type_mutable`: class-level mutability dominates per-field `def_ro`.
         if self.info.mutable:
             self.imports.record("std::ops::DerefMut")
@@ -357,9 +388,17 @@ class _ObjectRenderer:
             "#[derive(tvm_ffi::derive::Object)]",
             f'#[type_key = "{self.info.type_key}"]',
             f"pub struct {obj_struct} {{",
-            f"    base: {base_type},",
+            f"    {self.base_slot}: {base_type},",
         ]
-        for field in _layout_fields(self.info.fields):
+        layout = _padded_layout(_layout_fields(self.info.fields))  # raises: skip
+        self.has_hidden_gaps = any(pad for pad, _ in layout)
+        num_pads = 0
+        for pad, field in layout:
+            if pad:
+                # Non-reflected C++ state: hold its bytes so every reflected
+                # field below sits at its recorded offset.
+                lines.append(f"    _pad{num_pads}: [u8; {pad}],")
+                num_pads += 1
             name = _escape_ident(field.name)
             lines.append(f"    pub {name}: {self.render_struct_field(field)},")
         lines += ["}", ""]
@@ -375,20 +414,23 @@ class _ObjectRenderer:
 
         lines += _deref_impl(leaf, obj_struct, "data", self.info.mutable)
         if not self.is_root:
-            lines += _deref_impl(obj_struct, base_type, "base", self.info.mutable)
+            lines += _deref_impl(obj_struct, base_type, self.base_slot, self.info.mutable)
             lines += self._upcast_lines()
 
-        # Native (FFI-free) construction whenever the whole chain is eligible;
-        # there is no FFI fallback -- a blocked constructor is skipped loudly.
+        # Native (FFI-free) construction whenever the whole chain is eligible.
+        # A layout-padded type instead constructs through the C++ constructor
+        # (`__ffi_init__`): its padding is hidden C++ state a struct literal
+        # cannot fill (F6). Other blocked types are skipped loudly.
         blocker = _native_blocker(self.info)
         native = blocker is None
-        if self.info.has_init and not native:
+        ffi_ctor = not native and self.info.has_init and self.has_hidden_gaps
+        if self.info.has_init and not native and not ffi_ctor:
             print(
                 f"{C.TERM_YELLOW}[Warning] object {self.info.type_key}: skipping "
                 f"`ffi_new` because {blocker}; hand-write a constructor outside "
                 f"the generated markers{C.TERM_RESET}"
             )
-        lines += self._impl_block(native)
+        lines += self._impl_block(native, ffi_ctor)
         if native:
             lines += self._builder_lines()
 
@@ -429,7 +471,7 @@ class _ObjectRenderer:
             "}",
         ]
 
-    def _impl_block(self, native: bool) -> list[str]:
+    def _impl_block(self, native: bool, ffi_ctor: bool = False) -> list[str]:
         """Emit `impl <T> { same_as; downcast; ffi_new; methods }`."""
         methods = [
             m for m in self.info.methods if m.schema.name.rsplit(".", 1)[-1] != "__ffi_init__"
@@ -438,6 +480,8 @@ class _ObjectRenderer:
         sections: list[list[str]] = [self._ref_helper_lines()]
         if native:  # `native` implies `has_init` (see `_native_blocker`)
             sections.append(self._new_fn_native())
+        elif ffi_ctor:  # layout-padded: construct through the C++ `__ffi_init__`
+            sections.append(self._new_fn_ffi())
         sections += [self._method_fn(method) for method in methods]
 
         inner: list[str] = []
@@ -485,7 +529,8 @@ class _ObjectRenderer:
         like-named locals that :meth:`_unwrap_lines` just checked (on derived
         types ``base`` binds the local :meth:`_base_resolve_lines` produced).
         """
-        base_entry = "    base: self.base," if self.is_root else "    base,"
+        slot = self.base_slot
+        base_entry = f"    {slot}: self.{slot}," if self.is_root else f"    {slot},"
         lines = [f"{self.obj_struct} {{", base_entry]
         # Entries bind by name; memory order just mirrors the struct definition.
         for field in _layout_fields(self.info.fields):
@@ -507,12 +552,13 @@ class _ObjectRenderer:
         if self.is_root:
             return []
         parent_ref = self.parent_ref  # in scope via `_resolve_parent`
+        slot = self.base_slot  # the message names the slot the setter exposes
         return [
-            "let base = match self.base {",
-            "    Some(base) => base,",
+            f"let {slot} = match self.{slot} {{",
+            f"    Some({slot}) => {slot},",
             f"    None => {parent_ref}::ffi_new().build_obj().map_err(|e| tvm_ffi::Error::new(",
             "        tvm_ffi::VALUE_ERROR,",
-            f'        &format!("field `base` is not set and default `{parent_ref}` '
+            f'        &format!("field `{slot}` is not set and default `{parent_ref}` '
             'construction failed: {}", e.message()),',
             '        "",',
             "    ))?,",
@@ -531,6 +577,27 @@ class _ObjectRenderer:
             if field.default is MISSING
         ]
 
+    def _new_fn_ffi(self) -> list[str]:
+        """Emit ``fn ffi_new(<init args>) -> Result<T>`` through C++ ``__ffi_init__``.
+
+        Used for layout-padded types instead of the native builder: the padding
+        bytes are non-reflected C++ state a struct literal cannot fill, so only
+        the C++ constructor can produce a valid object. Parameters come from
+        the reflected init chain (``init_fields``, ancestors first) and the
+        packed call returns the fully constructed ref.
+        """
+        params = [
+            (_escape_ident(f.name), self.render_param(f.schema)) for f in self.info.init_fields
+        ]
+        self.imports.record("tvm_ffi::Result")
+        if params:
+            self.imports.record("tvm_ffi::AnyView")
+        packed = _packed_args_expr(params, False)
+        getter = self._cached_getter_lines("f", "__ffi_init__")
+        sig = ", ".join(f"{n}: {t}" for n, t in params)
+        header = f"pub fn ffi_new({sig}) -> Result<{self.leaf}> {{"
+        return [header, *_packed_call_lines("f", getter, packed, self.leaf), "}"]
+
     def _new_fn_native(self) -> list[str]:
         """Emit ``fn ffi_new() -> <T>Builder``, opening the builder chain.
 
@@ -546,9 +613,9 @@ class _ObjectRenderer:
         builder = f"{self.leaf}Builder"
         lines = [f"pub fn ffi_new() -> {builder} {{", f"    {builder} {{"]
         if self.is_root:
-            lines.append(f"        base: {self.base_type}::new(),")
+            lines.append(f"        {self.base_slot}: {self.base_type}::new(),")
         else:
-            lines.append("        base: None,")
+            lines.append(f"        {self.base_slot}: None,")
         for field in _layout_fields(self.info.fields):
             name = _escape_ident(field.name)
             if field.default is MISSING:
@@ -574,7 +641,7 @@ class _ObjectRenderer:
         builder = f"{self.leaf}Builder"
         fields = _layout_fields(self.info.fields)
         base_store = self.base_type if self.is_root else f"Option<{self.base_type}>"
-        lines = [f"pub struct {builder} {{", f"    base: {base_store},"]
+        lines = [f"pub struct {builder} {{", f"    {self.base_slot}: {base_store},"]
         for field in fields:
             ty = self.render_struct_field(field)
             store = ty if field.default is not MISSING else f"Option<{ty}>"
@@ -583,9 +650,10 @@ class _ObjectRenderer:
 
         inner: list[str] = []
         if not self.is_root:
+            slot = self.base_slot  # setter tracks the (possibly dodged) slot name
             inner += [
-                f"pub fn base(mut self, base: {self.base_type}) -> Self {{",
-                "    self.base = Some(base);",
+                f"pub fn {slot}(mut self, {slot}: {self.base_type}) -> Self {{",
+                f"    self.{slot} = Some({slot});",
                 "    self",
                 "}",
                 "",
@@ -699,8 +767,6 @@ def generate_rust_object(
     )
 
     body = renderer.body()
-
-    _warn_offset_mismatch(type_key, _layout_fields(obj_info.fields))
 
     indent = " " * code.indent
     code.lines = [

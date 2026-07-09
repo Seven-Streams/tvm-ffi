@@ -1343,24 +1343,21 @@ def test_rust_struct_fields_sorted_by_offset(capsys: pytest.CaptureFixture[str])
     assert "[Warning]" not in capsys.readouterr().out
 
 
-def test_rust_struct_offset_gap_warns(capsys: pytest.CaptureFixture[str]) -> None:
+def test_rust_struct_offset_gap_pads(capsys: pytest.CaptureFixture[str]) -> None:
+    # F6: the hole at 32..40 (as if an unregistered C++ member sat there) is
+    # held by explicit padding so `gamma` sits at its recorded offset 40 --
+    # never a silently misaligned mirror, and no warning chatter.
     text, _ = _gen_rust_object(_scrambled_layout_info(gap=True))
-    # The binding is still emitted (warning, not an error) ...
     assert "pub struct ScrambledObj {" in text
-    # ... but the unreproducible hole at 32..40 is reported: repr(C) places
-    # `gamma` right after `beta` (offset 32), reflection says 40.
-    out = capsys.readouterr().out
-    assert "[Warning] object cpp_rust_test.Scrambled" in out
-    assert "'gamma' is at C++ offset 40" in out
-    assert "places it at offset 32" in out
+    assert "    _pad0: [u8; 8]," in text
+    assert text.index("pub beta:") < text.index("_pad0") < text.index("pub gamma:")
+    assert "[Warning]" not in capsys.readouterr().out
 
 
-def test_rust_offset_check_resumes_after_unverifiable_field(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    # A field without size metadata is skipped (not an early bail-out): the field
-    # right after it has no known predecessor end, but checking resumes one field
-    # later -- the hole before `d` must still be reported.
+def test_rust_offset_padding_resumes_after_unverifiable_field() -> None:
+    # A field without size metadata resets the check (not an early bail-out):
+    # the field right after it has no known predecessor end, but padding
+    # resumes one field later -- the hole before `d` is still held.
     info = ObjectInfo(
         fields=[
             NamedTypeSchema("a", TypeSchema("int"), size=4, offset=16),
@@ -1372,10 +1369,91 @@ def test_rust_offset_check_resumes_after_unverifiable_field(
         type_key="cpp_rust_test.Holey",
         parent_type_key="ffi.Object",
     )
-    _gen_rust_object(info)
-    out = capsys.readouterr().out
-    assert "'d' is at C++ offset 48" in out
-    assert "places it at offset 28" in out
+    text, _ = _gen_rust_object(info)
+    assert "    _pad0: [u8; 20]," in text  # 28..48 held explicitly
+    assert text.index("pub c:") < text.index("_pad0") < text.index("pub d:")
+
+
+def test_rust_offset_overlap_skips_fail_closed() -> None:
+    # An offset repr(C) is already past cannot be padded to: fail-closed skip,
+    # never a mirror that reads the wrong bytes.
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("a", TypeSchema("int"), size=8, offset=24),
+            NamedTypeSchema("b", TypeSchema("int"), size=4, offset=28),  # inside `a`
+        ],
+        methods=[],
+        type_key="cpp_rust_test.Overlap",
+        parent_type_key="ffi.Object",
+    )
+    with pytest.raises(UnsupportedTypeError) as exc:
+        _gen_rust_object(info)
+    assert exc.value.origin == "b"
+
+
+def test_rust_padded_type_gets_ffi_ctor_not_builder(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # F6: a padded type's hidden bytes are C++ state a struct literal cannot
+    # fill -- the native builder is replaced by an FFI constructor calling the
+    # C++ `__ffi_init__` (params from the reflected init chain), silently (no
+    # skip warning: construction IS provided).
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("op_type", TypeSchema("int"), size=4, offset=24),
+            NamedTypeSchema("num_inputs", TypeSchema("int"), size=4, offset=32),  # gap 28..32
+        ],
+        methods=[],
+        type_key="ir.Op",
+        parent_type_key="ffi.Object",
+        init_fields=[
+            InitFieldInfo("op_type", NamedTypeSchema("op_type", TypeSchema("int")), False, False),
+            InitFieldInfo(
+                "num_inputs", NamedTypeSchema("num_inputs", TypeSchema("int")), False, False
+            ),
+        ],
+        has_init=True,
+    )
+    text, _ = _gen_rust_object(info)
+    assert "    _pad0: [u8; 4]," in text
+    # FFI ctor, not the builder:
+    assert "pub fn ffi_new(op_type: i64, num_inputs: i64) -> Result<Op> {" in text
+    assert 'OpObj::type_index(), "__ffi_init__")?;' in text
+    assert (
+        "Ok(f.call_packed(&[AnyView::from(&op_type), AnyView::from(&num_inputs)])?"
+        ".try_into()?)" in text
+    )
+    assert "OpBuilder" not in text
+    assert "[Warning]" not in capsys.readouterr().out
+
+
+def test_rust_padded_parent_blocks_child_native(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A clean-layout child of a padded parent cannot use the native chain (the
+    # parent's builder does not exist); it is skipped with the parent blocker
+    # (an FFI ctor for such children is F7 territory).
+    padded_parent = ObjectInfo(
+        fields=[
+            NamedTypeSchema("x", TypeSchema("int"), size=4, offset=24),
+            NamedTypeSchema("y", TypeSchema("int"), size=4, offset=32),
+        ],
+        methods=[],
+        type_key="ir.Op",
+        parent_type_key="ffi.Object",
+        has_init=True,
+    )
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: padded_parent)
+    child = ObjectInfo(
+        fields=[NamedTypeSchema("z", TypeSchema("int"))],
+        methods=[],
+        type_key="ir.SpecialOp",
+        parent_type_key="ir.Op",
+        has_init=True,
+    )
+    text, _ = _gen_rust_object(child)
+    assert "ffi_new" not in text
+    assert "not natively constructible" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("init_arity", [2, 1])
@@ -1604,6 +1682,82 @@ def test_rust_unmapped_ffi_key_keeps_crate_path() -> None:
     text, imports = _gen_rust_object(_f1_info("tirx.Ramp", "ffi.Opaque"))
     assert "    pub x: Opaque," in text
     assert RustUse("tvm_ffi::Opaque") in imports.items
+
+
+def test_rust_reflected_base_field_renames_parent_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # F5: `tirx.Ramp` has a reflected field literally named `base` -- the
+    # synthesized parent-embed slot must dodge it (E0124), renaming itself
+    # (and its Deref body, builder store/setter, resolve local) to `__base`;
+    # C++ reserves `__`-prefixed identifiers, so the dodge cannot re-collide.
+    # The REFLECTED `base` keeps its natural name everywhere.
+    expr_info = ObjectInfo(
+        fields=[],
+        methods=[],
+        type_key="tirx.Expr",
+        parent_type_key="ffi.Object",
+        has_init=True,
+    )
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: expr_info)
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("base", TypeSchema("tirx.Expr")),
+            NamedTypeSchema("lanes", TypeSchema("int")),
+        ],
+        methods=[],
+        type_key="tirx.Ramp",
+        parent_type_key="tirx.Expr",
+        has_init=True,
+    )
+    text, _ = _gen_rust_object(info)
+    # struct: dodged slot + reflected field coexist
+    assert "    __base: ExprObj," in text
+    assert "    pub base: Expr," in text
+    # Deref to the parent goes through the dodged slot
+    assert "        &self.__base" in text
+    # builder: dodged store + setter; reflected `base` keeps its own setter
+    assert "    __base: Option<ExprObj>," in text
+    assert "pub fn __base(mut self, __base: ExprObj) -> Self {" in text
+    assert "pub fn base(mut self, base: Expr) -> Self {" in text
+    # ffi_new / resolve / build literal all track the slot
+    assert "        __base: None," in text
+    assert "let __base = match self.__base {" in text
+    assert '"field `__base` is not set and default `Expr` construction failed: {}"' in text
+    assert "    __base," in text
+    # the reflected field's unwrap keeps its natural name and message
+    assert "let base = self.base.ok_or_else" in text
+    assert '"field `base` is not set"' in text
+
+
+def test_rust_root_reflected_base_field_renames_slot() -> None:
+    # Root objects embed the bare crate `Object`; the slot dodge applies too.
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("base", TypeSchema("int"))],
+        methods=[],
+        type_key="tirx.Load",
+        parent_type_key="ffi.Object",
+        has_init=True,
+    )
+    text, _ = _gen_rust_object(info)
+    assert "    __base: Object," in text
+    assert "    pub base: i64," in text
+    assert "        __base: Object::new()," in text
+    assert "    __base: self.__base," in text  # root build literal moves the slot
+
+
+def test_rust_no_base_field_keeps_plain_slot() -> None:
+    # Without a reflected `base`, the slot keeps its plain name (API stability).
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("x", TypeSchema("int"))],
+        methods=[],
+        type_key="tirx.Plain",
+        parent_type_key="ffi.Object",
+        has_init=True,
+    )
+    text, _ = _gen_rust_object(info)
+    assert "    base: Object," in text
+    assert "__base" not in text
 
 
 def test_rust_default_literal_kind_follows_field_origin() -> None:
