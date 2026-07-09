@@ -215,24 +215,52 @@ class _ObjectRenderer:
     is_root: bool
     imports: RustImports
     ty_map: dict[str, str]
+    #: Module segments of the file this object lands in (its type key minus the
+    #: leaf; ``tirx.transform.X`` -> ``("tirx", "transform")``): one file per
+    #: prefix, mounted at ``<out>/<seg>/.../mod.rs`` (see ``cli`` and
+    #: :func:`finalize_rust_module_tree`).
+    mod_segments: tuple[str, ...]
 
     def _ty_render(self, origin: str) -> str:
         """Resolve a leaf origin to its Rust name and record its ``use``.
 
-        Unmapped dotted names (object type keys, ``pkg.Type`` -> ``pkg::Type``)
-        pass through. An unmapped bare origin (e.g. ``const char*``) or a
-        ``ctypes.*`` sentinel (``ctypes.c_void_p`` -- ``void*`` -- is dotted but
-        is not an object key and has no Rust rendering) raises, skipping the
-        enclosing object. Rejecting here covers every position uniformly (field,
-        container element, method arg/return), so no separate element blocklist
-        is needed.
+        Unmapped dotted names (object type keys) resolve against the generated
+        module tree via :meth:`_generated_type_path`. An unmapped bare origin
+        (e.g. ``const char*``) or a ``ctypes.*`` sentinel (``ctypes.c_void_p``
+        -- ``void*`` -- is dotted but is not an object key and has no Rust
+        rendering) raises, skipping the enclosing object. Rejecting here covers
+        every position uniformly (field, container element, method arg/return),
+        so no separate element blocklist is needed.
         """
         mapped = self.ty_map.get(origin)
         if mapped is None:
             if "." not in origin or origin.startswith("ctypes."):
                 raise UnsupportedTypeError(origin)
-            mapped = origin
+            mapped = self._generated_type_path(origin)
         return self.imports.record(mapped)
+
+    def _generated_type_path(self, type_key: str) -> str:
+        """Resolve a generated-tree type key to a path valid from this file.
+
+        A bare ``use ir::Expr;`` is broken in edition 2021 (it resolves to an
+        extern crate ``ir``, or silently captures an equally-named *submodule*),
+        so cross-module references must anchor at the shared generated root:
+        ``super::`` once per segment of this file's own module path, then the
+        referenced key's full path (``super::ir::Expr`` from ``tirx/mod.rs``,
+        ``super::super::ir::Expr`` from ``tirx/transform/mod.rs``). A key in
+        *this* file's module is a local item: bare leaf, no ``use``. A head
+        with a :data:`~.consts.RUST_MOD_MAP` rewrite (builtin ``ffi.*`` keys)
+        lives in the crate, not the generated tree, and passes through for
+        :class:`~.utils.RustUse` to rewrite.
+        """
+        head, _, _ = type_key.partition(".")
+        if head in C_RUST.RUST_MOD_MAP:
+            return type_key
+        mod, _, type_leaf = type_key.rpartition(".")
+        if tuple(mod.split(".")) == self.mod_segments:
+            return type_leaf
+        supers = "super::" * len(self.mod_segments)
+        return f"{supers or 'self::'}{type_key.replace('.', '::')}"
 
     def render_struct_field(self, schema: NamedTypeSchema) -> str:
         """Render a directly-laid-out struct field type, width-correct for scalars.
@@ -638,6 +666,7 @@ def generate_rust_object(
         is_root=is_root,
         imports=imports,
         ty_map=ty_map,
+        mod_segments=tuple(type_key.split(".")[:-1]),
     )
 
     body = renderer.body()

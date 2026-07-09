@@ -1446,11 +1446,19 @@ def _optional_field_info(fields: list[NamedTypeSchema], *, has_init: bool = True
         pytest.param(
             TypeSchema("dtype"), "Optional<DLDataType>", "tvm_ffi::DLDataType", id="dtype"
         ),
+        # `cpp_rust_test.Point` shares the holder's module: a local name, no `use`.
         pytest.param(
             TypeSchema("cpp_rust_test.Point"),
             "Optional<Point>",
-            "cpp_rust_test::Point",
+            None,
             id="objref",
+        ),
+        # A cross-module payload anchors at the generated root (F1).
+        pytest.param(
+            TypeSchema("other.Point"),
+            "Optional<Point>",
+            "super::other::Point",
+            id="objref-cross-module",
         ),
         pytest.param(
             TypeSchema("Object"),
@@ -1525,6 +1533,98 @@ def test_rust_void_ptr_unsupported(schema: TypeSchema) -> None:
     with pytest.raises(UnsupportedTypeError) as exc:
         _gen_rust_object(_optional_field_info([field], has_init=False))
     assert exc.value.origin == "ctypes.c_void_p"
+
+
+def _f1_info(own_key: str, ref_key: str) -> ObjectInfo:
+    """Build an object `own_key` with one field of type `ref_key` (for path tests)."""
+    return ObjectInfo(
+        fields=[NamedTypeSchema("x", TypeSchema(ref_key))],
+        methods=[],
+        type_key=own_key,
+        parent_type_key="ffi.Object",
+        has_init=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("own_key", "ref_key", "expected_use"),
+    [
+        # A bare `use ir::Expr;` in edition 2021 resolves to an extern crate
+        # `ir` (E0432): cross-module references must anchor at the shared
+        # generated root -- one `super::` per segment of this file's module.
+        pytest.param("tirx.Ramp", "ir.Expr", "super::ir::Expr", id="sibling-module"),
+        # A sibling prefix whose name also exists as a *submodule* of this
+        # module (`tirx::transform`) must not be captured by a bare path: the
+        # `super::` anchor resolves to the top-level `transform` module.
+        pytest.param(
+            "tirx.Ramp",
+            "transform.PassInfo",
+            "super::transform::PassInfo",
+            id="sibling-name-capture",
+        ),
+        # Nested module: one `super::` per segment (`tirx/transform/mod.rs` -> 2).
+        pytest.param(
+            "tirx.transform.UnrollConfig",
+            "ir.Expr",
+            "super::super::ir::Expr",
+            id="nested-two-supers",
+        ),
+        # Up-tree reference from a nested module: uniform root-anchored path.
+        pytest.param(
+            "tirx.transform.UnrollConfig",
+            "tirx.Ramp",
+            "super::super::tirx::Ramp",
+            id="up-tree-ref",
+        ),
+        # A dotless own key lands in the generated root itself: `self::` (a
+        # bare `use ir::…` would not see the sibling submodule in 2021).
+        pytest.param("Rootless", "ir.Expr", "self::ir::Expr", id="root-file-self"),
+    ],
+)
+def test_rust_cross_module_ref_uses_rooted_path(
+    own_key: str, ref_key: str, expected_use: str
+) -> None:
+    text, imports = _gen_rust_object(_f1_info(own_key, ref_key))
+    ref_leaf = ref_key.rsplit(".", 1)[-1]
+    assert f"    pub x: {ref_leaf}," in text
+    assert RustUse(expected_use) in imports.items
+
+
+def test_rust_same_module_ref_is_local() -> None:
+    # `tirx.Stmt` lands in the same file as `tirx.Ramp` (one file per prefix):
+    # a local item -- bare leaf, no `use` recorded at all.
+    text, imports = _gen_rust_object(_f1_info("tirx.Ramp", "tirx.Stmt"))
+    assert "    pub x: Stmt," in text
+    assert all(u.leaf != "Stmt" for u in imports.items)
+
+
+def test_rust_unmapped_ffi_key_keeps_crate_path() -> None:
+    # An `ffi.*` key outside the ty_map lives in the crate (RUST_MOD_MAP head
+    # rewrite), not the generated tree: never `super::`-anchored.
+    text, imports = _gen_rust_object(_f1_info("tirx.Ramp", "ffi.Opaque"))
+    assert "    pub x: Opaque," in text
+    assert RustUse("tvm_ffi::Opaque") in imports.items
+
+
+def test_rust_cross_module_ref_in_container_and_method() -> None:
+    # Every position funnels through `_ty_render`: a container element and a
+    # method return of a cross-module key record the same rooted import.
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("kids", TypeSchema("Array", (TypeSchema("ir.Expr"),)))],
+        methods=[
+            FuncInfo(
+                NamedTypeSchema("make", TypeSchema("Callable", (TypeSchema("ir.Expr"),))),
+                is_member=False,
+            )
+        ],
+        type_key="tirx.Ramp",
+        parent_type_key="ffi.Object",
+        has_init=False,
+    )
+    text, imports = _gen_rust_object(info)
+    assert "    pub kids: Array<Expr>," in text
+    assert "pub fn make() -> Result<Expr> {" in text
+    assert RustUse("super::ir::Expr") in imports.items
 
 
 @pytest.mark.parametrize(
@@ -1894,8 +1994,11 @@ def test_rust_object_unsupported_raises() -> None:
 def test_rust_stage3_skipped_type_not_counted_as_defined(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A skipped object must not enter `defined_types`: another object referencing
-    # it keeps its `use` in the import section (previously dropped -> E0412).
+    # A skipped object must not poison its siblings: another object in the same
+    # file that references it still renders, with the reference as a bare local
+    # name (same-module refs record no `use` -- one file per prefix). The name
+    # dangles until the skip becomes transitive (F9), but no bogus import is
+    # emitted for it.
     rs = tmp_path / "demo.rs"
     rs.write_text(
         "\n".join(
@@ -1936,7 +2039,7 @@ def test_rust_stage3_skipped_type_not_counted_as_defined(
     assert "[Skipped] object demo.HasMap" in capsys.readouterr().out
     assert "struct HasMapObj" not in text  # skipped block reset to bare markers
     assert "    pub child: HasMap," in text  # the referencing object still renders
-    assert "use demo::HasMap;" in text  # ... and keeps its import
+    assert "use demo::HasMap;" not in text  # local ref: no `use` recorded at all
 
 
 def test_rust_bytes_field_maps_to_crate_bytes() -> None:
