@@ -68,21 +68,6 @@ def _rust_string_literal(s: str) -> str:
     return "".join(out)
 
 
-def _scalar_literal(value: object) -> str | None:
-    """Render a ``bool``/``int``/finite ``float`` value as a Rust literal (``None``: can't).
-
-    The literal coerces to the field's possibly narrowed scalar type in the
-    struct-literal position.
-    """
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return repr(value)
-    if isinstance(value, float):
-        return repr(value) if math.isfinite(value) else None
-    return None
-
-
 def _optional_default_expr(field: NamedTypeSchema) -> str | None:
     """Render an ``Optional`` field's ``nullopt`` default as the mirror's disengaged state.
 
@@ -99,17 +84,32 @@ def _optional_default_expr(field: NamedTypeSchema) -> str | None:
 def _default_expr(field: NamedTypeSchema) -> str | None:
     """Render ``field``'s registered default as a Rust expression (``None``: can't).
 
-    Supported: ``bool``/``int``/finite ``float`` literals, ``str`` (as
-    ``tvm_ffi::String``), and the ``nullopt`` default of ``Optional`` fields.
-    Anything else has no native materialization.
+    The field's schema ORIGIN -- the same thing that drives the rendered field
+    type -- drives the literal kind, so the two can never disagree: a reflected
+    ``True`` default on an int-typed field renders ``1`` (not ``true``, which
+    would be an ``expected i32, found bool`` mismatch -- Python ``bool`` is an
+    ``int`` subclass and C++ configs register bool-valued defaults on integer
+    fields), an integral default on a float field renders ``1.0``, and a value
+    whose kind cannot coerce to the field's -- or any default on a non-scalar,
+    non-``str``/``Optional`` field -- has no rendering (``ffi_new`` is then
+    skipped loudly).
     """
+    value = field.default
     if field.origin == "Optional":
         return _optional_default_expr(field)
-    value = field.default
-    literal = _scalar_literal(value)
-    if literal is not None:
-        return literal
-    if isinstance(value, str):
+    if field.origin == "bool":
+        # Accept the 0/1 integers as bools; any other int is not coercible.
+        ok = isinstance(value, bool) or (isinstance(value, int) and value in (0, 1))
+        return ("true" if value else "false") if ok else None
+    if field.origin == "int":
+        # `bool` is an `int` subclass: `int(True)` -> `1`, the field's kind.
+        return repr(int(value)) if isinstance(value, int) else None
+    if field.origin == "float":
+        # `1.0` / `1e+30`: valid Rust float literals for any rendered width.
+        ok = isinstance(value, (bool, int, float)) and math.isfinite(value)
+        return repr(float(value)) if ok else None
+    # Both origins render `tvm_ffi::String` (see RUST_TY_MAP_DEFAULTS).
+    if field.origin in ("str", "ffi.String") and isinstance(value, str):
         return f"tvm_ffi::String::from({_rust_string_literal(value)})"
     return None
 

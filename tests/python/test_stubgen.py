@@ -1606,6 +1606,59 @@ def test_rust_unmapped_ffi_key_keeps_crate_path() -> None:
     assert RustUse("tvm_ffi::Opaque") in imports.items
 
 
+def test_rust_default_literal_kind_follows_field_origin() -> None:
+    # F4: the schema origin drives BOTH the field type and the default literal
+    # kind, so they can never disagree. The tirx UnrollConfig shape: an int32
+    # field whose reflected default is Python `True` (bool is an int subclass)
+    # must prefill `1`, not `true` (E0308). Symmetrically an integral default
+    # on a float field renders `1.0`, and 0/1 ints on a bool field render
+    # `false`/`true`.
+    info = ObjectInfo(
+        fields=[
+            NamedTypeSchema("explicit_unroll", TypeSchema("int"), size=4, default=True),
+            NamedTypeSchema("flag", TypeSchema("bool"), default=True),
+            NamedTypeSchema("bit", TypeSchema("bool"), default=1),
+            NamedTypeSchema("ratio", TypeSchema("float"), default=1),
+            NamedTypeSchema("count", TypeSchema("int"), default=7),
+        ],
+        methods=[],
+        type_key="tirx.transform.UnrollConfig",
+        parent_type_key="ffi.Object",
+        has_init=True,
+    )
+    text, _ = _gen_rust_object(info)
+    assert "    pub explicit_unroll: i32," in text  # size-narrowed int field ...
+    assert "        explicit_unroll: 1," in text  # ... bool default coerces to its kind
+    assert "    pub flag: bool," in text
+    assert "        flag: true," in text
+    assert "        bit: true," in text  # 0/1 int on a bool field
+    assert "    pub ratio: f64," in text
+    assert "        ratio: 1.0," in text  # integral default on a float field
+    assert "        count: 7," in text
+
+
+def test_rust_uncoercible_default_kind_skips_ffi_new() -> None:
+    # A default whose kind cannot coerce to the field's rendered type -- or any
+    # default on a non-scalar field -- has no rendering: `ffi_new` is skipped
+    # loudly and the struct still emits.
+    for bad in [
+        NamedTypeSchema("x", TypeSchema("int"), default=1.5),  # float on int
+        NamedTypeSchema("x", TypeSchema("bool"), default=2),  # non-0/1 int on bool
+        NamedTypeSchema("x", TypeSchema("str"), default=3),  # int on String
+        NamedTypeSchema("x", TypeSchema("Device"), default=1),  # scalar on non-scalar
+    ]:
+        info = ObjectInfo(
+            fields=[bad],
+            methods=[],
+            type_key="demo.Cfg",
+            parent_type_key="ffi.Object",
+            has_init=True,
+        )
+        text, _ = _gen_rust_object(info)
+        assert "ffi_new" not in text
+        assert "pub struct CfgObj {" in text
+
+
 def test_rust_cross_module_parent_imports_ref_and_obj() -> None:
     # F3: `target.VirtualDevice`'s parent is `ir.Attrs` (cross-prefix). The
     # struct embeds `base: AttrsObj` and the upcast targets `Attrs` -- BOTH
