@@ -221,6 +221,10 @@ class _ObjectRenderer:
     #: prefix, mounted at ``<out>/<seg>/.../mod.rs`` (see ``cli`` and
     #: :func:`finalize_rust_module_tree`).
     mod_segments: tuple[str, ...]
+    #: In-scope name of the parent's REF type (set by :meth:`_resolve_parent`
+    #: for derived types; unused for roots, whose ``base`` is the bare
+    #: ``tvm_ffi::Object`` data struct with no generated ref).
+    parent_ref: str = ""
 
     def _ty_render(self, origin: str) -> str:
         """Resolve a leaf origin to its Rust name and record its ``use``.
@@ -307,6 +311,25 @@ class _ObjectRenderer:
             return self.imports.record("tvm_ffi::AnyView")
         return render_rust_type(schema, self._ty_render)
 
+    def _resolve_parent(self) -> None:
+        """Bring BOTH parent names into scope: ``<Parent>Obj`` and ``<Parent>``.
+
+        The embedded ``base`` field and the ``Deref`` target need the parent's
+        data struct; the upcast ``From`` target and the builder's default-
+        construction fallback need its ref type. Both are items of the
+        parent's OWN module, so each resolves through the same generated-tree
+        path rule as any cross-module type reference (``use super::ir::Attrs;``
+        + ``use super::ir::AttrsObj;``); a same-module parent stays a bare
+        local name with no ``use``.
+        """
+        parent_key = self.info.parent_type_key
+        assert isinstance(parent_key, str)  # non-root implies a parent key
+        mod, dot, parent_leaf = parent_key.rpartition(".")
+        self.parent_ref = self.imports.record(self._generated_type_path(parent_key))
+        self.base_type = self.imports.record(
+            self._generated_type_path(f"{mod}{dot}{parent_leaf}Obj")
+        )
+
     def body(self) -> list[str]:
         """Build the Rust source lines for the object (raises on unsupported types)."""
         # Boilerplate `use`s, recorded through the same collector as field types
@@ -321,6 +344,8 @@ class _ObjectRenderer:
             # Same path the ty_map uses for `Object` fields, so they dedup
             # instead of colliding.
             self.base_type = self.imports.record("tvm_ffi::Object")
+        else:
+            self._resolve_parent()
         # C++ `_type_mutable`: class-level mutability dominates per-field `def_ro`.
         if self.info.mutable:
             self.imports.record("std::ops::DerefMut")
@@ -438,7 +463,7 @@ class _ObjectRenderer:
         has no ref-typed parent (its `base` is the bare `Object` data struct).
         """
         self.imports.record("tvm_ffi::ObjectRefCore")
-        parent_ref = self.base_type[:-3]  # `<ParentLeaf>Obj` -> `<ParentLeaf>`
+        parent_ref = self.parent_ref  # in scope via `_resolve_parent`
         parent_obj = self.base_type
         return [
             f"impl From<{self.leaf}> for {parent_ref} {{",
@@ -481,7 +506,7 @@ class _ObjectRenderer:
         """
         if self.is_root:
             return []
-        parent_ref = (self.info.parent_type_key or "").rsplit(".", 1)[-1]
+        parent_ref = self.parent_ref  # in scope via `_resolve_parent`
         return [
             "let base = match self.base {",
             "    Some(base) => base,",
@@ -662,19 +687,12 @@ def generate_rust_object(
     assert isinstance(type_key, str)
     leaf = type_key.rsplit(".", 1)[-1]
     obj_struct = f"{leaf}Obj"
-    parent_key = obj_info.parent_type_key
-    is_root = parent_key in (None, "ffi.Object")
-    if is_root:
-        base_type = "Object"
-    else:
-        assert isinstance(parent_key, str)
-        base_type = f"{parent_key.rsplit('.', 1)[-1]}Obj"
     renderer = _ObjectRenderer(
         info=obj_info,
         leaf=leaf,
         obj_struct=obj_struct,
-        base_type=base_type,
-        is_root=is_root,
+        base_type="",  # resolved by `body()` (crate `Object` / `_resolve_parent`)
+        is_root=obj_info.parent_type_key in (None, "ffi.Object"),
         imports=imports,
         ty_map=ty_map,
         mod_segments=tuple(type_key.split(".")[:-1]),

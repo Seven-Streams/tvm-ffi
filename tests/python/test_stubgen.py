@@ -1606,6 +1606,66 @@ def test_rust_unmapped_ffi_key_keeps_crate_path() -> None:
     assert RustUse("tvm_ffi::Opaque") in imports.items
 
 
+def test_rust_cross_module_parent_imports_ref_and_obj() -> None:
+    # F3: `target.VirtualDevice`'s parent is `ir.Attrs` (cross-prefix). The
+    # struct embeds `base: AttrsObj` and the upcast targets `Attrs` -- BOTH
+    # names must come into scope through the generated tree, alongside the
+    # F1 path rule.
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("x", TypeSchema("int"))],
+        methods=[],
+        type_key="target.VirtualDevice",
+        parent_type_key="ir.Attrs",
+        has_init=False,
+    )
+    text, imports = _gen_rust_object(info)
+    assert "    base: AttrsObj," in text
+    assert "    type Target = AttrsObj;" in text  # Deref to the parent struct
+    assert "impl From<VirtualDevice> for Attrs {" in text  # upcast to the ref
+    assert RustUse("super::ir::Attrs") in imports.items
+    assert RustUse("super::ir::AttrsObj") in imports.items
+
+
+def test_rust_same_module_parent_stays_local() -> None:
+    # A same-module parent is a local item: bare `ExprObj`/`Expr`, no `use`.
+    info = ObjectInfo(
+        fields=[],
+        methods=[],
+        type_key="tirx.Ramp",
+        parent_type_key="tirx.Expr",
+        has_init=False,
+    )
+    text, imports = _gen_rust_object(info)
+    assert "    base: ExprObj," in text
+    assert "impl From<Ramp> for Expr {" in text
+    assert all(u.leaf not in ("Expr", "ExprObj") for u in imports.items)
+
+
+def test_rust_cross_module_parent_builder_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    # With a native-eligible cross-module parent, the builder's unset-`base`
+    # fallback calls the parent ref's builder -- the imported in-scope name.
+    attrs_info = ObjectInfo(
+        fields=[NamedTypeSchema("n", TypeSchema("int"))],
+        methods=[],
+        type_key="ir.Attrs",
+        parent_type_key="ffi.Object",
+        has_init=True,
+    )
+    monkeypatch.setattr(rust_codegen, "object_info_from_type_key", lambda key: attrs_info)
+    info = ObjectInfo(
+        fields=[NamedTypeSchema("x", TypeSchema("int"))],
+        methods=[],
+        type_key="target.VirtualDevice",
+        parent_type_key="ir.Attrs",
+        has_init=True,
+    )
+    text, imports = _gen_rust_object(info)
+    assert "pub fn base(mut self, base: AttrsObj) -> Self {" in text
+    assert "    None => Attrs::ffi_new().build_obj().map_err(|e| tvm_ffi::Error::new(" in text
+    assert RustUse("super::ir::Attrs") in imports.items
+    assert RustUse("super::ir::AttrsObj") in imports.items
+
+
 def test_rust_keyword_field_raw_ident_all_positions() -> None:
     # `tirx.TensorIntrin` has a field literally named `impl` (F2): every CODE
     # position must escape to the raw identifier `r#impl` -- struct field,
