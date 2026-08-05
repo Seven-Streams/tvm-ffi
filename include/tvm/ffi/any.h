@@ -24,6 +24,7 @@
 #define TVM_FFI_ANY_H_
 
 #include <tvm/ffi/c_api.h>
+#include <tvm/ffi/device.h>
 #include <tvm/ffi/string.h>
 #include <tvm/ffi/type_traits.h>
 
