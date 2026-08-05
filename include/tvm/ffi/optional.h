@@ -407,6 +407,11 @@ struct TypeTraits<Optional<T>> : public TypeTraitsBase {
     return "Optional<" + TypeTraits<T>::TypeStr() + ">";
   }
   TVM_FFI_INLINE static std::string TypeSchema() {
+    // Optional<T> and a nullable T share kTVMFFINone as their only absent
+    // representation. There is no observable second null state to encode.
+    if constexpr (details::type_schema_is_optional_v<T>) {
+      return details::TypeSchema<T>::v();
+    }
     return R"({"type":"Optional","args":[)" + details::TypeSchema<T>::v() + "]}";
   }
 };

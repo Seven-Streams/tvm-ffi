@@ -992,6 +992,8 @@ class ObjectDef : public ReflectionDefBase {
     // apply extra info traits
     ((ApplyExtraInfoTrait(&info, std::forward<ExtraArgs>(extra_args)), ...));
     TVM_FFI_CHECK_SAFE_CALL(TVMFFITypeRegisterMetadata(type_index_, &info));
+    RegisterTypeAttrValue(type_index_, type_attr::kNativeAlignment,
+                          static_cast<int64_t>(alignof(Class)));
   }
 
   template <typename T, typename BaseClass, typename... ExtraArgs>
@@ -1016,6 +1018,13 @@ class ObjectDef : public ReflectionDefBase {
     info.default_value_or_factory = AnyView(nullptr).CopyToTVMFFIAny();
     info.doc = TVMFFIByteArray{nullptr, 0};
     info.metadata_.emplace_back("type_schema", ::tvm::ffi::details::TypeSchema<T>::v());
+    using FieldType = std::remove_cv_t<T>;
+    if constexpr (std::is_integral_v<FieldType> && !std::is_same_v<FieldType, bool>) {
+      info.metadata_.emplace_back("type_is_signed", std::is_signed_v<FieldType>);
+    } else if constexpr (std::is_enum_v<FieldType>) {
+      info.metadata_.emplace_back("type_is_signed",
+                                  std::is_signed_v<std::underlying_type_t<FieldType>>);
+    }
     // apply field info traits
     ((ApplyFieldInfoTrait(&info, std::forward<ExtraArgs>(extra_args)), ...));
     // call register

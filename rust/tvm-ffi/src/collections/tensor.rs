@@ -84,7 +84,7 @@ pub struct TensorObj {
 }
 
 /// ABI stable owned Shape for ffi
-#[repr(C)]
+#[repr(transparent)]
 #[derive(ObjectRef, Clone)]
 pub struct Tensor {
     data: ObjectArc<TensorObj>,
@@ -285,14 +285,15 @@ impl Tensor {
         };
         unsafe {
             let mut obj_arc = ObjectArc::new_with_extra_items(tensor_obj);
-            obj_arc.base.dltensor.shape =
-                TensorObjFromNDAlloc::extra_items(&obj_arc).as_ptr() as *mut i64;
-            obj_arc.base.dltensor.strides = obj_arc.base.dltensor.shape.add(shape.len());
-            let extra_items = TensorObjFromNDAlloc::extra_items_mut(&mut obj_arc);
+            let obj = ObjectArc::get_mut(&mut obj_arc)
+                .expect("a newly allocated TensorObj must be uniquely owned");
+            obj.base.dltensor.shape = TensorObjFromNDAlloc::extra_items(obj).as_ptr() as *mut i64;
+            obj.base.dltensor.strides = obj.base.dltensor.shape.add(shape.len());
+            let extra_items = TensorObjFromNDAlloc::extra_items_mut(obj);
             extra_items[..shape.len()].copy_from_slice(shape);
             Shape::fill_strides_from_shape(shape, &mut extra_items[shape.len()..]);
-            let dltensor_ptr = &obj_arc.base.dltensor as *const DLTensor;
-            obj_arc.base.dltensor.data = obj_arc.alloc.alloc_data(&*dltensor_ptr);
+            let dltensor_ptr = &obj.base.dltensor as *const DLTensor;
+            obj.base.dltensor.data = obj.alloc.alloc_data(&*dltensor_ptr);
             Self {
                 data: ObjectArc::from_raw(ObjectArc::into_raw(obj_arc) as *mut TensorObj),
             }

@@ -28,6 +28,7 @@ from .. import consts as C
 from .codegen import (
     finalize_rust_module_tree,
     generate_rust_api_file,
+    generate_rust_global_funcs,
     generate_rust_import_section,
     generate_rust_object,
 )
@@ -44,12 +45,13 @@ if TYPE_CHECKING:
 class RustGenerator:
     """Generator that emits Rust binding stubs.
 
-    Objects using an unrepresentable origin (``Union`` / ``Dict`` / ``List`` /
-    ``tuple``, or containers/``Optional`` over payloads the crate cannot hold)
-    are skipped with a warning; global functions and ``__all__``/``export``
-    re-exports are not generated. The backend targets natively-laid-out C++
-    objects only -- running it on Python-defined (``py_class``) types is
-    undefined (their fields use Python-side storage conventions).
+    Every valid reflected object is emitted. Complete, immutable native-layout
+    proof exposes direct fields; otherwise the object keeps an opaque parent
+    prefix and owning reflection getters. An unrenderable individual getter
+    returns ``Any`` rather than erasing its enclosing object. Global
+    ``Callable`` schemas become fallible free-function wrappers; dynamically
+    typed callables retain a packed-slice API rather than an invented
+    signature. ``__all__``/``export`` re-exports are not generated.
     """
 
     name = "rust"
@@ -89,7 +91,8 @@ class RustGenerator:
         imports: RustImports,
         opt: Options,
     ) -> None:
-        """No-op: Rust calls globals dynamically via ``Function::get_global``."""
+        """Emit fallible free functions backed by cached global lookups."""
+        generate_rust_global_funcs(code, global_funcs, ty_map, imports, opt)
 
     def generate_object_block(
         self,
@@ -131,7 +134,7 @@ class RustGenerator:
         init_cfg: InitConfig,
         is_root: bool,
     ) -> str:
-        """Scaffold a Rust binding file: header + object/import markers."""
+        """Scaffold a Rust binding file: header + import/global/object markers."""
         return generate_rust_api_file(
             code_blocks,
             ty_map,

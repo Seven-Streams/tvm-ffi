@@ -110,6 +110,14 @@ static_assert(!object_ref_contains_is_enabled_v<TIntObj, TIntObj>);
 static_assert(!object_ref_contains_is_enabled_v<TInt, int>);
 static_assert(!object_ref_contains_is_enabled_v<TIntOrFloatRef, int>);
 
+TEST(ObjectRefTypeSchema, PreservesNullability) {
+  EXPECT_EQ(TypeTraits<TNumber>::TypeSchema(),
+            R"({"type":"Optional","args":[{"type":"test.Number"}]})");
+  EXPECT_EQ(TypeTraits<TInt>::TypeSchema(), R"({"type":"test.Int"})");
+  EXPECT_EQ(TypeTraits<Optional<TNumber>>::TypeSchema(),
+            R"({"type":"Optional","args":[{"type":"test.Number"}]})");
+}
+
 template <typename T>
 class CRTPObject : public Object {
  public:
@@ -658,10 +666,10 @@ TEST(ObjectPtrStorage, OptionalAndVariantComposition) {
   EXPECT_FALSE(Any(present_absent).cast<NestedOptionalNumber>().has_value());
 
   EXPECT_EQ(TypeTraits<OptionalNumber>::TypeSchema(),
-            R"({"type":"Optional","args":[{"type":"Optional","args":[{"type":"test.Number"}]}]})");
+            R"({"type":"Optional","args":[{"type":"test.Number"}]})");
   EXPECT_EQ(
       TypeTraits<OptionalNumberOrInt>::TypeSchema(),
-      R"({"type":"Variant","args":[{"type":"Optional","args":[{"type":"Optional","args":[{"type":"test.Number"}]}]},{"type":"int"}]})");
+      R"({"type":"Variant","args":[{"type":"Optional","args":[{"type":"test.Number"}]},{"type":"int"}]})");
 }
 
 TEST(ObjectPtrStorage, Expected) {

@@ -19,7 +19,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import ctypes
+import dataclasses
 import importlib
 import sys
 import traceback
@@ -41,7 +43,7 @@ if TYPE_CHECKING:
     from .generator import Generator
 
 
-def __main__() -> int:
+def __main__() -> int:  # noqa: PLR0912
     """Command line entry point for ``tvm-ffi-stubgen``.
 
     This generates in-place type stubs inside special ``tvm-ffi-stubgen`` blocks
@@ -49,11 +51,22 @@ def __main__() -> int:
     overview and examples of the block syntax.
     """
     opt = _parse_args()
+    if opt.init is not None and opt.dry_run:
+        print(
+            f"{C.TERM_RED}[Error] --dry-run cannot be combined with --init-* options{C.TERM_RESET}",
+            file=sys.stderr,
+        )
+        return 1
+
     generator = get_generator(opt.target)
     for imp in opt.imports or []:
         importlib.import_module(imp)
-    dlls = [ctypes.CDLL(lib) for lib in opt.dlls]
-    files: list[FileInfo] = collect_files([Path(f) for f in opt.files])
+    _dlls = [ctypes.CDLL(lib) for lib in opt.dlls]
+    try:
+        files: list[FileInfo] = collect_files([Path(f) for f in opt.files])
+    except Exception:
+        print(f"{C.TERM_RED}[Failed] {traceback.format_exc()}{C.TERM_RESET}")
+        return 1
     global_funcs: dict[str, list[FuncInfo]] = collect_global_funcs()
     init_path: Path | None = None
     if opt.files:
@@ -66,26 +79,34 @@ def __main__() -> int:
     # - defined global functions: `tvm-ffi-stubgen(begin): global/...`
     # - defined object types: `tvm-ffi-stubgen(begin): object/...`
     ty_map: dict[str, str] = generator.default_ty_map()
+    failed = False
     for file in files:
         try:
             _stage_1(file, ty_map)
         except Exception:
+            failed = True
             print(
                 f'{C.TERM_RED}[Failed] File "{file.path}": {traceback.format_exc()}{C.TERM_RESET}'
             )
+    if failed:
+        return 1
 
     # Stage 2. Generate stubs if they are not defined on the file.
     generated_prefixes: set[str] = set()
     if opt.init:
         assert init_path is not None, "init-path could not be determined"
-        generated_prefixes = _stage_2(
-            files,
-            ty_map,
-            init_cfg=opt.init,
-            init_path=init_path,
-            global_funcs=global_funcs,
-            generator=generator,
-        )
+        try:
+            generated_prefixes = _stage_2(
+                files,
+                ty_map,
+                init_cfg=opt.init,
+                init_path=init_path,
+                global_funcs=global_funcs,
+                generator=generator,
+            )
+        except Exception:
+            print(f"{C.TERM_RED}[Failed] {traceback.format_exc()}{C.TERM_RESET}")
+            return 1
 
     # Stage 3: Process
     # - `tvm-ffi-stubgen(begin): global/...`
@@ -94,19 +115,41 @@ def __main__() -> int:
         if opt.verbose:
             print(f"{C.TERM_CYAN}[File] {file.path}{C.TERM_RESET}")
         try:
-            _stage_3(file, opt, ty_map, global_funcs, generator=generator)
+            failed |= _stage_3_transactional(file, opt, ty_map, global_funcs, generator=generator)
         except Exception:
+            failed = True
             print(
                 f'{C.TERM_RED}[Failed] File "{file.path}": {traceback.format_exc()}{C.TERM_RESET}'
             )
 
     # Stage 4. Let the generator stitch the generated tree together (runs after the
     # files are fully written, so language-specific wiring isn't clobbered).
-    if opt.init and generated_prefixes:
+    if not failed and opt.init and generated_prefixes:
         assert init_path is not None
-        generator.finalize_init(init_path, generated_prefixes)
-    del dlls
-    return 0
+        try:
+            generator.finalize_init(init_path, generated_prefixes)
+        except Exception:
+            failed = True
+            print(f"{C.TERM_RED}[Failed] {traceback.format_exc()}{C.TERM_RESET}")
+    return int(failed)
+
+
+def _stage_3_transactional(
+    file: FileInfo,
+    opt: Options,
+    ty_map: dict[str, str],
+    global_funcs: dict[str, list[FuncInfo]],
+    generator: Generator,
+) -> bool:
+    """Generate one file in memory and write it only after full success."""
+    staged_file = copy.deepcopy(file)
+    staged_opt = dataclasses.replace(opt, verbose=False, dry_run=True)
+    skipped = _stage_3(staged_file, staged_opt, ty_map, global_funcs, generator)
+    if skipped:
+        return True
+    file.code_blocks = staged_file.code_blocks
+    file.update(verbose=opt.verbose, dry_run=opt.dry_run)
+    return False
 
 
 def _stage_1(
@@ -211,7 +254,8 @@ def _stage_3(  # noqa: PLR0912
     ty_map: dict[str, str],
     global_funcs: dict[str, list[FuncInfo]],
     generator: Generator,
-) -> None:
+) -> bool:
+    skipped = False
     defined_funcs: set[str] = set()
     defined_types: set[str] = set()
     imports = generator.new_imports()
@@ -241,6 +285,7 @@ def _stage_3(  # noqa: PLR0912
                 # another object referencing it must keep its import.
                 code.lines = [code.lines[0], code.lines[-1]]
                 print(f"{C.TERM_YELLOW}[Skipped] object {type_key}: {e}{C.TERM_RESET}")
+                skipped = True
                 continue
             defined_types.add(generator.canonical_type_name(type_key))
     # Stage 4. Add imports for used types.
@@ -260,6 +305,7 @@ def _stage_3(  # noqa: PLR0912
             generator.generate_export_block(code)
     # Finalize: write back to file
     file.update(verbose=opt.verbose, dry_run=opt.dry_run)
+    return skipped
 
 
 def _parse_args() -> Options:

@@ -21,7 +21,6 @@ from __future__ import annotations
 import dataclasses
 import difflib
 import os
-import traceback
 from collections.abc import Generator, Iterable
 from pathlib import Path
 from typing import Callable
@@ -244,17 +243,17 @@ def collect_files(paths: list[Path]) -> list[FileInfo]:
     """Collect all files from the given paths and parse them into FileInfo objects."""
 
     def _on_error(e: Exception) -> None:
-        print(
-            f"{C.TERM_RED}[Error]\n{traceback.format_exc()}{C.TERM_RESET}",
-            end="",
-            flush=True,
-        )
+        raise e
 
     def _walk_recursive() -> Generator[Path, None, None]:
         for p in paths:
+            if not p.exists():
+                raise FileNotFoundError(f"Input path does not exist: {p}")
             if p.is_file():
                 yield p
                 continue
+            if not p.is_dir():
+                raise ValueError(f"Input path is neither a file nor a directory: {p}")
             for root, _dirs, files in path_walk(p, follow_symlinks=False, on_error=_on_error):
                 for file in files:
                     f = Path(root) / file
@@ -269,13 +268,9 @@ def collect_files(paths: list[Path]) -> list[FileInfo]:
     filenames = sorted(filenames, key=_path_sort_key)
     files = []
     for file in filenames:
-        try:
-            content = FileInfo.from_file(file)
-        except Exception as e:
-            _on_error(e)
-        else:
-            if content is not None:
-                files.append(content)
+        content = FileInfo.from_file(file)
+        if content is not None:
+            files.append(content)
     return files
 
 

@@ -23,7 +23,7 @@ use std::ops::Deref;
 use crate::any::TryFromTemp;
 use crate::derive::Object;
 use crate::object::{Object, ObjectArc};
-use crate::{Any, AnyCompatible, AnyView, ObjectCoreWithExtraItems, ObjectRefCore};
+use crate::{Any, AnyCompatible, AnyValue, AnyView, ObjectCoreWithExtraItems, ObjectRefCore};
 use tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 use tvm_ffi_sys::{TVMFFIAny, TVMFFIObject};
 
@@ -31,24 +31,62 @@ use tvm_ffi_sys::{TVMFFIAny, TVMFFIObject};
 #[derive(Object)]
 #[type_key = "ffi.Array"]
 #[type_index(TypeIndex::kTVMFFIArray)]
+/// Native array storage whose initialized-cell invariants are maintained by
+/// [`Array`]. Its fields are intentionally not constructible by safe callers.
+///
+/// ```compile_fail
+/// use tvm_ffi::collections::array::ArrayObj;
+/// use tvm_ffi::Object;
+///
+/// let _invalid = ArrayObj {
+///     object: Object::new(),
+///     data: core::ptr::null_mut(),
+///     size: 1,
+///     capacity: 1,
+///     data_deleter: None,
+/// };
+/// ```
 pub struct ArrayObj {
-    pub object: Object,
+    // These fields jointly maintain the ownership invariant used by Drop: the
+    // first `size` cells at `data` are initialized owning TVMFFIAny values, and
+    // `capacity` is the trailing allocation length. Keep them private so safe
+    // downstream code cannot construct or mutate an invalid ArrayObj.
+    object: Object,
     /// Pointer to the start of the element buffer (AddressOf(0)).
-    pub data: *mut core::ffi::c_void,
-    pub size: i64,
-    pub capacity: i64,
+    data: *mut core::ffi::c_void,
+    size: i64,
+    capacity: i64,
     /// Optional custom deleter for the data pointer.
-    pub data_deleter: Option<unsafe extern "C" fn(*mut core::ffi::c_void)>,
+    data_deleter: Option<unsafe extern "C" fn(*mut core::ffi::c_void)>,
+}
+
+impl Drop for ArrayObj {
+    fn drop(&mut self) {
+        unsafe {
+            let data = self.data as *mut TVMFFIAny;
+            for index in 0..self.size {
+                // The first `size` cells are initialized owning TVMFFIAny values.
+                // Move each cell into Any so its Drop releases object-backed data.
+                drop(Any::from_raw_ffi_any(core::ptr::read(
+                    data.add(index as usize),
+                )));
+            }
+            self.size = 0;
+            if let Some(deleter) = self.data_deleter.take() {
+                deleter(self.data);
+            }
+        }
+    }
 }
 
 unsafe impl ObjectCoreWithExtraItems for ArrayObj {
     type ExtraItem = TVMFFIAny;
     fn extra_items_count(this: &Self) -> usize {
-        this.size as usize
+        this.capacity as usize
     }
 }
 
-#[repr(C)]
+#[repr(transparent)]
 #[derive(Clone)]
 pub struct Array<T: AnyCompatible + Clone> {
     data: ObjectArc<ArrayObj>,
@@ -97,20 +135,20 @@ impl<T: AnyCompatible + Clone> Array<T> {
 
     /// Internal helper to allocate an ArrayObj with specific headroom.
     fn new_with_capacity(items: Vec<T>, capacity: usize) -> Self {
-        let size = items.len();
-
         // Allocate with capacity
-        let arc = ObjectArc::<ArrayObj>::new_with_extra_items(ArrayObj {
+        let mut arc = ObjectArc::<ArrayObj>::new_with_extra_items(ArrayObj {
             object: Object::new(),
             data: core::ptr::null_mut(),
-            size: size as i64,
+            // Keep size at the number of initialized cells so Drop is safe if
+            // converting a later item panics part-way through construction.
+            size: 0,
             capacity: capacity as i64,
             data_deleter: None,
         });
 
         unsafe {
-            let raw_ptr = ObjectArc::as_raw(&arc) as *mut ArrayObj;
-            let container = &mut *raw_ptr;
+            let container = ObjectArc::get_mut(&mut arc)
+                .expect("a newly allocated ArrayObj must be uniquely owned");
 
             let base_ptr = ArrayObj::extra_items_mut(container).as_ptr() as *mut TVMFFIAny;
             container.data = base_ptr as *mut _;
@@ -119,6 +157,7 @@ impl<T: AnyCompatible + Clone> Array<T> {
                 let any: Any = Any::from(item);
                 let raw = Any::into_raw_ffi_any(any);
                 core::ptr::write(base_ptr.add(i), raw);
+                container.size += 1;
             }
         }
         Self::from_data(arc)
@@ -154,40 +193,36 @@ impl<T: AnyCompatible + Clone> Array<T> {
         }
     }
 
+    /// Borrow an element as an [`AnyView`] without incrementing its reference count.
+    ///
+    /// The returned view cannot outlive this array. Use [`Array::get`] when an
+    /// owning value must survive after the array is dropped.
+    ///
+    /// ```compile_fail
+    /// use tvm_ffi::Array;
+    ///
+    /// let view = {
+    ///     let array = Array::new(vec![1_i64]);
+    ///     array.view(0).unwrap()
+    /// };
+    /// let _ = view.type_index();
+    /// ```
+    pub fn view(&self, index: usize) -> Result<AnyView<'_>, crate::Error> {
+        if index >= self.len() {
+            crate::bail!(crate::error::INDEX_ERROR, "Array view index out of bound");
+        }
+        unsafe {
+            let container = self.data.deref();
+            let base_ptr = container.data as *const TVMFFIAny;
+            Ok(AnyView::from_raw_ffi_any(*base_ptr.add(index)))
+        }
+    }
+
     pub fn iter(&'_ self) -> ArrayIterator<'_, T> {
         ArrayIterator {
             array: self,
             index: 0,
             len: self.len(),
-        }
-    }
-
-    #[inline]
-    fn as_container(&self) -> &ArrayObj {
-        unsafe {
-            let ptr = ObjectArc::as_raw(&self.data) as *const ArrayObj;
-            &*ptr
-        }
-    }
-}
-
-// --- Index Implementation ---
-
-impl<T: AnyCompatible + Clone> std::ops::Index<usize> for Array<T> {
-    type Output = AnyView<'static>;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        let container = self.as_container();
-        let len = container.size as usize;
-        if index >= len {
-            panic!(
-                "Index out of bounds: the len is {} but the index is {}",
-                len, index
-            );
-        }
-        unsafe {
-            let ptr = (container.data as *const AnyView<'static>).add(index);
-            &*ptr
         }
     }
 }
@@ -245,7 +280,10 @@ where
             return false;
         }
 
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<Any>() {
+        // A dynamic element accepts every TVMFFIAny, so walking the array
+        // cannot discover a mismatch. This is also the common Array<Any>
+        // reflection case emitted as Array<AnyValue> by the Rust stubgen.
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<AnyValue>() {
             return true;
         }
 

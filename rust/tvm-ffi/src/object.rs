@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::atomic::AtomicU64;
 
 use crate::derive::ObjectRef;
@@ -35,7 +35,18 @@ pub struct Object {
 /// Arc-like wrapper for Object that allows shared ownership
 ///
 /// \tparam T The type of the object to be wrapped
-#[repr(C)]
+///
+/// `ObjectArc` deliberately does not implement [`std::ops::DerefMut`]: a
+/// mutable borrow of one handle does not prove that the reference-counted
+/// allocation has no aliases.
+///
+/// ```compile_fail
+/// use tvm_ffi::{Object, ObjectArc};
+///
+/// let mut arc = ObjectArc::new(Object::new());
+/// let _: &mut Object = &mut *arc;
+/// ```
+#[repr(transparent)]
 pub struct ObjectArc<T: ObjectCore> {
     ptr: std::ptr::NonNull<T>,
     _phantom: std::marker::PhantomData<T>,
@@ -126,6 +137,92 @@ pub unsafe trait ObjectRefCore: Sized + Clone {
     fn data(this: &Self) -> &ObjectArc<Self::ContainerType>;
     fn into_data(this: Self) -> ObjectArc<Self::ContainerType>;
     fn from_data(data: ObjectArc<Self::ContainerType>) -> Self;
+}
+
+/// Read one owning field value through the stable reflection getter ABI.
+///
+/// Generated bindings use this for object types whose complete foreign layout
+/// cannot be proven. `field_index` is the index in `O`'s own reflected field
+/// table (not its inherited fields); the getter computes the registered field
+/// address and returns an owning [`crate::Any`].
+#[doc(hidden)]
+pub fn get_reflected_field<O: ObjectCore>(
+    object: &O,
+    field_index: usize,
+) -> crate::Result<crate::Any> {
+    unsafe {
+        let type_index = O::type_index();
+        let info = TVMFFIGetTypeInfo(type_index);
+        if info.is_null() {
+            crate::bail!(
+                crate::error::TYPE_ERROR,
+                "no type info for reflected object `{}`",
+                O::TYPE_KEY
+            );
+        }
+        let info = &*info;
+        if field_index >= info.num_fields as usize || info.fields.is_null() {
+            crate::bail!(
+                crate::error::TYPE_ERROR,
+                "reflected field index {} is out of range for `{}` ({} own fields)",
+                field_index,
+                O::TYPE_KEY,
+                info.num_fields
+            );
+        }
+        let field = &*info.fields.add(field_index);
+        if field.offset < 0 {
+            crate::bail!(
+                crate::error::TYPE_ERROR,
+                "reflected field `{}` on `{}` has invalid offset {}",
+                field.name.as_str(),
+                O::TYPE_KEY,
+                field.offset
+            );
+        }
+        let Some(getter) = field.getter else {
+            crate::bail!(
+                crate::error::TYPE_ERROR,
+                "reflected field `{}` on `{}` has no getter",
+                field.name.as_str(),
+                O::TYPE_KEY
+            );
+        };
+
+        let address = (object as *const O as *mut u8).add(field.offset as usize);
+        // Keep the return slot in its owning wrapper throughout the call.  If
+        // the getter reports an error after assigning an object-backed value,
+        // normal Rust drop still releases that partial result.
+        let mut result = crate::Any::new();
+        let ret_code = getter(address.cast(), crate::Any::as_data_ptr(&mut result));
+        if ret_code != 0 {
+            return Err(crate::Error::from_raised());
+        }
+        Ok(result)
+    }
+}
+
+/// Borrow an object data prefix as a packed-call object value.
+///
+/// Generated instance methods live on object data structs so Rust's normal
+/// `Deref` chain also exposes inherited methods. Unlike an owning object-ref
+/// wrapper, an [`ObjectCore`] data struct does not implement `AnyCompatible`;
+/// this helper builds the equivalent non-owning view while tying its lifetime
+/// to `object`.
+#[doc(hidden)]
+#[inline]
+pub fn as_any_view<O: ObjectCore>(object: &O) -> crate::AnyView<'_> {
+    unsafe {
+        // ObjectCore's unsafe contract requires the allocation to begin with a
+        // valid TVMFFIObject header. The view borrows that allocation and never
+        // changes its reference count.
+        let object_ptr = (object as *const O).cast::<TVMFFIObject>().cast_mut();
+        let mut data = TVMFFIAny::new();
+        data.type_index = (*object_ptr).type_index;
+        data.small_str_len = 0;
+        data.data_union.v_obj = object_ptr;
+        crate::AnyView::from_raw_ffi_any(data)
+    }
 }
 
 /// Check whether a runtime type index refers to `Target` or one of its
@@ -220,7 +317,7 @@ impl<T: ObjectRefCore + AnyCompatible> ObjectRefCast for T {}
 /// Base class for ObjectRef
 ///
 /// This class is used to store the data of the ObjectRef
-#[repr(C)]
+#[repr(transparent)]
 #[derive(ObjectRef, Clone)]
 pub struct ObjectRef {
     data: ObjectArc<Object>,
@@ -304,13 +401,25 @@ pub mod unsafe_ {
     #[inline]
     pub(crate) unsafe fn strong_count(handle: *mut TVMFFIObject) -> usize {
         let obj = &mut *handle;
-        (obj.combined_ref_count.load(Ordering::Relaxed) & COMBINED_REF_COUNT_MASK_U32) as usize
+        (obj.combined_ref_count.load(Ordering::Acquire) & COMBINED_REF_COUNT_MASK_U32) as usize
     }
 
     #[inline]
     pub(crate) unsafe fn weak_count(handle: *mut TVMFFIObject) -> usize {
         let obj = &mut *handle;
-        (obj.combined_ref_count.load(Ordering::Relaxed) >> 32) as usize
+        (obj.combined_ref_count.load(Ordering::Acquire) >> 32) as usize
+    }
+
+    /// Whether `handle` has exactly its one owning reference and implicit weak
+    /// reference.
+    ///
+    /// This must inspect the combined counter with one atomic load. Reading the
+    /// strong and weak halves separately can combine observations from two
+    /// different states while a foreign `WeakObjectPtr` is promoted.
+    #[inline]
+    pub(crate) unsafe fn is_uniquely_owned(handle: *mut TVMFFIObject) -> bool {
+        let obj = &*handle;
+        obj.combined_ref_count.load(Ordering::Acquire) == COMBINED_REF_COUNT_BOTH_ONE
     }
 
     /// Generic object deleter for objects allocated through Rust's global allocator.
@@ -502,9 +611,17 @@ impl<T: ObjectCore> ObjectArc<T> {
         this.ptr.as_ptr() as *const T
     }
 
-    /// Get the raw mutable pointer from the ObjectArc
+    /// Get a non-owning raw mutable pointer from the ObjectArc.
     ///
-    /// Caller should view this as a non-owning reference
+    /// # Safety
+    ///
+    /// A mutable borrow of this handle does not make the reference-counted
+    /// allocation unique: cloned `ObjectArc`s and foreign FFI handles may still
+    /// alias it. The caller must ensure that, for every access through the
+    /// returned pointer, no other alias accesses the same allocation in a way
+    /// that conflicts with that mutation. The pointer must not outlive `this`,
+    /// and mutations must preserve the object header, registered layout, and
+    /// all `ObjectCore` invariants.
     ///
     /// # Arguments
     /// * `this` - The ObjectArc to get the raw pointer
@@ -514,6 +631,24 @@ impl<T: ObjectCore> ObjectArc<T> {
     #[inline]
     pub unsafe fn as_raw_mut(this: &mut Self) -> *mut T {
         this.ptr.as_mut()
+    }
+
+    /// Borrow the object mutably when this is its only owning and weak handle.
+    ///
+    /// A mutable borrow of an `ObjectArc` handle alone is insufficient because
+    /// clones share the same allocation. This method follows `Arc::get_mut`:
+    /// it returns `Some` only while both the strong and weak counts are the
+    /// allocation's implicit single references.
+    #[inline]
+    pub fn get_mut(this: &mut Self) -> Option<&mut T> {
+        let handle = this.ptr.as_ptr().cast::<TVMFFIObject>();
+        if unsafe { unsafe_::is_uniquely_owned(handle) } {
+            // SAFETY: the count check proves that no other owning or weak handle
+            // can make the allocation accessible while `this` is mutably borrowed.
+            Some(unsafe { this.ptr.as_mut() })
+        } else {
+            None
+        }
     }
 
     /// Get the strong reference count of the ObjectArc
@@ -549,14 +684,6 @@ impl<T: ObjectCore> Deref for ObjectArc<T> {
     #[inline]
     fn deref(&self) -> &Self::Target {
         unsafe { self.ptr.as_ref() }
-    }
-}
-
-// implement DerefMut for ObjectArc
-impl<T: ObjectCore> DerefMut for ObjectArc<T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { self.ptr.as_mut() }
     }
 }
 

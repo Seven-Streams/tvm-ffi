@@ -48,13 +48,38 @@ fn test_array_core_and_iteration() {
     assert!(!array.is_empty());
 
     // Value Integrity
-    assert_eq!(get_val(&Tensor::try_from(array[0]).unwrap()), 10.0);
-    assert_eq!(Tensor::try_from(array[0]).unwrap().ndim(), 2);
-    assert_eq!(Tensor::try_from(array[1]).unwrap().ndim(), 3);
+    assert_eq!(get_val(&array.get(0).unwrap()), 10.0);
+    assert_eq!(array.get(0).unwrap().ndim(), 2);
+    assert_eq!(array.get(1).unwrap().ndim(), 3);
 
     // Iteration
     let vals: Vec<f32> = array.iter().map(|t| get_val(&t)).collect();
     assert_eq!(vals, vec![10.0, 20.0]);
+}
+
+#[test]
+fn test_array_view_is_borrowed_and_get_is_owning() {
+    let text = String::from("a-long-array-element-that-is-reference-counted");
+    let base = AnyView::from(&text).debug_strong_count().unwrap();
+    let array = Array::new(vec![text.clone()]);
+    assert_eq!(AnyView::from(&text).debug_strong_count(), Some(base + 1));
+
+    {
+        let view = array.view(0).unwrap();
+        // A view borrows the array's element and does not acquire ownership.
+        assert_eq!(view.debug_strong_count(), Some(base + 1));
+        assert_eq!(view.try_as::<String>().as_deref(), Some(text.as_str()));
+    }
+    assert!(array.view(1).is_err());
+
+    // `get` returns an owning value, which remains valid after the array drops.
+    let owned = array.get(0).unwrap();
+    assert_eq!(AnyView::from(&text).debug_strong_count(), Some(base + 2));
+    drop(array);
+    assert_eq!(owned.as_str(), text.as_str());
+    assert_eq!(AnyView::from(&text).debug_strong_count(), Some(base + 1));
+    drop(owned);
+    assert_eq!(AnyView::from(&text).debug_strong_count(), Some(base));
 }
 
 #[test]
@@ -76,6 +101,41 @@ fn test_array_any_conversions() {
     let view = AnyView::from(&back);
     let back_from_view: Array<Tensor> = Array::try_from(view).expect("AnyView -> Array failed");
     assert_eq!(back_from_view.len(), 3);
+}
+
+#[test]
+fn test_array_any_value_preserves_heterogeneous_elements() {
+    let array = Array::new(vec![
+        AnyValue::new(42i64),
+        AnyValue::new(String::from("dynamic text")),
+        AnyValue::new(Shape::from(vec![2, 3])),
+        AnyValue::default(),
+    ]);
+
+    assert_eq!(array.get(0).unwrap().try_as::<i64>(), Some(42));
+    assert_eq!(
+        array.get(1).unwrap().try_as::<String>().as_deref(),
+        Some("dynamic text")
+    );
+    assert_eq!(
+        array.get(2).unwrap().try_as::<Shape>().unwrap().as_slice(),
+        &[2, 3]
+    );
+    assert_eq!(array.get(3).unwrap().try_as::<Option<i64>>(), Some(None));
+
+    let roundtrip: Array<AnyValue> =
+        Array::try_from(Any::from(array)).expect("Any -> Array<AnyValue> failed");
+    assert_eq!(roundtrip.len(), 4);
+    assert_eq!(roundtrip.get(0).unwrap().try_as::<i64>(), Some(42));
+    assert_eq!(
+        roundtrip
+            .get(2)
+            .unwrap()
+            .try_as::<Shape>()
+            .unwrap()
+            .as_slice(),
+        &[2, 3]
+    );
 }
 
 #[test]

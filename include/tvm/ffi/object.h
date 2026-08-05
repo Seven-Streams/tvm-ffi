@@ -992,6 +992,28 @@ class ObjectRef {
   friend struct tvm::ffi::details::ObjectUnsafe;
 };
 
+namespace details {
+
+/*! \brief Whether a type schema already includes ``None`` as a value. */
+template <typename T, typename = void>
+struct TypeSchemaIsOptional : std::false_type {};
+
+template <typename TObject>
+struct TypeSchemaIsOptional<ObjectPtr<TObject>> : std::true_type {};
+
+template <typename T, typename Enable>
+struct TypeSchemaIsOptional<Optional<T, Enable>> : std::true_type {};
+
+template <typename T>
+struct TypeSchemaIsOptional<
+    T, std::enable_if_t<std::is_base_of_v<ObjectRef, T> && use_default_type_traits_v<T>>>
+    : std::bool_constant<T::_type_is_nullable> {};
+
+template <typename T>
+inline constexpr bool type_schema_is_optional_v = TypeSchemaIsOptional<T>::value;
+
+}  // namespace details
+
 /*!
  * \brief Whether RefType contains every ObjectType instance.
  *
@@ -1608,6 +1630,10 @@ struct ObjectRefTypeTraitsBase : public TypeTraitsBase {
 
   TVM_FFI_INLINE static std::string TypeStr() { return ContainerType::_type_key; }
   TVM_FFI_INLINE static std::string TypeSchema() {
+    if constexpr (TObjRef::_type_is_nullable) {
+      return R"({"type":"Optional","args":[{"type":")" + std::string(ContainerType::_type_key) +
+             R"("}]})";
+    }
     return R"({"type":")" + std::string(ContainerType::_type_key) + R"("})";
   }
 };

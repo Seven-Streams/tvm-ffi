@@ -59,6 +59,7 @@ pub struct ErrorObj {
 }
 
 /// Error reference class
+#[repr(transparent)]
 #[derive(Clone, ObjectRef)]
 pub struct Error {
     data: ObjectArc<ErrorObj>,

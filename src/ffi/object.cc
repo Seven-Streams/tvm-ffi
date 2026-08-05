@@ -624,7 +624,10 @@ namespace {
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace ffi = ::tvm::ffi;
   namespace refl = ::tvm::ffi::reflection;
-  refl::TypeAttrDef<ffi::Object>().def_convert<ffi::ObjectRef>();
+  refl::TypeAttrDef<ffi::Object>()
+      .def_convert<ffi::ObjectRef>()
+      .attr(refl::type_attr::kNativeAlignment, static_cast<int64_t>(alignof(ffi::Object)))
+      .attr(refl::type_attr::kTypeMutable, ffi::Object::_type_mutable);
   refl::TypeAttrDef<ffi::details::StringObj>().def_convert<ffi::String>();
   refl::TypeAttrDef<ffi::details::BytesObj>().def_convert<ffi::Bytes>();
   refl::TypeAttrDef<ffi::ErrorObj>().def_convert<ffi::Error>();

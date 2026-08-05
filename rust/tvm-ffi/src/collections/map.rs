@@ -69,7 +69,7 @@ pub struct MapObj {
 
 /// Immutable, reference-counted map from `K` to `V`, sharing its underlying
 /// `MapObj` with C++. Cloning is cheap (it bumps the refcount).
-#[repr(C)]
+#[repr(transparent)]
 pub struct Map<K, V> {
     data: ObjectArc<MapObj>,
     _marker: PhantomData<(K, V)>,

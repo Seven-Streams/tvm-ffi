@@ -18,6 +18,17 @@
  */
 use tvm_ffi::*;
 
+// The C++ global function table deliberately has no internal mutex. Serialize
+// every test in this binary that reads or mutates it while the cache tests
+// temporarily remove and re-register globals.
+static GLOBAL_FUNCTION_TABLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_global_function_table_for_test() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_FUNCTION_TABLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn test_function_dummpy_c_api() {
     let ret = unsafe { tvm_ffi_sys::TVMFFITestingDummyTarget() };
@@ -26,11 +37,87 @@ fn test_function_dummpy_c_api() {
 
 #[test]
 fn test_function_get_global_required() {
+    let _registry_guard = lock_global_function_table_for_test();
     let fecho = Function::get_global("testing.echo").unwrap();
     let a = 1;
     let args = [AnyView::from(&a)];
     let result = fecho.call_packed(&args).unwrap();
     assert_eq!(i32::try_from(result).unwrap(), 1);
+}
+
+fn remove_global_for_test(name: &str) -> bool {
+    let name = String::from(name);
+    let result = Function::get_global("ffi.FunctionRemoveGlobal")
+        .unwrap()
+        .call_packed(&[AnyView::from(&name)])
+        .unwrap();
+    bool::try_from(result).unwrap()
+}
+
+#[test]
+fn test_function_get_global_cached_retries_after_missing_global() {
+    let _registry_guard = lock_global_function_table_for_test();
+    static CACHE: std::sync::OnceLock<Function> = std::sync::OnceLock::new();
+
+    const NAME: &str = "testing.rust.get_global_cached.retry";
+    remove_global_for_test(NAME);
+
+    assert!(Function::get_global_cached(&CACHE, NAME).is_err());
+
+    Function::register_global(NAME, Function::from_typed(|| -> Result<i32> { Ok(17) })).unwrap();
+    let function = Function::get_global_cached(&CACHE, NAME).unwrap();
+    let result = function.call_packed(&[]).unwrap();
+    assert_eq!(i32::try_from(result).unwrap(), 17);
+
+    assert!(remove_global_for_test(NAME));
+}
+
+#[test]
+fn test_function_get_global_cached_is_shared_across_threads() {
+    let _registry_guard = lock_global_function_table_for_test();
+    static CACHE: std::sync::OnceLock<Function> = std::sync::OnceLock::new();
+
+    const NAME: &str = "testing.rust.get_global_cached.shared";
+    remove_global_for_test(NAME);
+    Function::register_global(NAME, Function::from_typed(|| -> Result<i32> { Ok(1) })).unwrap();
+
+    let function = Function::get_global_cached(&CACHE, NAME).unwrap();
+    assert_eq!(
+        i32::try_from(function.call_packed(&[]).unwrap()).unwrap(),
+        1
+    );
+    assert!(remove_global_for_test(NAME));
+    Function::register_global(NAME, Function::from_typed(|| -> Result<i32> { Ok(2) })).unwrap();
+
+    // The cached Function is Send + Sync and shared by every generated call
+    // site, so another thread observes the same successful lookup.
+    let other_thread = std::thread::spawn(move || {
+        let function = Function::get_global_cached(&CACHE, NAME).unwrap();
+        i32::try_from(function.call_packed(&[]).unwrap()).unwrap()
+    });
+    assert_eq!(other_thread.join().unwrap(), 1);
+
+    assert!(remove_global_for_test(NAME));
+}
+
+#[test]
+fn test_function_from_type_method_finds_auto_init_type_attr() {
+    // SAFETY: the byte array is used only while this string literal is alive.
+    let type_key =
+        unsafe { tvm_ffi_sys::TVMFFIByteArray::from_str("testing.TestCxxAutoInitSimple") };
+    let mut type_index = -1;
+    let result = unsafe { tvm_ffi_sys::TVMFFITypeKeyToIndex(&type_key, &mut type_index) };
+    assert_eq!(result, 0);
+
+    // This fixture intentionally has no explicit refl::init TypeMethod. Its
+    // __ffi_init__ is created at runtime and exists only in a type-attr column.
+    let init = Function::from_type_method(type_index, "__ffi_init__").unwrap();
+    let x = 10_i64;
+    let y = 20_i64;
+    let object = init
+        .call_packed(&[AnyView::from(&x), AnyView::from(&y)])
+        .unwrap();
+    assert_eq!(object.type_index(), type_index);
 }
 
 #[test]
@@ -113,6 +200,7 @@ fn test_function_into_typed_fn() {
 
 #[test]
 fn test_function_echo_tensor_typed() {
+    let _registry_guard = lock_global_function_table_for_test();
     let echo = into_typed_fn!(
         Function::get_global("testing.echo").unwrap(),
         Fn(&Tensor) -> Result<Tensor>
@@ -147,6 +235,7 @@ fn test_function_from_extern_c() {
 
 #[test]
 fn test_function_echo_string_bytes() {
+    let _registry_guard = lock_global_function_table_for_test();
     let echo = Function::get_global("testing.echo").unwrap();
     let echo_str = into_typed_fn!(
         echo.clone(),
@@ -164,6 +253,7 @@ fn test_function_echo_string_bytes() {
 
 #[test]
 fn test_function_apply() {
+    let _registry_guard = lock_global_function_table_for_test();
     let add_one = Function::from_typed(|x: i32| -> Result<i32> { Ok(x + 1) });
     let fapply = into_typed_fn!(
         Function::get_global("testing.apply").unwrap(),

@@ -37,10 +37,30 @@ fn layout_is_uniform_16_bytes() {
     assert_eq!(std::mem::size_of::<Optional<f64>>(), 16);
     assert_eq!(std::mem::size_of::<Optional<String>>(), 16);
     assert_eq!(std::mem::size_of::<Optional<Array<i64>>>(), 16);
+    assert_eq!(std::mem::size_of::<Optional<AnyValue>>(), 16);
     assert_eq!(
         std::mem::align_of::<Optional<i32>>(),
         std::mem::align_of::<Optional<Array<i64>>>()
     );
+}
+
+#[test]
+fn any_value_payload_preserves_dynamic_type_and_nullopt() {
+    let scalar = Optional::<AnyValue>::some(AnyValue::new(7i64));
+    assert_eq!(scalar.get().unwrap().try_as::<i64>(), Some(7));
+
+    let string = Optional::<AnyValue>::some(AnyValue::new(String::from("dynamic text")));
+    assert_eq!(
+        string.get().unwrap().try_as::<String>().as_deref(),
+        Some("dynamic text")
+    );
+
+    // AnyValue itself accepts kTVMFFINone so it can preserve a None element in
+    // Array<AnyValue>/Map<_, AnyValue>. Optional must still interpret that same
+    // cell as nullopt before asking its payload type to decode it.
+    let none = Optional::<AnyValue>::none();
+    assert!(none.is_none());
+    assert!(none.get().is_none());
 }
 
 #[test]

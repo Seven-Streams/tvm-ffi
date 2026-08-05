@@ -37,7 +37,7 @@ pub struct ModuleObj {
 }
 
 /// ABI-stable owned Module for FFI operations.
-#[repr(C)]
+#[repr(transparent)]
 #[derive(ObjectRef, Clone)]
 pub struct Module {
     data: ObjectArc<ModuleObj>,

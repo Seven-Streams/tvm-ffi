@@ -380,6 +380,16 @@ inline constexpr const char* kShallowCopy = "__ffi_shallow_copy__";
  */
 inline constexpr const char* kTypeMutable = "__ffi_type_mutable__";
 /*!
+ * \brief Native alignment of the complete C++ object (``alignof(Class)``).
+ *
+ * Registered automatically by ``ObjectDef<Class>`` as an ``int64_t``.  This
+ * lives in an extensible TypeAttrColumn rather than ``TVMFFITypeMetadata`` so
+ * adding layout evidence does not change the C ABI.  Consumers must treat a
+ * missing or malformed value as unknown instead of inferring alignment from
+ * the reflected fields.
+ */
+inline constexpr const char* kNativeAlignment = "__ffi_native_alignment__";
+/*!
  * \brief Custom recursive repr hook.
  *
  * If registered, ``RecursiveRepr`` (Python ``__repr__``) calls this instead

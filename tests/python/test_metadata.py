@@ -14,11 +14,17 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+import ctypes
 from typing import Any
 
 import pytest
 from tvm_ffi import get_global_func_metadata, register_global_func, remove_global_func
-from tvm_ffi.core import TypeInfo, TypeSchema, _lookup_type_attr
+from tvm_ffi.core import (
+    TypeInfo,
+    TypeSchema,
+    _lookup_or_register_type_info_from_type_key,
+    _lookup_type_attr,
+)
 from tvm_ffi.testing import TestObjectPtrHolder, _SchemaAllTypes
 
 
@@ -41,31 +47,40 @@ def _replace_container_types(ty: str) -> str:
         ("testing.schema_id_dtype", "Callable[[dtype], dtype]"),
         ("testing.schema_id_string", "Callable[[str], str]"),
         ("testing.schema_id_bytes", "Callable[[bytes], bytes]"),
-        ("testing.schema_id_func", "Callable[[Callable[..., Any]], Callable[..., Any]]"),
+        (
+            "testing.schema_id_func",
+            "Callable[[Callable[..., Any] | None], Callable[..., Any] | None]",
+        ),
         (
             "testing.schema_id_func_typed",
-            "Callable[[Callable[[int, float, Callable[..., Any]], None]], Callable[[int, float, Callable[..., Any]], None]]",
+            "Callable[[Callable[[int, float, Callable[..., Any] | None], None]], Callable[[int, float, Callable[..., Any] | None], None]]",
         ),
         ("testing.schema_id_any", "Callable[[Any], Any]"),
-        ("testing.schema_id_object", "Callable[[Object], Object]"),
+        ("testing.schema_id_object", "Callable[[Object | None], Object | None]"),
         ("testing.schema_id_dltensor", "Callable[[Tensor], Tensor]"),
-        ("testing.schema_id_tensor", "Callable[[Tensor], Tensor]"),
+        ("testing.schema_id_tensor", "Callable[[Tensor | None], Tensor | None]"),
         ("testing.schema_tensor_view_input", "Callable[[Tensor], None]"),
         ("testing.schema_id_opt_int", "Callable[[int | None], int | None]"),
         ("testing.schema_id_opt_str", "Callable[[str | None], str | None]"),
         ("testing.schema_id_opt_obj", "Callable[[Object | None], Object | None]"),
         ("testing.schema_id_arr_int", "Callable[[Array[int]], Array[int]]"),
         ("testing.schema_id_arr_str", "Callable[[Array[str]], Array[str]]"),
-        ("testing.schema_id_arr_obj", "Callable[[Array[Object]], Array[Object]]"),
+        (
+            "testing.schema_id_arr_obj",
+            "Callable[[Array[Object | None]], Array[Object | None]]",
+        ),
         ("testing.schema_id_arr", "Callable[[Array[Any]], Array[Any]]"),
         ("testing.schema_id_map_str_int", "Callable[[Map[str, int]], Map[str, int]]"),
         ("testing.schema_id_map_str_str", "Callable[[Map[str, str]], Map[str, str]]"),
-        ("testing.schema_id_map_str_obj", "Callable[[Map[str, Object]], Map[str, Object]]"),
+        (
+            "testing.schema_id_map_str_obj",
+            "Callable[[Map[str, Object | None]], Map[str, Object | None]]",
+        ),
         ("testing.schema_id_map", "Callable[[Map[Any, Any]], Map[Any, Any]]"),
         ("testing.schema_id_dict_str_int", "Callable[[Dict[str, int]], Dict[str, int]]"),
         ("testing.schema_id_dict_str_str", "Callable[[Dict[str, str]], Dict[str, str]]"),
         ("testing.schema_id_variant_int_str", "Callable[[int | str], int | str]"),
-        ("testing.schema_packed", "Callable[..., Any]"),
+        ("testing.schema_packed", "Callable[..., Any] | None"),
         (
             "testing.schema_arr_map_opt",
             "Callable[[Array[int | None], Map[str, Array[int]], str | None], Map[str, Array[int]]]",
@@ -143,6 +158,26 @@ def test_schema_object_ptr_field() -> None:
     )
 
 
+def test_schema_nullable_object_ref_field() -> None:
+    type_info = _lookup_or_register_type_info_from_type_key("testing.TestNullableObjectRefHolder")
+    assert len(type_info.fields) == 2
+    raw_field, optional_field = type_info.fields
+    assert raw_field.name == "value"
+    assert raw_field.size == ctypes.sizeof(ctypes.c_void_p)
+    assert raw_field.c_default is None
+    assert (
+        str(TypeSchema.from_json_str(raw_field.metadata["type_schema"]))
+        == "testing.TestIntPair | None"
+    )
+    assert optional_field.name == "optional_value"
+    assert optional_field.size == 16
+    assert optional_field.c_default is None
+    assert (
+        str(TypeSchema.from_json_str(optional_field.metadata["type_schema"]))
+        == "testing.TestIntPair | None"
+    )
+
+
 @pytest.mark.parametrize(
     "method_name,expected",
     [
@@ -153,7 +188,7 @@ def test_schema_object_ptr_field() -> None:
             "merge_map",
             "Callable[[testing.SchemaAllTypes, Map[str, Array[int]], Map[str, Array[int]]], Map[str, Array[int]]]",
         ),
-        ("make_with", "Callable[[int, float, str], testing.SchemaAllTypes]"),
+        ("make_with", "Callable[[int, float, str], testing.SchemaAllTypes | None]"),
     ],
 )
 def test_schema_member_method(method_name: str, expected: str) -> None:
@@ -223,7 +258,7 @@ def test_metadata_member_method() -> None:
 def test_mem_fn_as_global_func() -> None:
     metadata: dict[str, Any] = get_global_func_metadata("testing.TestIntPairSum")
     type_schema: TypeSchema = TypeSchema.from_json_str(metadata["type_schema"])
-    assert str(type_schema) == "Callable[[testing.TestIntPair], int]"
+    assert str(type_schema) == "Callable[[testing.TestIntPair | None], int]"
 
 
 def test_class_metadata_none() -> None:

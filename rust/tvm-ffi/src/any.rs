@@ -37,6 +37,25 @@ pub struct Any {
     data: TVMFFIAny,
 }
 
+/// An owning dynamically typed value that can be stored in typed containers.
+///
+/// `AnyValue` has the same owned `TVMFFIAny` representation as [`Any`], but it
+/// also implements [`AnyCompatible`]. This makes it the dynamic element type
+/// for containers such as `Array<AnyValue>` and `Map<String, AnyValue>`, where
+/// every FFI value -- scalars, strings, objects, containers, and `None` -- must
+/// be preserved rather than narrowed to an object handle. A separate wrapper
+/// is required because implementing `AnyCompatible` directly on `Any` would
+/// make the crate's generic `From<T> for Any` overlap Rust's identity
+/// `From<T> for T` implementation.
+#[repr(transparent)]
+#[derive(Clone, Default)]
+pub struct AnyValue(Any);
+
+const _: () = assert!(
+    std::mem::size_of::<AnyValue>() == std::mem::size_of::<TVMFFIAny>()
+        && std::mem::align_of::<AnyValue>() == std::mem::align_of::<TVMFFIAny>()
+);
+
 //---------------------
 // AnyView
 //---------------------
@@ -233,6 +252,94 @@ impl Any {
 impl Default for Any {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+//---------------------
+// AnyValue
+//---------------------
+impl AnyValue {
+    /// Wrap a typed value as an owning dynamic value.
+    #[inline]
+    pub fn new<T: AnyCompatible>(value: T) -> Self {
+        Self(Any::from(value))
+    }
+
+    /// Return the runtime FFI type index of the contained value.
+    #[inline]
+    pub fn type_index(&self) -> i32 {
+        self.0.type_index()
+    }
+
+    /// Decode the contained value only when its runtime type strictly matches `T`.
+    #[inline]
+    pub fn try_as<T: AnyCompatible>(&self) -> Option<T> {
+        self.0.try_as::<T>()
+    }
+
+    /// Borrow the underlying owning [`Any`].
+    #[inline]
+    pub fn as_any(&self) -> &Any {
+        &self.0
+    }
+
+    /// Consume this wrapper and return its underlying owning [`Any`].
+    #[inline]
+    pub fn into_any(self) -> Any {
+        self.0
+    }
+}
+
+impl From<Any> for AnyValue {
+    #[inline]
+    fn from(value: Any) -> Self {
+        Self(value)
+    }
+}
+
+impl From<AnyView<'_>> for AnyValue {
+    #[inline]
+    fn from(value: AnyView<'_>) -> Self {
+        Self(Any::from(value))
+    }
+}
+
+impl AsRef<Any> for AnyValue {
+    #[inline]
+    fn as_ref(&self) -> &Any {
+        self.as_any()
+    }
+}
+
+unsafe impl AnyCompatible for AnyValue {
+    unsafe fn copy_to_any_view(src: &Self, data: &mut TVMFFIAny) {
+        *data = *src.0.as_raw_ffi_any();
+    }
+
+    unsafe fn move_to_any(src: Self, data: &mut TVMFFIAny) {
+        *data = Any::into_raw_ffi_any(src.0);
+    }
+
+    unsafe fn check_any_strict(_data: &TVMFFIAny) -> bool {
+        true
+    }
+
+    unsafe fn copy_from_any_view_after_check(data: &TVMFFIAny) -> Self {
+        Self(Any::from(AnyView::from_raw_ffi_any(*data)))
+    }
+
+    unsafe fn move_from_any_after_check(data: &mut TVMFFIAny) -> Self {
+        let owned = Any::from_raw_ffi_any(*data);
+        *data = TVMFFIAny::new();
+        Self(owned)
+    }
+
+    unsafe fn try_cast_from_any_view(data: &TVMFFIAny) -> Result<Self, ()> {
+        Ok(Self::copy_from_any_view_after_check(data))
+    }
+
+    fn type_str() -> String {
+        "Any".to_string()
     }
 }
 

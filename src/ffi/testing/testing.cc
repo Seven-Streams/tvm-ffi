@@ -180,6 +180,16 @@ class TestObjectPtrHolder : public Object {
   TVM_FFI_DECLARE_OBJECT_INFO("testing.TestObjectPtrHolder", TestObjectPtrHolder, Object);
 };
 
+class TestNullableObjectRefHolder : public Object {
+ public:
+  TestIntPair value;
+  Optional<TestIntPair> optional_value;
+
+  static constexpr bool _type_mutable = true;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.TestNullableObjectRefHolder",
+                                    TestNullableObjectRefHolder, Object);
+};
+
 class TestCxxClassBase : public Object {
  public:
   int64_t v_i64 = 0;
@@ -485,6 +495,11 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::ObjectDef<TestObjectPtrHolder>()
       .def_rw("value", &TestObjectPtrHolder::value)
       .def_rw("optional_value", &TestObjectPtrHolder::optional_value, refl::default_value(nullptr));
+
+  refl::ObjectDef<TestNullableObjectRefHolder>()
+      .def_rw("value", &TestNullableObjectRefHolder::value, refl::default_value(nullptr))
+      .def_rw("optional_value", &TestNullableObjectRefHolder::optional_value,
+              refl::default_value(nullptr));
 
   refl::ObjectDef<TestCxxClassBase>()
       .def_rw("v_i64", &TestCxxClassBase::v_i64, refl::repr(false))

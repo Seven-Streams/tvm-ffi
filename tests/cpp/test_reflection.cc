@@ -28,6 +28,7 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ffi/string.h>
 
+#include <cstdint>
 #include <string_view>
 
 #include "./testing_object.h"
@@ -68,6 +69,20 @@ struct PrefixLookupObj : public Object {
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("test.PrefixLookup", PrefixLookupObj, Object);
 };
 
+enum class SignedFieldEnum : int16_t { kZero = 0 };
+enum class UnsignedFieldEnum : uint16_t { kZero = 0 };
+
+struct FieldSignednessObj : public Object {
+  int32_t signed_value = 0;
+  uint32_t unsigned_value = 0;
+  SignedFieldEnum signed_enum = SignedFieldEnum::kZero;
+  UnsignedFieldEnum unsigned_enum = UnsignedFieldEnum::kZero;
+  bool boolean_value = false;
+  float float_value = 0.0f;
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("test.FieldSignedness", FieldSignednessObj, Object);
+};
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
 
@@ -100,6 +115,13 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::ObjectDef<PrefixLookupObj>()
       .def_ro("stage", &PrefixLookupObj::stage)
       .def_static("run", []() -> int64_t { return 1; });
+  refl::ObjectDef<FieldSignednessObj>()
+      .def_ro("signed_value", &FieldSignednessObj::signed_value)
+      .def_ro("unsigned_value", &FieldSignednessObj::unsigned_value)
+      .def_ro("signed_enum", &FieldSignednessObj::signed_enum)
+      .def_ro("unsigned_enum", &FieldSignednessObj::unsigned_enum)
+      .def_ro("boolean_value", &FieldSignednessObj::boolean_value)
+      .def_ro("float_value", &FieldSignednessObj::float_value);
   refl::TypeAttrDef<TestObjADerived>()
       .def("test.attr.type_attr_def.literal", "derived-literal")
       .def("test.attr.type_attr_def.string", String("derived-string"))
@@ -128,6 +150,29 @@ TEST(Reflection, FieldLookupRequiresExactName) {
   EXPECT_EQ(std::string_view(info->name.data, info->name.size), "stage");
 
   EXPECT_THROW(reflection::GetFieldInfo(PrefixLookupObj::_type_key, "stage_bytes"), Error);
+}
+
+TEST(Reflection, FieldMetadataRecordsIntegralAndEnumSignedness) {
+  auto expect_signedness = [](const char* field_name, bool expected) {
+    const TVMFFIFieldInfo* info =
+        reflection::GetFieldInfo(FieldSignednessObj::_type_key, field_name);
+    Map<String, Any> metadata = json::Parse(String(info->metadata)).cast<Map<String, Any>>();
+    Any value = metadata["type_is_signed"];
+    EXPECT_EQ(value.type_index(), TypeIndex::kTVMFFIBool) << field_name;
+    EXPECT_EQ(value.cast<bool>(), expected) << field_name;
+  };
+
+  expect_signedness("signed_value", true);
+  expect_signedness("unsigned_value", false);
+  expect_signedness("signed_enum", true);
+  expect_signedness("unsigned_enum", false);
+
+  for (const char* field_name : {"boolean_value", "float_value"}) {
+    const TVMFFIFieldInfo* info =
+        reflection::GetFieldInfo(FieldSignednessObj::_type_key, field_name);
+    Map<String, Any> metadata = json::Parse(String(info->metadata)).cast<Map<String, Any>>();
+    EXPECT_EQ(metadata.count("type_is_signed"), 0) << field_name;
+  }
 }
 
 TEST(Reflection, FieldSetter) {
@@ -325,6 +370,23 @@ TEST(Reflection, ForEachFieldInfo) {
 TEST(Reflection, TypeAttrColumn) {
   reflection::TypeAttrColumn size_attr("test.size");
   EXPECT_EQ(size_attr[TIntObj::RuntimeTypeIndex()].cast<int>(), sizeof(TIntObj));
+}
+
+TEST(Reflection, ObjectDefRegistersNativeLayoutAttrs) {
+  reflection::TypeAttrColumn alignment_attr(reflection::type_attr::kNativeAlignment);
+  reflection::TypeAttrColumn mutable_attr(reflection::type_attr::kTypeMutable);
+
+  EXPECT_EQ(alignment_attr[TestObjA::RuntimeTypeIndex()].cast<int64_t>(),
+            static_cast<int64_t>(alignof(TestObjA)));
+  EXPECT_TRUE(mutable_attr[TestObjA::RuntimeTypeIndex()].cast<bool>());
+
+  EXPECT_EQ(alignment_attr[PrefixLookupObj::RuntimeTypeIndex()].cast<int64_t>(),
+            static_cast<int64_t>(alignof(PrefixLookupObj)));
+  EXPECT_FALSE(mutable_attr[PrefixLookupObj::RuntimeTypeIndex()].cast<bool>());
+
+  EXPECT_EQ(alignment_attr[Object::RuntimeTypeIndex()].cast<int64_t>(),
+            static_cast<int64_t>(alignof(Object)));
+  EXPECT_FALSE(mutable_attr[Object::RuntimeTypeIndex()].cast<bool>());
 }
 
 TEST(Reflection, TypeAttrColumnBeginIndex) {

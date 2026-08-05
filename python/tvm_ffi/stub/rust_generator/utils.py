@@ -71,9 +71,9 @@ class RustImports:
     """Collects the ``use`` items of one generated file (all via :meth:`record`).
 
     Two *different* paths wanting the same in-scope name raise
-    :class:`UnsupportedTypeError` (the enclosing object is skipped with a
-    warning): the backend declares such pathological type names unsupported
-    rather than auto-aliasing.
+    :class:`UnsupportedTypeError`: the backend declares such pathological type
+    names unsupported rather than inventing an alias. Codegen transactions
+    ensure a failed block does not leak partial imports.
     """
 
     items: list[RustUse] = dataclasses.field(default_factory=list)
@@ -103,9 +103,9 @@ def _escape_ident(name: str) -> str:
 
     A Rust-keyword name (``impl``, ``type``, ``match``, ...) becomes the raw
     identifier ``r#<name>``, valid in every code position the generator emits
-    (struct fields, builder fields, setters, ``let`` bindings, literals, ``fn``
-    names). The few names rustc rejects even raw (``crate``/``self``/``Self``/
-    ``super``/``_``) have no rendering: raise, skipping the object loudly.
+    (struct fields, constructor parameters, and ``fn`` names). The few names
+    rustc rejects even raw (``crate``/``self``/``Self``/``super``/``_``) have
+    no rendering, so the enclosing declaration fails loudly.
     Message strings and FFI lookup names keep the original spelling -- escape
     only at code positions.
     """
@@ -121,19 +121,16 @@ def _escape_ident(name: str) -> str:
 def _element_rust_type(elem: TypeSchema, ty_render: Callable[[str], str]) -> str:
     """Render a container element / ``Optional`` payload type.
 
-    An ``Any`` element renders as the generic single-pointer ``ObjectRef``
-    handle: ``Array``/``Map``/``Optional`` are pointer-only containers whose
-    element type is phantom in the field layout, and ``ObjectRef`` -- unlike
-    ``Any`` -- is ``AnyCompatible``, so ``Array<ObjectRef>`` / ``Map<_,
-    ObjectRef>`` satisfy the crate's element bound while staying layout-identical
-    to the C++ ``...<Any>`` field. (Mirrors the hand-written ``Map<String,
-    ObjectRef>`` used for TIR annotations.) Every other origin recurses through
-    :func:`render_rust_type`, which rejects the unrepresentable
+    An ``Any`` element renders as the owning dynamic ``AnyValue`` carrier. It
+    implements ``AnyCompatible`` without narrowing the value domain, so
+    ``Array<AnyValue>`` / ``Map<_, AnyValue>`` preserve scalars, strings,
+    objects, containers, and ``None`` from the C++ ``...<Any>`` field. Every
+    other origin recurses through :func:`render_rust_type`, which rejects the unrepresentable
     (``Dict``/``List``/``Union``/``tuple`` up front, and ``void*`` / unmapped
     leaves at ``ty_render``).
     """
     if elem.origin == "Any":
-        return ty_render("Object")  # -> tvm_ffi::object::ObjectRef
+        return ty_render("AnyValue")
     return render_rust_type(elem, ty_render)
 
 
@@ -174,9 +171,15 @@ def render_rust_type(schema: TypeSchema, ty_render: Callable[[str], str]) -> str
     return ty_render(origin)  # leaf / object type
 
 
-def _deref_impl(ref: str, target: str, field: str, mutable: bool) -> list[str]:
-    """Emit ``Deref`` (+ ``DerefMut`` when ``mutable``) for ``ref`` -> ``target``."""
-    out = [
+def _deref_impl(ref: str, target: str, field: str) -> list[str]:
+    """Emit an immutable ``Deref`` for ``ref`` -> ``target``.
+
+    Object references are shared owning handles. Even when C++ marks the
+    underlying object type mutable, ``&mut`` access to one Rust handle cannot
+    prove the allocation is unaliased, so generated mirrors never implement
+    ``DerefMut``.
+    """
+    return [
         f"impl Deref for {ref} {{",
         f"    type Target = {target};",
         f"    fn deref(&self) -> &{target} {{",
@@ -185,16 +188,6 @@ def _deref_impl(ref: str, target: str, field: str, mutable: bool) -> list[str]:
         "}",
         "",
     ]
-    if mutable:
-        out += [
-            f"impl DerefMut for {ref} {{",
-            f"    fn deref_mut(&mut self) -> &mut {target} {{",
-            f"        &mut self.{field}",
-            "    }",
-            "}",
-            "",
-        ]
-    return out
 
 
 def _packed_args_expr(params: list[tuple[str, str]], is_member: bool) -> str:
@@ -203,9 +196,10 @@ def _packed_args_expr(params: list[tuple[str, str]], is_member: bool) -> str:
     A param whose type already rendered as ``AnyView`` (a top-level ``Any``
     argument) is passed through as-is.
     """
-    parts = ["AnyView::from(&*self)"] if is_member else []
+    parts = ["tvm_ffi::object::as_any_view(self)"] if is_member else []
     for name, ty in params:
-        parts.append(name if ty == "AnyView" else f"AnyView::from(&{name})")
+        is_any_view = ty == "AnyView" or ty.startswith("AnyView<")
+        parts.append(name if is_any_view else f"AnyView::from(&{name})")
     return ", ".join(parts)
 
 

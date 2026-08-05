@@ -24,8 +24,8 @@ use crate::object::{Object, ObjectArc, ObjectCore};
 use crate::type_traits::AnyCompatible;
 use tvm_ffi_sys::{
     TVMFFIAny, TVMFFIByteArray, TVMFFIFunctionCell, TVMFFIFunctionCreate, TVMFFIFunctionGetGlobal,
-    TVMFFIFunctionSetGlobal, TVMFFIGetTypeInfo, TVMFFIObjectHandle, TVMFFISafeCallType,
-    TVMFFITypeIndex,
+    TVMFFIFunctionSetGlobal, TVMFFIGetTypeAttrColumn, TVMFFIGetTypeInfo, TVMFFIObjectHandle,
+    TVMFFISafeCallType, TVMFFITypeIndex,
 };
 
 /// function object
@@ -39,6 +39,7 @@ pub struct FunctionObj {
 }
 
 /// Error reference class
+#[repr(transparent)]
 #[derive(Clone, ObjectRef)]
 pub struct Function {
     data: ObjectArc<FunctionObj>,
@@ -198,11 +199,30 @@ impl Function {
         }
     }
 
-    /// Look up the reflected method `method_name` on the type identified by `type_index`.
+    /// Cached front of [`Function::get_global`], used by generated bindings.
     ///
-    /// The method is the `ffi::Function` registered through the C++ reflection
-    /// registry (`ObjectDef<T>::def` / `def_static`); for instance methods its
-    /// first packed argument is the object itself.
+    /// `cell` is a per-call-site [`std::sync::OnceLock`]. Only successful
+    /// lookups are cached: if the global has not been registered yet, this
+    /// method returns the lookup error and a later call can retry.
+    pub fn get_global_cached(
+        cell: &'static std::sync::OnceLock<Function>,
+        name: &str,
+    ) -> Result<Function> {
+        if let Some(function) = cell.get() {
+            return Ok(function.clone());
+        }
+        let function = Function::get_global(name)?;
+        let _ = cell.set(function.clone());
+        Ok(function)
+    }
+
+    /// Look up a reflected callable on the type identified by `type_index`.
+    ///
+    /// Normal methods are read from the type's method table. Runtime-generated
+    /// callables such as an automatic `__ffi_init__` live only in a type-attr
+    /// column, so this function falls back to the equally named column when no
+    /// method-table entry exists. For instance methods, the first packed
+    /// argument is the object itself.
     ///
     /// # Arguments
     /// * `type_index` - The runtime type index of the object type
@@ -237,6 +257,29 @@ impl Function {
                     ));
                 }
             }
+
+            let attr_name = TVMFFIByteArray::from_str(method_name);
+            let column = TVMFFIGetTypeAttrColumn(&attr_name);
+            if !column.is_null() {
+                let column = &*column;
+                let index = type_index - column.begin_index;
+                if index >= 0 && index < column.size && !column.data.is_null() {
+                    let value = &*column.data.add(index as usize);
+                    if value.type_index != TVMFFITypeIndex::kTVMFFINone as i32 {
+                        if !<Function as AnyCompatible>::check_any_strict(value) {
+                            crate::bail!(
+                                crate::error::TYPE_ERROR,
+                                "type attribute `{}` on type_index `{}` is not a Function",
+                                method_name,
+                                type_index
+                            );
+                        }
+                        return Ok(<Function as AnyCompatible>::copy_from_any_view_after_check(
+                            value,
+                        ));
+                    }
+                }
+            }
         }
         crate::bail!(
             crate::error::TYPE_ERROR,
@@ -248,22 +291,19 @@ impl Function {
 
     /// Cached front of [`Function::from_type_method`], used by generated bindings.
     ///
-    /// `cell` is a per-call-site `thread_local!` `OnceCell` (a `Function` is not
-    /// `Sync`, ruling out a `OnceLock`), so the method-table scan runs once per
-    /// thread.
+    /// `cell` is a per-call-site [`std::sync::OnceLock`], so the reflected
+    /// method-table scan runs once for the process.
     pub fn from_type_method_cached(
-        cell: &'static std::thread::LocalKey<std::cell::OnceCell<Function>>,
+        cell: &'static std::sync::OnceLock<Function>,
         type_index: i32,
         method_name: &str,
     ) -> Result<Function> {
-        cell.with(|c| {
-            if let Some(f) = c.get() {
-                return Ok(f.clone());
-            }
-            let f = Function::from_type_method(type_index, method_name)?;
-            let _ = c.set(f.clone());
-            Ok(f)
-        })
+        if let Some(function) = cell.get() {
+            return Ok(function.clone());
+        }
+        let function = Function::from_type_method(type_index, method_name)?;
+        let _ = cell.set(function.clone());
+        Ok(function)
     }
 
     /// Register a function as a global function

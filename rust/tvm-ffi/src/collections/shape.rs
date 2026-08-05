@@ -37,7 +37,7 @@ pub struct ShapeObj {
 }
 
 /// ABI stable owned Shape for ffi
-#[repr(C)]
+#[repr(transparent)]
 #[derive(ObjectRef, Clone)]
 pub struct Shape {
     data: ObjectArc<ShapeObj>,
@@ -99,8 +99,10 @@ where
                 },
             });
             // reset the data ptr correctly after Arc is created
-            obj_arc.data.data = ShapeObj::extra_items(&obj_arc).as_ptr();
-            let extra_items = ShapeObj::extra_items_mut(&mut obj_arc);
+            let obj = ObjectArc::get_mut(&mut obj_arc)
+                .expect("a newly allocated ShapeObj must be uniquely owned");
+            obj.data.data = ShapeObj::extra_items(obj).as_ptr();
+            let extra_items = ShapeObj::extra_items_mut(obj);
             extra_items.copy_from_slice(value_slice);
             Self { data: obj_arc }
         }

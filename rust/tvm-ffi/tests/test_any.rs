@@ -199,6 +199,33 @@ fn test_any_option_i32() {
 }
 
 #[test]
+fn test_any_value_preserves_dynamic_values_and_ownership() {
+    let int_value = AnyValue::new(42i64);
+    assert_eq!(int_value.type_index(), TypeIndex::kTVMFFIInt as i32);
+    assert_eq!(int_value.try_as::<i64>(), Some(42));
+    assert!(int_value.try_as::<String>().is_none());
+
+    let none_value = AnyValue::default();
+    assert_eq!(none_value.type_index(), TypeIndex::kTVMFFINone as i32);
+    assert_eq!(none_value.try_as::<Option<i64>>(), Some(None));
+
+    // Copying from an AnyView must turn a borrowed heap value into a new
+    // owning value, while converting back to Any transfers that ownership.
+    let text = String::from("a-long-dynamic-string-that-is-reference-counted");
+    let base = AnyView::from(&text).debug_strong_count().unwrap();
+    let borrowed = AnyView::from(&text);
+    let dynamic = AnyValue::from(borrowed);
+    assert_eq!(AnyView::from(&text).debug_strong_count(), Some(base + 1));
+    assert_eq!(dynamic.try_as::<String>().as_deref(), Some(text.as_str()));
+
+    let cloned = dynamic.clone();
+    assert_eq!(AnyView::from(&text).debug_strong_count(), Some(base + 2));
+    drop(cloned);
+    drop(dynamic.into_any());
+    assert_eq!(AnyView::from(&text).debug_strong_count(), Some(base));
+}
+
+#[test]
 fn test_any_string() {
     let any = Any::from(String::from("hello"));
     assert_eq!(any.type_index(), TypeIndex::kTVMFFISmallStr as i32);

@@ -29,6 +29,9 @@ RUST_TY_MAP_DEFAULTS = {
     "str": "tvm_ffi::String",
     "bytes": "tvm_ffi::Bytes",
     "Any": "tvm_ffi::Any",
+    # Owning dynamic payload used only when an `Any` appears inside a typed
+    # container/Optional. Kept separate from top-level `Any` call results.
+    "AnyValue": "tvm_ffi::AnyValue",
     "Callable": "tvm_ffi::Function",
     "Array": "tvm_ffi::Array",  # the crate's own Array<T>, NOT Vec
     "Map": "tvm_ffi::Map",  # the crate's own Map<K, V>, NOT HashMap
@@ -52,23 +55,29 @@ RUST_TY_MAP_DEFAULTS = {
     "ffi.Function": "tvm_ffi::Function",
 }
 
-#: Width-correct scalar for a ``#[repr(C)]`` struct field, keyed by
-#: ``(ffi origin, sizeof(T))``: the type schema erases scalar widths, but the
-#: generated structs read fields at their real offsets, so the width must be
-#: recovered from the reflected field size. Signedness is not recorded;
-#: unsigned C++ fields render as the same-width signed type.
-RUST_SCALAR_BY_SIZE = {
-    ("int", 1): "i8",
-    ("int", 2): "i16",
-    ("int", 4): "i32",
-    ("int", 8): "i64",
-    ("float", 4): "f32",
-    ("float", 8): "f64",
+#: Width- and signedness-correct integral carriers for reflected fields.
+#: ``bool`` is deliberately separate: C++ ``bool`` has its own schema origin.
+RUST_INT_BY_SIGNED_SIZE = {
+    (True, 1): "i8",
+    (True, 2): "i16",
+    (True, 4): "i32",
+    (True, 8): "i64",
+    (False, 1): "u8",
+    (False, 2): "u16",
+    (False, 4): "u32",
+    (False, 8): "u64",
+}
+
+#: Width-correct floating-point carriers for reflected fields.
+RUST_FLOAT_BY_SIZE = {
+    4: "f32",
+    8: "f64",
 }
 
 #: Origins the crate has no FFI type for (do NOT map to ``HashMap``/``Vec``;
 #: Rust tuples don't match ``ffi::Tuple``'s layout). ``render_rust_type``
-#: raises wherever one appears and the enclosing object is skipped.
+#: raises wherever one appears; object getters catch this locally and return
+#: owning ``Any``, while signatures that cannot honestly degrade fail loudly.
 RUST_UNSUPPORTED_ORIGINS = frozenset({"Dict", "List", "Union", "tuple"})
 
 #: In-place mirror of an ``Optional<T>`` FIELD: C++ ``ffi::Optional<T>`` is

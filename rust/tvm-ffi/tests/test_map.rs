@@ -127,6 +127,91 @@ fn test_map_any_roundtrip() {
 }
 
 #[test]
+fn test_map_any_value_preserves_heterogeneous_values() {
+    let map: Map<String, AnyValue> = [
+        (String::from("count"), AnyValue::new(3i64)),
+        (
+            String::from("label"),
+            AnyValue::new(String::from("dynamic text")),
+        ),
+        (
+            String::from("shape"),
+            AnyValue::new(Shape::from(vec![4, 5])),
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(
+        map.get(&String::from("count"))
+            .unwrap()
+            .unwrap()
+            .try_as::<i64>(),
+        Some(3)
+    );
+    assert_eq!(
+        map.get(&String::from("label"))
+            .unwrap()
+            .unwrap()
+            .try_as::<String>()
+            .as_deref(),
+        Some("dynamic text")
+    );
+    assert_eq!(
+        map.get(&String::from("shape"))
+            .unwrap()
+            .unwrap()
+            .try_as::<Shape>()
+            .unwrap()
+            .as_slice(),
+        &[4, 5]
+    );
+
+    let roundtrip: Map<String, AnyValue> =
+        Map::try_from(Any::from(map)).expect("Any -> Map<String, AnyValue> failed");
+    assert_eq!(roundtrip.len(), 3);
+    assert_eq!(
+        roundtrip
+            .get(&String::from("count"))
+            .unwrap()
+            .unwrap()
+            .try_as::<i64>(),
+        Some(3)
+    );
+}
+
+#[test]
+fn test_map_any_value_supports_dynamic_keys_and_values() {
+    let map: Map<AnyValue, AnyValue> = [
+        (AnyValue::new(1i64), AnyValue::new(String::from("one"))),
+        (
+            AnyValue::new(String::from("shape")),
+            AnyValue::new(Shape::from(vec![6, 7])),
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(
+        map.get(&AnyValue::new(1i64))
+            .unwrap()
+            .unwrap()
+            .try_as::<String>()
+            .as_deref(),
+        Some("one")
+    );
+    assert_eq!(
+        map.get(&AnyValue::new(String::from("shape")))
+            .unwrap()
+            .unwrap()
+            .try_as::<Shape>()
+            .unwrap()
+            .as_slice(),
+        &[6, 7]
+    );
+}
+
+#[test]
 fn test_map_shares_underlying_object() {
     let map: Map<i64, i64> = [(1i64, 10i64)].into_iter().collect();
     // Cloning shares the same underlying MapObj rather than copying entries.
