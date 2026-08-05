@@ -2993,6 +2993,26 @@ def test_rust_global_dynamic_callable_gets_honest_packed_fallback() -> None:
     assert "call_packed(&[])" not in text
 
 
+def test_rust_global_unsupported_carrier_gets_packed_fallback() -> None:
+    block = _rust_global_block("testing")
+    imports = RustImports()
+    choice = TypeSchema("Union", (TypeSchema("str"), TypeSchema("int")))
+
+    generate_rust_global_funcs(
+        block,
+        [_global_func("testing.AcceptChoice", TypeSchema("bool"), TypeSchema("str"), choice)],
+        RC.RUST_TY_MAP_DEFAULTS.copy(),
+        imports,
+        Options(),
+    )
+    text = "\n".join(block.lines)
+
+    assert "pub fn accept_choice(args: &[AnyView<'_>]) -> Result<Any> {" in text
+    assert 'Function::get_global_cached(&F, "testing.AcceptChoice")?;' in text
+    assert "    f.call_packed(args)" in text
+    assert RustUse("tvm_ffi::String") not in imports.items
+
+
 def test_rust_global_nested_any_and_generated_module_paths() -> None:
     block = _rust_global_block("tirx.transform")
     imports = RustImports()

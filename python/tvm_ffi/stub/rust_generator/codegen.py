@@ -1151,18 +1151,8 @@ class _GlobalRenderer(_RustTypeRenderer):
             "}",
         ]
 
-    def function(self, func: FuncInfo, fn_name: str) -> list[str]:
-        """Render one typed global or an honest fully-packed fallback."""
-        schema = func.schema
-        ffi_name = schema.name
-        if schema.origin != "Callable":
-            raise UnsupportedTypeError(
-                schema.origin,
-                f"global function {ffi_name!r} has non-Callable schema {schema.origin!r}",
-            )
-        if not schema.args:
-            return self._packed_fallback(ffi_name, fn_name)
-
+    def _typed_function(self, schema: TypeSchema, ffi_name: str, fn_name: str) -> list[str]:
+        """Render a complete callable schema whose Rust carriers are supported."""
         ret_schema, *param_schemas = schema.args
         result = self.imports.record("tvm_ffi::Result")
         if ret_schema.origin == "Any":
@@ -1196,6 +1186,27 @@ class _GlobalRenderer(_RustTypeRenderer):
             "}",
         ]
 
+    def function(self, func: FuncInfo, fn_name: str) -> list[str]:
+        """Render one typed global or an honest fully-packed fallback."""
+        schema = func.schema
+        ffi_name = schema.name
+        if schema.origin != "Callable":
+            raise UnsupportedTypeError(
+                schema.origin,
+                f"global function {ffi_name!r} has non-Callable schema {schema.origin!r}",
+            )
+        if not schema.args:
+            return self._packed_fallback(ffi_name, fn_name)
+        imports_before = list(self.imports.items)
+        try:
+            return self._typed_function(schema, ffi_name, fn_name)
+        except UnsupportedTypeError:
+            # Keep the wrapper available without inventing a Rust carrier for
+            # unions or another unsupported reflected type.  Roll back any
+            # imports recorded before the unsupported leaf was encountered.
+            self.imports.items[:] = imports_before
+            return self._packed_fallback(ffi_name, fn_name)
+
 
 def generate_rust_global_funcs(
     code: CodeBlock,
@@ -1207,10 +1218,11 @@ def generate_rust_global_funcs(
     """Generate fallible Rust wrappers for one global-function prefix.
 
     A non-empty ``Callable`` argument tuple is a complete schema: element zero
-    is the return and the remainder are parameters. Bare ``Callable()`` means
-    ``Callable[..., Any]`` and therefore emits a packed-slice fallback. Name
-    and type validation is transactional: neither the block nor ``imports`` is
-    changed unless every function can be rendered without collisions.
+    is the return and the remainder are parameters. Bare ``Callable()`` and
+    complete schemas containing types without Rust carriers emit a packed-slice
+    fallback. Name and schema validation is transactional: neither the block
+    nor ``imports`` is changed unless every function has a callable schema and
+    names do not collide.
     """
     assert len(code.lines) >= 2
     if not global_funcs:
