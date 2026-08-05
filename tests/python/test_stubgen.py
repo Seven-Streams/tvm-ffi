@@ -2942,6 +2942,7 @@ def test_rust_global_funcs_generate_typed_api_and_preserve_lookup_names() -> Non
         _global_func("testing.Match", TypeSchema("None")),
         _global_func("testing.EchoAny", TypeSchema("Any"), TypeSchema("Any")),
         _global_func("testing.GetJSONGraph", TypeSchema("int")),
+        _global_func("testing.Module_Add", TypeSchema("None")),
         _global_func("testing.AddOne", TypeSchema("int"), TypeSchema("int")),
     ]
 
@@ -2958,6 +2959,8 @@ def test_rust_global_funcs_generate_typed_api_and_preserve_lookup_names() -> Non
     assert "pub fn add_one(_0: i64) -> Result<i64> {" in text
     assert 'Function::get_global_cached(&F, "testing.AddOne")?;' in text
     assert "Ok(f.call_packed(&[AnyView::from(&_0)])?.try_into()?)" in text
+    assert "pub fn module_add() -> Result<()> {" in text
+    assert "module__add" not in text
 
     # A top-level Any parameter is borrowed; the return remains owning.
     assert "pub fn echo_any(_0: AnyView<'_>) -> Result<Any> {" in text

@@ -134,6 +134,7 @@ def _snake_case_global_ident(name: str) -> str:
     """
     name = _CAMEL_WORD_BOUNDARY_RE.sub(r"\1_\2", name)
     name = _CAMEL_ACRONYM_BOUNDARY_RE.sub(r"\1_\2", name).lower()
+    name = re.sub(r"_+", "_", name)
     if not _RUST_IDENT_RE.fullmatch(name):
         raise UnsupportedTypeError(
             name, f"global function leaf {name!r} cannot be normalized to a Rust identifier"
@@ -145,6 +146,7 @@ def _snake_case_method_ident(name: str) -> str:
     """Normalize a reflected method name without changing its FFI lookup key."""
     name = _CAMEL_WORD_BOUNDARY_RE.sub(r"\1_\2", name)
     name = _CAMEL_ACRONYM_BOUNDARY_RE.sub(r"\1_\2", name).lower()
+    name = re.sub(r"_+", "_", name)
     if not _RUST_IDENT_RE.fullmatch(name):
         raise UnsupportedTypeError(
             name, f"reflected method {name!r} cannot be normalized to a Rust identifier"
