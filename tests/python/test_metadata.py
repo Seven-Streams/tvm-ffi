@@ -80,7 +80,7 @@ def _replace_container_types(ty: str) -> str:
         ("testing.schema_id_dict_str_int", "Callable[[Dict[str, int]], Dict[str, int]]"),
         ("testing.schema_id_dict_str_str", "Callable[[Dict[str, str]], Dict[str, str]]"),
         ("testing.schema_id_variant_int_str", "Callable[[int | str], int | str]"),
-        ("testing.schema_packed", "Callable[..., Any] | None"),
+        ("testing.schema_packed", "Callable[..., Any]"),
         (
             "testing.schema_arr_map_opt",
             "Callable[[Array[int | None], Map[str, Array[int]], str | None], Map[str, Array[int]]]",
