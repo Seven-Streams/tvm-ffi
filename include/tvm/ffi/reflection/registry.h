@@ -554,8 +554,11 @@ class GlobalDef : public ReflectionDefBase {
    */
   template <typename Func, typename... Extra>
   GlobalDef& def_packed(const char* name, Func func, Extra&&... extra) {
+    // This schema describes the registered callable, not a Function value.
+    // Packed functions have unknown arguments and return type, so retain the
+    // bare callable marker even though Function values themselves are nullable.
     RegisterFunc(name, ffi::Function::FromPacked(func),
-                 ::tvm::ffi::details::TypeSchemaImpl<Function>::v(), std::forward<Extra>(extra)...);
+                 R"({"type":"ffi.Function"})", std::forward<Extra>(extra)...);
     return *this;
   }
 
