@@ -1006,7 +1006,7 @@ struct TypeSchemaIsOptional<Optional<T, Enable>> : std::true_type {};
 
 template <typename T>
 struct TypeSchemaIsOptional<
-    T, std::enable_if_t<std::is_base_of_v<ObjectRef, T> && use_default_type_traits_v<T>>>
+    T, std::enable_if_t<std::is_base_of_v<ObjectRef, T>>>
     : std::bool_constant<T::_type_is_nullable> {};
 
 template <typename T>
