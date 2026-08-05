@@ -45,7 +45,9 @@ def collect_global_funcs() -> dict[str, list[FuncInfo]]:
         try:
             prefix, _ = name.rsplit(".", 1)
         except ValueError:
-            print(f"{C.TERM_YELLOW}[Skipped] Invalid name in global function: {name}{C.TERM_RESET}")
+            # Unqualified globals are valid registry entries, but cannot be
+            # assigned to a generated module prefix without guessing.
+            continue
         else:
             try:
                 global_funcs.setdefault(prefix, []).append(_func_info_from_global_name(name))

@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 import tvm_ffi.stub.cli as stub_cli
+import tvm_ffi.stub.lib_state as stub_lib_state
 import tvm_ffi.stub.rust_generator.codegen as rust_codegen
 from tvm_ffi import Object, method
 from tvm_ffi.core import TypeSchema, _lookup_or_register_type_info_from_type_key
@@ -88,6 +89,33 @@ def _type_suffix(name: str) -> str:
 
 def _input_type_suffix(name: str) -> str:
     return PC.TY_MAP_INPUT_DEFAULTS.get(name, PC.TY_MAP_DEFAULTS.get(name, name)).rsplit(".", 1)[-1]
+
+
+def test_collect_global_funcs_ignores_unqualified_registry_names(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    metadata_calls: list[str] = []
+
+    monkeypatch.setattr(
+        stub_lib_state,
+        "list_global_func_names",
+        lambda: ["SourceMapAdd", "testing.AddOne"],
+    )
+
+    def metadata(name: str) -> dict[str, str]:
+        metadata_calls.append(name)
+        return {"type_schema": '{"type":"ffi.Function","args":[{"type":"int"}]}'}
+
+    monkeypatch.setattr(stub_lib_state, "get_global_func_metadata", metadata)
+    stub_lib_state._func_info_from_global_name.cache_clear()
+    try:
+        funcs = stub_lib_state.collect_global_funcs()
+    finally:
+        stub_lib_state._func_info_from_global_name.cache_clear()
+
+    assert metadata_calls == ["testing.AddOne"]
+    assert [func.schema.name for func in funcs["testing"]] == ["testing.AddOne"]
+    assert capsys.readouterr().out == ""
 
 
 def test_codeblock_from_begin_line_variants() -> None:
