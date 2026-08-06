@@ -43,6 +43,8 @@ class PythonGenerator:
 
     name = "python"
     syntax = C.PYTHON_SYNTAX
+    supports_global_funcs = True
+    builtin_type_keys = frozenset(C.BUILTIN_TYPE_KEYS)
 
     def default_ty_map(self) -> dict[str, str]:
         """Return the default FFI-origin -> Python-type name map."""
@@ -62,6 +64,10 @@ class PythonGenerator:
         imports.items.append(ImportItem(name, type_checking_only=tco, alias=alias or None))
         if alias == "_FFI_LOAD_LIB" or name.endswith("libinfo.load_lib_module"):
             imports.has_lib_load = True
+
+    def reserve_defined_types(self, imports: PythonImports, names: set[str]) -> None:
+        """Python resolves local/import collisions through its existing alias logic."""
+        _ = (imports, names)
 
     def canonical_type_name(self, type_key: str) -> str:
         """Return the canonical (import-comparable) full name for a defined type key."""

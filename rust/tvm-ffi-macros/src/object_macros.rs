@@ -54,7 +54,7 @@ pub fn derive_object(input: proc_macro::TokenStream) -> TokenStream {
             quote! {
                 #[inline]
                 fn type_index() -> i32 {
-                    static TYPE_INDEX: std::sync::LazyLock<i32> = std::sync::LazyLock::new(||
+                    static TYPE_INDEX: ::std::sync::LazyLock<i32> = ::std::sync::LazyLock::new(||
                         unsafe {
                             let type_key_arg =
                                  #tvm_ffi_crate::tvm_ffi_sys::TVMFFIByteArray::from_str(#type_key);
@@ -132,6 +132,7 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
     let tvm_ffi_crate = get_tvm_ffi_crate();
     let derive_input = syn::parse_macro_input!(input as DeriveInput);
     let struct_name = derive_input.ident.clone();
+    let root_object_ref = get_attr(&derive_input, "root_object_ref").is_some();
 
     // search for field name base and derive the base type
     // we expect base always to be the first field
@@ -151,17 +152,19 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
 
     let mut expanded = quote! {
         unsafe impl #tvm_ffi_crate::object::ObjectRefCore for #struct_name {
-            type ContainerType = <#data_ty as std::ops::Deref>::Target;
+            type ContainerType = <#data_ty as ::std::ops::Deref>::Target;
             #[inline]
-            fn data(this: &Self) -> &ObjectArc<Self::ContainerType> {
+            fn data(this: &Self) -> &#tvm_ffi_crate::object::ObjectArc<Self::ContainerType> {
                 &this.data
             }
             #[inline]
-            fn into_data(this: Self) -> ObjectArc<Self::ContainerType> {
+            fn into_data(this: Self) -> #tvm_ffi_crate::object::ObjectArc<Self::ContainerType> {
                 this.data
             }
             #[inline]
-            fn from_data(data: ObjectArc<Self::ContainerType>) -> Self {
+            fn from_data(
+                data: #tvm_ffi_crate::object::ObjectArc<Self::ContainerType>
+            ) -> Self {
                 Self { data}
             }
         }
@@ -181,7 +184,7 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
                 <ContainerType as #tvm_ffi_crate::object::ObjectCore>::type_index()
             }
 
-            fn type_str() -> std::string::String {
+            fn type_str() -> ::std::string::String {
                 type ContainerType = <#struct_name as #tvm_ffi_crate::object::ObjectRefCore>
                     ::ContainerType;
                 <ContainerType as #tvm_ffi_crate::object::ObjectCore>::TYPE_KEY.into()
@@ -262,19 +265,20 @@ pub fn derive_object_ref(input: proc_macro::TokenStream) -> TokenStream {
 
             unsafe fn try_cast_from_any_view(
                 data: & #tvm_ffi_crate::tvm_ffi_sys::TVMFFIAny
-            ) -> Result<Self, ()> {
+            ) -> ::core::result::Result<Self, ()> {
                 type ContainerType = <#struct_name as #tvm_ffi_crate::object::ObjectRefCore>
                     ::ContainerType;
                 if #tvm_ffi_crate::object::is_instance_of::<ContainerType>(data.type_index) {
-                    Ok(Self::copy_from_any_view_after_check(data))
+                    ::core::result::Result::Ok(Self::copy_from_any_view_after_check(data))
                 } else {
-                    Err(())
+                    ::core::result::Result::Err(())
                 }
             }
         }
     };
-    // skip ObjectRef since it can create circular dependency with any.rs
-    if struct_name != "ObjectRef" {
+    // The crate's root erased ObjectRef is defined before the Any conversion
+    // helpers; generated/user types named ObjectRef must still get them.
+    if !root_object_ref {
         expanded.extend(quote! {
             #tvm_ffi_crate::impl_try_from_any!(#struct_name);
             #tvm_ffi_crate::impl_arg_into_ref!(#struct_name);

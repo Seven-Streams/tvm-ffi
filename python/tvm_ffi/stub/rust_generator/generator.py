@@ -32,7 +32,7 @@ from .codegen import (
     generate_rust_object,
 )
 from .consts import RUST_TY_MAP_DEFAULTS
-from .utils import RustImports, RustUse
+from .utils import RustImports, RustUse, UnsupportedTypeError, rust_identifier, rust_type_key_path
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -44,16 +44,18 @@ if TYPE_CHECKING:
 class RustGenerator:
     """Generator that emits Rust binding stubs.
 
-    Objects using an unrepresentable origin (``Union`` / ``Dict`` / ``List`` /
-    ``tuple``, or containers/``Optional`` over payloads the crate cannot hold)
-    are skipped with a warning; global functions and ``__all__``/``export``
-    re-exports are not generated. The backend targets natively-laid-out C++
-    objects only -- running it on Python-defined (``py_class``) types is
-    undefined (their fields use Python-side storage conventions).
+    Object layouts stay opaque. Fields, constructors, and methods use runtime
+    reflection; schemas that Rust cannot represent statically fall back to
+    owning ``Any`` results or borrowed ``AnyView`` parameters. Global functions
+    and ``__all__``/``export`` re-exports are not generated.
     """
 
     name = "rust"
     syntax = C.RUST_SYNTAX
+    supports_global_funcs = False
+    builtin_type_keys = frozenset(C.BUILTIN_TYPE_KEYS) | frozenset(
+        key for key in RUST_TY_MAP_DEFAULTS if key.startswith("ffi.")
+    )
 
     def default_ty_map(self) -> dict[str, str]:
         """Return the default FFI-origin -> Rust-type name map."""
@@ -71,11 +73,30 @@ class RustGenerator:
         ``type_checking_only`` and ``alias`` are ignored (Rust has no
         ``TYPE_CHECKING`` split and the Rust backend never emits ``use .. as``).
         """
-        imports.record(name)
+        imports.record(RUST_TY_MAP_DEFAULTS.get(name, rust_type_key_path(name)))
+
+    def reserve_defined_types(self, imports: RustImports, names: set[str]) -> None:
+        """Prevent imports from shadowing local wrappers and reject name collisions."""
+        generated_by: dict[str, str] = {}
+        for name in sorted(names):
+            leaf = RustUse(name).leaf
+            raw_leaf = leaf.removeprefix("r#")
+            ref_name = rust_identifier(raw_leaf)
+            obj_name = rust_identifier(f"{raw_leaf}Obj")
+            for generated in (ref_name, obj_name):
+                if previous := generated_by.get(generated):
+                    raise UnsupportedTypeError(
+                        name,
+                        f"Rust types {previous!r} and {name!r} both generate item {generated!r}",
+                    )
+                generated_by[generated] = name
+            imports.reserve(ref_name, obj_name)
 
     def canonical_type_name(self, type_key: str) -> str:
         """Return the Rust path for a defined type key (matches :attr:`RustUse.path`)."""
-        return RustUse(type_key).path
+        if "::" in type_key:
+            return RustUse(type_key).path
+        return rust_type_key_path(type_key)
 
     def extra_export_names(self, imports: RustImports) -> set[str]:
         """No extra export names for Rust."""

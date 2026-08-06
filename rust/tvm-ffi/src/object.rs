@@ -76,6 +76,74 @@ pub unsafe trait ObjectCore: Sized + 'static {
     unsafe fn object_header_mut(this: &mut Self) -> &mut TVMFFIObject;
 }
 
+/// Borrow an object container as a dynamically typed FFI value.
+///
+/// This is support code for generated instance methods.  The returned view
+/// borrows `object` and does not change its reference count.
+#[doc(hidden)]
+pub fn object_core_as_any_view<T: ObjectCore>(object: &T) -> crate::AnyView<'_> {
+    unsafe {
+        let header = object as *const T as *mut TVMFFIObject;
+        let mut raw = TVMFFIAny::new();
+        raw.type_index = (*header).type_index;
+        raw.small_str_len = 0;
+        raw.data_union.v_obj = header;
+        crate::AnyView::from_raw_ffi_any(raw)
+    }
+}
+
+/// Read one field from an FFI-owned object through its reflection getter.
+///
+/// This is support code for generated bindings.  The returned [`crate::Any`]
+/// owns its value, so it does not borrow from `object`.
+///
+/// # Safety
+///
+/// `object` must point to a complete runtime object whose layout matches the
+/// reflection entry for `T`.  Implementing [`ObjectCore`] only guarantees a
+/// compatible object header, not the presence of reflected trailing fields.
+#[doc(hidden)]
+pub unsafe fn get_reflected_field_unchecked<T: ObjectCore>(
+    object: &T,
+    field_name: &str,
+) -> crate::Result<crate::Any> {
+    let info = unsafe { TVMFFIGetTypeInfo(T::type_index()) };
+    if info.is_null() {
+        crate::bail!(crate::TYPE_ERROR, "no type info for `{}`", T::TYPE_KEY);
+    }
+
+    let info = unsafe { &*info };
+    for index in 0..info.num_fields {
+        let field = unsafe { &*info.fields.add(index as usize) };
+        if field.name.as_str() != field_name {
+            continue;
+        }
+        let Some(getter) = field.getter else {
+            crate::bail!(
+                crate::RUNTIME_ERROR,
+                "reflected field `{}` on `{}` has no getter",
+                field_name,
+                T::TYPE_KEY,
+            );
+        };
+        let address = unsafe {
+            (object as *const T as *mut u8)
+                .offset(field.offset as isize)
+                .cast::<std::ffi::c_void>()
+        };
+        let mut raw = TVMFFIAny::new();
+        crate::check_safe_call!(unsafe { getter(address, &mut raw) })?;
+        return Ok(unsafe { crate::Any::from_raw_ffi_any(raw) });
+    }
+
+    crate::bail!(
+        crate::TYPE_ERROR,
+        "field `{}` not found on `{}`",
+        field_name,
+        T::TYPE_KEY,
+    )
+}
+
 /// Traits for objects with extra items that follows the object
 ///
 /// This extra trait can be helpful to implement array types and string types
@@ -104,8 +172,6 @@ pub unsafe trait ObjectCoreWithExtraItems: ObjectCore {
 
 /// Traits to specify core operations of ObjectRef
 ///
-/// used by the ffi Any system and not user facing
-///
 /// We mark as unsafe since it moves out the internal of the ObjectRef
 ///
 /// # Safety
@@ -126,6 +192,14 @@ pub unsafe trait ObjectRefCore: Sized + Clone {
     fn data(this: &Self) -> &ObjectArc<Self::ContainerType>;
     fn into_data(this: Self) -> ObjectArc<Self::ContainerType>;
     fn from_data(data: ObjectArc<Self::ContainerType>) -> Self;
+
+    /// Return whether two references point to the same runtime object.
+    fn same_as<O: ObjectRefCore>(&self, other: &O) -> bool {
+        unsafe {
+            ObjectArc::as_raw(Self::data(self)).cast::<u8>()
+                == ObjectArc::as_raw(O::data(other)).cast::<u8>()
+        }
+    }
 }
 
 /// Check whether a runtime type index refers to `Target` or one of its
@@ -222,6 +296,7 @@ impl<T: ObjectRefCore + AnyCompatible> ObjectRefCast for T {}
 /// This class is used to store the data of the ObjectRef
 #[repr(C)]
 #[derive(ObjectRef, Clone)]
+#[root_object_ref]
 pub struct ObjectRef {
     data: ObjectArc<Object>,
 }

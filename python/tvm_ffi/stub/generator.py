@@ -71,6 +71,12 @@ class Generator(Protocol):
     #: Comment-marker syntax for the files this generator emits.
     syntax: C.MarkerSyntax
 
+    #: Whether global function prefixes should create generated API modules.
+    supports_global_funcs: bool
+
+    #: Runtime types already supplied by the target language support crate.
+    builtin_type_keys: frozenset[str]
+
     def default_ty_map(self) -> dict[str, str]:
         """Return the default FFI-origin -> target-type name map for this language."""
         ...
@@ -85,6 +91,10 @@ class Generator(Protocol):
         self, imports: Any, name: str, type_checking_only: str, alias: str
     ) -> None:
         """Record an ``import-object`` directive (raw directive fields) into ``imports``."""
+        ...
+
+    def reserve_defined_types(self, imports: Any, names: set[str]) -> None:
+        """Reserve the canonical names that this file intends to define."""
         ...
 
     def canonical_type_name(self, type_key: str) -> str:
