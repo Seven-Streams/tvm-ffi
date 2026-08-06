@@ -49,13 +49,33 @@ macro_rules! function_name {
 #[macro_export]
 macro_rules! cached_global_func {
     ($name:literal) => {{
-        static FUNC: std::sync::LazyLock<$crate::function::Function> =
-            std::sync::LazyLock::new(|| {
+        static FUNC: ::std::sync::LazyLock<$crate::function::Function> =
+            ::std::sync::LazyLock::new(|| {
                 $crate::function::Function::get_global($name).unwrap_or_else(|_| {
                     panic!(concat!("global function `", $name, "` is not registered"))
                 })
             });
         &*FUNC
+    }};
+}
+
+/// Resolve and cache a reflected type method at this call site.
+#[macro_export]
+macro_rules! cached_type_method {
+    ($type_index:expr, $name:literal) => {{
+        static FUNC: ::std::sync::OnceLock<$crate::function::Function> =
+            ::std::sync::OnceLock::new();
+        $crate::function::Function::from_type_method_cached(&FUNC, $type_index, $name)
+    }};
+}
+
+/// Resolve and cache a function-valued type attribute at this call site.
+#[macro_export]
+macro_rules! cached_type_attr {
+    ($type_index:expr, $name:literal) => {{
+        static FUNC: ::std::sync::OnceLock<$crate::function::Function> =
+            ::std::sync::OnceLock::new();
+        $crate::function::Function::from_type_attr_cached(&FUNC, $type_index, $name)
     }};
 }
 
@@ -164,25 +184,27 @@ macro_rules! attach_context {
 macro_rules! impl_try_from_any {
     ($($t:ty),* $(,)?) => {
         $(
-            impl<'a> TryFrom<$crate::any::AnyView<'a>> for $t {
+            impl<'a> ::core::convert::TryFrom<$crate::any::AnyView<'a>> for $t {
                 type Error = $crate::error::Error;
                 #[inline(always)]
                 fn try_from(
                     value: $crate::any::AnyView<'a>
-                ) -> Result<Self, Self::Error> {
+                ) -> ::core::result::Result<Self, Self::Error> {
                     type TryFromTemp = $crate::any::TryFromTemp<$t>;
-                    return TryFromTemp::try_from(value).map(TryFromTemp::into_value);
+                    return <TryFromTemp as ::core::convert::TryFrom<_>>::try_from(value)
+                        .map(TryFromTemp::into_value);
                 }
             }
 
-            impl TryFrom<$crate::any::Any> for $t {
+            impl ::core::convert::TryFrom<$crate::any::Any> for $t {
                 type Error = $crate::error::Error;
                 #[inline(always)]
                 fn try_from(
                     value: $crate::any::Any
-                ) -> Result<Self, Self::Error> {
+                ) -> ::core::result::Result<Self, Self::Error> {
                     type TryFromTemp = $crate::any::TryFromTemp<$t>;
-                    return TryFromTemp::try_from(value).map(TryFromTemp::into_value);
+                    return <TryFromTemp as ::core::convert::TryFrom<_>>::try_from(value)
+                        .map(TryFromTemp::into_value);
                 }
             }
         )*

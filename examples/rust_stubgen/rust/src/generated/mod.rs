@@ -18,3 +18,6 @@
  */
 
 pub mod rust_stubgen;
+
+// tvm-ffi-stubgen-modules(begin)
+// tvm-ffi-stubgen-modules(end)

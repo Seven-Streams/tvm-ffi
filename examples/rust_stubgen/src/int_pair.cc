@@ -33,15 +33,14 @@ class IntPairObj : public ffi::Object {
  public:
   int64_t a;
   int64_t b;
-  // `scale` carries a reflected default: the generated Rust builder prefills
-  // it and exposes a `.scale(..)` setter instead of a required parameter.
+  // `scale` carries a reflected default and is readable through the generated
+  // owning reflection getter.
   int64_t scale = 1;
 
   IntPairObj(int64_t a, int64_t b) : a(a), b(b) {}
 
   int64_t Sum() const { return (a + b) * scale; }
 
-  // All fields are writable, so the generated Rust wrapper gets `DerefMut`.
   static constexpr bool _type_mutable = true;
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL(
       /*type_key=*/"rust_stubgen.IntPair",
@@ -56,7 +55,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def_rw("a", &IntPairObj::a, "the first field")
       .def_rw("b", &IntPairObj::b, "the second field")
       .def_rw("scale", &IntPairObj::scale, refl::init(false), refl::default_value(int64_t{1}),
-              "sum multiplier (defaulted -> builder setter in Rust)")
+              "sum multiplier")
       .def("sum", &IntPairObj::Sum, "(a + b) * scale");
 }
 // [object.end]

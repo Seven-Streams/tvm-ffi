@@ -57,7 +57,8 @@ cd rust
 cargo run
 ```
 
-This runs four flows: constructing an `IntPair` via the generated builder
-(`ffi_new().a(1).b(2).build()`; the defaulted `scale` field may be omitted),
-calling the `sum` method, overriding the default through the `.scale(..)`
-setter, and writing a field through `DerefMut`.
+This constructs an `IntPair` through its reflected C++ constructor, reads its
+fields through the generated owning getters, calls the reflected `sum` method,
+and verifies identity across a cloned Rust handle. Generated Rust object structs
+are intentionally opaque: they do not duplicate C++ field layout or allocate
+C++ runtime objects with Rust's allocator.

@@ -23,22 +23,20 @@ Codegen orchestration lives here; low-level rendering helpers live in
 from __future__ import annotations
 
 import dataclasses
-import math
+import re
 from typing import TYPE_CHECKING
 
-from tvm_ffi.core import MISSING
-
 from .. import consts as C
-from ..lib_state import object_info_from_type_key
 from . import consts as C_RUST
 from .utils import (
     RustImports,
     UnsupportedTypeError,
     _deref_impl,
-    _element_rust_type,
     _packed_args_expr,
     _packed_call_lines,
     render_rust_type,
+    rust_identifier,
+    rust_type_key_path,
 )
 
 if TYPE_CHECKING:
@@ -48,9 +46,6 @@ if TYPE_CHECKING:
 
     from ..file_utils import CodeBlock
     from ..utils import FuncInfo, InitConfig, NamedTypeSchema, ObjectInfo, Options
-
-
-# --- native (FFI-free) construction eligibility ------------------------------
 
 
 def _rust_string_literal(s: str) -> str:
@@ -65,156 +60,6 @@ def _rust_string_literal(s: str) -> str:
             out.append(f"\\u{{{ord(ch):x}}}")
     out.append('"')
     return "".join(out)
-
-
-def _scalar_literal(value: object) -> str | None:
-    """Render a ``bool``/``int``/finite ``float`` value as a Rust literal (``None``: can't).
-
-    The literal coerces to the field's possibly narrowed scalar type in the
-    struct-literal position.
-    """
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return repr(value)
-    if isinstance(value, float):
-        return repr(value) if math.isfinite(value) else None
-    return None
-
-
-def _optional_payload_is_any_backed(payload: TypeSchema) -> bool:
-    """Whether C++ ``Optional<payload>`` keeps the 16-byte Any-backed layout.
-
-    Mirrors ``use_object_ref_optional_v`` (the #701 split): an ``ObjectRef``-derived
-    payload gets the pointer-sized object optional; non-object values (scalars,
-    ``Device``, ``dtype``) and nested optionals (``!is_optional_type_v``) stay
-    Any-backed.
-    """
-    return (
-        payload.origin in C_RUST.RUST_ANY_BACKED_OPTIONAL_PAYLOADS or payload.origin == "Optional"
-    )
-
-
-def _optional_default_expr(field: NamedTypeSchema) -> str | None:
-    """Render an ``Optional`` field's ``nullopt`` default as the mirror's disengaged state.
-
-    Only the ``None`` default is supported: an engaged default's type-erased
-    value can disagree with the payload's kind or width, so it is treated as
-    unrenderable (``ffi_new`` is then skipped loudly). The disengaged value
-    follows the field's mirror: ``Optional::none()`` for the Any-cell mirror,
-    the ``Option`` ``None`` for the pointer-sized object mirror.
-    """
-    if field.default is not None:
-        return None
-    (payload,) = field.args or (None,)
-    if payload is not None and not _optional_payload_is_any_backed(payload):
-        return "None"
-    return f"{C_RUST.RUST_OPTIONAL_PATH}::none()"
-
-
-def _default_expr(field: NamedTypeSchema) -> str | None:
-    """Render ``field``'s registered default as a Rust expression (``None``: can't).
-
-    Supported: ``bool``/``int``/finite ``float`` literals, ``str`` (as
-    ``tvm_ffi::String``), and the ``nullopt`` default of ``Optional`` fields.
-    Anything else has no native materialization.
-    """
-    if field.origin == "Optional":
-        return _optional_default_expr(field)
-    value = field.default
-    literal = _scalar_literal(value)
-    if literal is not None:
-        return literal
-    if isinstance(value, str):
-        return f"tvm_ffi::String::from({_rust_string_literal(value)})"
-    return None
-
-
-def _native_blocker(info: ObjectInfo) -> str | None:
-    """Why ``info`` cannot be constructed natively; ``None`` when it can.
-
-    The native builder allocates the struct directly, binding every own
-    field from its setter or a stubgen-rendered default and silently
-    bypassing any C++ constructor logic -- that is the opted-in behavior, so
-    native is used whenever possible. There is no FFI fallback: a blocked
-    type gets no generated constructor at all (the user hand-writes one).
-    """
-    if not info.has_init:
-        return "the type has no reflected constructor"
-    for field in info.fields:
-        if field.default_is_factory:
-            return f"field {field.name!r} uses a default factory (FFI-only)"
-        if field.default is not MISSING and _default_expr(field) is None:
-            return f"the default value of field {field.name!r} has no Rust rendering"
-    parent = info.parent_type_key
-    if parent in (None, "ffi.Object") or _native_eligible(parent):
-        return None
-    return f"parent {parent!r} is not natively constructible"
-
-
-def _info_native_eligible(info: ObjectInfo) -> bool:
-    """Whether ``info`` can be constructed natively (see :func:`_native_blocker`)."""
-    return _native_blocker(info) is None
-
-
-def _native_eligible(type_key: str) -> bool:
-    """Type-key wrapper of :func:`_info_native_eligible` (parent recursion).
-
-    A type that cannot be resolved is warned about and treated as non-native.
-    Deliberately uncached: a cache would go stale across registry changes.
-    """
-    try:
-        info = object_info_from_type_key(type_key)
-    except Exception as e:  # any failure means "cannot prove native-safe"
-        print(
-            f"{C.TERM_YELLOW}[Warning] cannot resolve type {type_key!r} for native "
-            f"construction ({type(e).__name__}: {e}); treating it as non-native"
-            f"{C.TERM_RESET}"
-        )
-        return False
-    return _info_native_eligible(info)
-
-
-def _layout_fields(fields: list[NamedTypeSchema]) -> list[NamedTypeSchema]:
-    """Sort own fields by reflection ``offset`` (C++ memory order).
-
-    Registration order need not match memory order, but the ``#[repr(C)]``
-    struct is positional. Fields without an offset (synthetic ``ObjectInfo``s
-    in tests) keep registration order.
-    """
-    if any(f.offset is None for f in fields):
-        return list(fields)
-    return sorted(fields, key=lambda f: f.offset)
-
-
-def _warn_offset_mismatch(type_key: str | None, fields: list[NamedTypeSchema]) -> None:
-    """Warn when ``#[repr(C)]`` cannot reproduce the recorded field offsets.
-
-    Recomputes each field's ``#[repr(C)]`` placement from the previous field's
-    end. Reflection has no ``alignof``, so alignment is approximated from
-    ``size`` (largest power of two, capped at 8) -- exact for scalars, but
-    composite FFI structs like ``DLDevice`` can trigger a false positive. A
-    mismatch only warns; the binding is still emitted. Fields without
-    offset/size metadata are skipped and reset the running position.
-    """
-    prev_end: int | None = None
-    for field in fields:
-        if field.offset is None or field.size is None:
-            prev_end = None
-            continue
-        if prev_end is not None:
-            align = min(8, field.size & -field.size)
-            placed = (prev_end + align - 1) // align * align
-            if placed != field.offset:
-                print(
-                    f"{C.TERM_YELLOW}[Warning] object {type_key}: field "
-                    f"{field.name!r} is at C++ offset {field.offset}, but the "
-                    f"generated #[repr(C)] layout places it at offset {placed}; "
-                    f"the Rust struct may not match the C++ object layout"
-                    f"{C.TERM_RESET}"
-                )
-        # Resync to the recorded offset so one hole yields one warning.
-        prev_end = field.offset + field.size
 
 
 @dataclasses.dataclass
@@ -245,18 +90,21 @@ class _ObjectRenderer:
         module tree via :meth:`_generated_type_path`. An unmapped bare origin
         (e.g. ``const char*``) or a ``ctypes.*`` sentinel (``ctypes.c_void_p``
         -- ``void*`` -- is dotted but is not an object key and has no Rust
-        rendering) raises, skipping the enclosing object. Rejecting here covers
-        every position uniformly (field, container element, method arg/return),
-        so no separate element blocklist is needed.
+        rendering) raises. Value/argument renderers catch those schema failures
+        and use ``Any``/``AnyView`` without confusing them with a named IR type.
         """
         mapped = self.ty_map.get(origin)
         if mapped is None:
             if "." not in origin or origin.startswith("ctypes."):
                 raise UnsupportedTypeError(origin)
             mapped = self._generated_type_path(origin)
+        elif "::" not in mapped and "." in mapped:
+            # Dotted map targets name another generated reflected type. Rust
+            # crate paths use `::` and pass through unchanged.
+            mapped = self._generated_type_path(mapped)
         return self.imports.record(mapped)
 
-    def _generated_type_path(self, type_key: str) -> str:
+    def _generated_type_path(self, type_key: str, *, object_data: bool = False) -> str:
         """Resolve a generated-tree type key to a path valid from this file.
 
         A bare ``use ir::Expr;`` is broken in edition 2021 (it resolves to an
@@ -270,194 +118,199 @@ class _ObjectRenderer:
         lives in the crate, not the generated tree, and passes through for
         :class:`~.utils.RustUse` to rewrite.
         """
-        head, _, _ = type_key.partition(".")
-        if head in C_RUST.RUST_MOD_MAP:
-            return type_key
-        mod, _, type_leaf = type_key.rpartition(".")
-        if tuple(mod.split(".")) == self.mod_segments:
-            return type_leaf
-        supers = "super::" * len(self.mod_segments)
-        return f"{supers or 'self::'}{type_key.replace('.', '::')}"
-
-    def render_struct_field(self, schema: NamedTypeSchema) -> str:
-        """Render a directly-laid-out struct field type, width-correct for scalars.
-
-        An ``int32_t`` field must render as ``i32``, not the schema-erased
-        default ``i64``; the width comes from reflection's per-field ``size``.
-        ``Optional`` fields are layout-sensitive and route to their in-place
-        mirror. Non-scalar origins (or schemas without a size) render plainly.
-        """
-        if schema.origin == "Optional":
-            return self._render_optional_field(schema)
-        narrowed = C_RUST.RUST_SCALAR_BY_SIZE.get((schema.origin, schema.size))
-        return narrowed if narrowed is not None else render_rust_type(schema, self._ty_render)
-
-    def _render_optional_field(self, schema: NamedTypeSchema) -> str:
-        """Render an ``Optional<T>`` FIELD as its layout mirror (the #701 split).
-
-        An ``ObjectRef``-derived payload (strings, containers, object classes)
-        is a pointer-sized nullable pointer in C++ (``nullopt == nullptr``),
-        mirrored by Rust's niche-optimized ``Option<T>``. Every other
-        storage-enabled payload stays a single 16-byte ``TVMFFIAny`` cell
-        (``nullopt == kTVMFFINone``), mirrored by ``tvm_ffi::Optional<T>``.
-        The payload rules are exactly the container-element rules; the size
-        guards reject the ``std::optional`` fallback layout of storage-disabled
-        types.
-        """
-        (payload,) = schema.args or (None,)  # Optional always has exactly one argument
-        assert payload is not None
-        if payload.origin == "Any":
-            # C++ `Optional<Any>` stays Any-backed, but the crate has no
-            # compilable mirror: the `Any` element rendering (`ObjectRef`) is
-            # deliberately not `OptionalCompatible`.
-            raise UnsupportedTypeError("Optional", "`Optional<Any>` fields have no Rust mirror")
-        payload_ty = _element_rust_type(payload, self._ty_render)
-        if _optional_payload_is_any_backed(payload):
-            if schema.size not in (None, C_RUST.RUST_OPTIONAL_FIELD_SIZE):
+        mapped = C_RUST.RUST_TY_MAP_DEFAULTS.get(type_key)
+        if mapped is not None:
+            if object_data:
                 raise UnsupportedTypeError(
-                    "Optional",
-                    f"`Optional<{payload.origin}>` field has size {schema.size}, not the "
-                    f"{C_RUST.RUST_OPTIONAL_FIELD_SIZE}-byte `TVMFFIAny`-backed "
-                    "`ffi::Optional` layout",
+                    type_key, f"Rust has no exposed object container for builtin {type_key!r}"
                 )
-            # No width recovery: the Any cell stores the widened v_int64/v_float64,
-            # so the schema-erased scalar is the correct mirror for every C++ width.
-            opt = self.imports.record(C_RUST.RUST_OPTIONAL_PATH)
-            return f"{opt}<{payload_ty}>"
-        if schema.size not in (None, C_RUST.RUST_OBJECT_OPTIONAL_FIELD_SIZE):
-            raise UnsupportedTypeError(
-                "Optional",
-                f"`Optional<{payload.origin}>` field has size {schema.size}, not the "
-                f"{C_RUST.RUST_OBJECT_OPTIONAL_FIELD_SIZE}-byte pointer-sized object "
-                "`ffi::Optional` layout",
-            )
-        return f"Option<{payload_ty}>"
+            return mapped
+        mod, _, type_leaf = type_key.rpartition(".")
+        type_name = rust_identifier(f"{type_leaf}Obj" if object_data else type_leaf)
+        if tuple(mod.split(".")) == self.mod_segments:
+            return type_name
+        supers = "super::" * len(self.mod_segments)
+        path = rust_type_key_path(type_key, object_data=object_data)
+        return f"{supers or 'self::'}{path}"
 
-    def render_param(self, schema: TypeSchema) -> str:
-        """Render an argument type (a top-level ``Any`` is the non-owning ``AnyView``)."""
-        if schema.origin == "Any":
-            return self.imports.record("tvm_ffi::AnyView")
-        return render_rust_type(schema, self._ty_render)
+    def render_result(self, schema: TypeSchema) -> tuple[str, bool]:
+        """Render an owning result, falling back to ``Any`` when it is dynamic.
+
+        In particular, a container containing ``Any`` cannot be represented as
+        a Rust ``Array<T>``/``Map<K, V>`` without lying about its element type.
+        Keeping the complete value as owning ``Any`` is lossless and lets
+        callers inspect it with the dynamic APIs or ``structural_walk``.
+        """
+        checkpoint = len(self.imports.items)
+        try:
+            if schema.origin == "Any":
+                raise UnsupportedTypeError("Any")
+            return render_rust_type(schema, self._ty_render), False
+        except UnsupportedTypeError:
+            del self.imports.items[checkpoint:]
+            return "::tvm_ffi::Any", True
+
+    def render_param(self, schema: TypeSchema) -> tuple[str, bool]:
+        """Render an argument, using ``AnyView`` for dynamic schemas."""
+        checkpoint = len(self.imports.items)
+        try:
+            if schema.origin == "Any":
+                raise UnsupportedTypeError("Any")
+            return render_rust_type(schema, self._ty_render), False
+        except UnsupportedTypeError:
+            del self.imports.items[checkpoint:]
+            return "::tvm_ffi::AnyView", True
 
     def body(self) -> list[str]:
-        """Build the Rust source lines for the object (raises on unsupported types)."""
-        # Boilerplate `use`s, recorded through the same collector as field types
-        # so leaf collisions raise and skip the object. The derive macros are
-        # spelled by full path in the attribute, never imported: their leaves
-        # collide with `tvm_ffi::Object`/`ObjectRef`.
-        self.imports.record("std::ops::Deref")
-        # `ObjectCore` must be in scope for the generated `type_index()` calls.
-        self.imports.record("tvm_ffi::ObjectCore")
-        self.imports.record("tvm_ffi::ObjectArc")
+        """Build one opaque object binding and its reflection-backed API."""
         if self.is_root:
-            # Same path the ty_map uses for `Object` fields, so they dedup
-            # instead of colliding.
-            self.base_type = self.imports.record("tvm_ffi::Object")
-        # C++ `_type_mutable`: class-level mutability dominates per-field `def_ro`.
-        if self.info.mutable:
-            self.imports.record("std::ops::DerefMut")
+            self.base_type = "::tvm_ffi::Object"
+        else:
+            parent = self.info.parent_type_key
+            assert isinstance(parent, str)
+            self.base_type = self.imports.record(
+                self._generated_type_path(parent, object_data=True)
+            )
 
         leaf, obj_struct, base_type = self.leaf, self.obj_struct, self.base_type
-        lines: list[str] = []
-        lines += [
+        lines = [
             "#[repr(C)]",
-            "#[derive(tvm_ffi::derive::Object)]",
-            f'#[type_key = "{self.info.type_key}"]',
+            "#[derive(::tvm_ffi::derive::Object)]",
+            f"#[type_key = {_rust_string_literal(self.info.type_key)}]",
             f"pub struct {obj_struct} {{",
             f"    base: {base_type},",
         ]
-        for field in _layout_fields(self.info.fields):
-            lines.append(f"    pub {field.name}: {self.render_struct_field(field)},")
-        lines += ["}", ""]
-
         lines += [
+            "}",
+            "",
             "#[repr(C)]",
-            "#[derive(tvm_ffi::derive::ObjectRef, Clone)]",
+            "#[derive(::tvm_ffi::derive::ObjectRef, Clone)]",
             f"pub struct {leaf} {{",
-            f"    data: ObjectArc<{obj_struct}>,",
+            f"    data: ::tvm_ffi::ObjectArc<{obj_struct}>,",
             "}",
             "",
         ]
 
-        lines += _deref_impl(leaf, obj_struct, "data", self.info.mutable)
+        lines += _deref_impl(leaf, obj_struct, "data")
         if not self.is_root:
-            lines += _deref_impl(obj_struct, base_type, "base", self.info.mutable)
+            lines += _deref_impl(obj_struct, base_type, "base")
             lines += self._upcast_lines()
 
-        # Native (FFI-free) construction whenever the whole chain is eligible;
-        # there is no FFI fallback -- a blocked constructor is skipped loudly.
-        blocker = _native_blocker(self.info)
-        native = blocker is None
-        if self.info.has_init and not native:
-            print(
-                f"{C.TERM_YELLOW}[Warning] object {self.info.type_key}: skipping "
-                f"`ffi_new` because {blocker}; hand-write a constructor outside "
-                f"the generated markers{C.TERM_RESET}"
-            )
-        lines += self._impl_block(native)
-        if native:
-            lines += self._builder_lines()
+        methods = self._non_overloaded_methods()
+        lines += self._object_impl_block([method for method in methods if method.is_member])
+        lines += self._ref_impl_block([method for method in methods if not method.is_member])
 
         lines.pop()  # every section above ends with a `""` separator
         return lines
 
-    def _ref_helper_lines(self) -> list[str]:
-        """`same_as` (pointer identity) and `downcast` (checked concrete retype).
-
-        Present on every generated ref, mirroring the C++ ref-class
-        `ObjectRef::same_as` and `obj.as<N>()`: pass code compares object
-        identity and narrows a base handle to a concrete node. `downcast`
-        returns a borrow of `N` iff the object header's runtime type index
-        equals `N`'s.
-        """
-        self.imports.record("tvm_ffi::ObjectRefCore")
+    def _field_fn(self, field: NamedTypeSchema) -> list[str]:
+        """Emit one safe accessor backed by the field's owning FFI getter."""
+        ret, dynamic = self.render_result(field)
+        name = field.name
+        rust_name = rust_identifier(name)
+        call = (
+            f"::tvm_ffi::object::get_reflected_field_unchecked(self, {_rust_string_literal(name)})"
+        )
+        body = f"unsafe {{ {call} }}" if dynamic else f"unsafe {{ {call} }}?.try_into()"
         return [
-            "/// C++ `ObjectRef::same_as`: pointer identity of the underlying object.",
-            "pub fn same_as<O: tvm_ffi::ObjectRefCore>(&self, other: &O) -> bool {",
-            "    unsafe {",
-            "        ObjectArc::as_raw(&self.data) as *const u8",
-            "            == ObjectArc::as_raw(<O as tvm_ffi::ObjectRefCore>::data(other)) as *const u8",
-            "    }",
-            "}",
-            "",
-            "/// Checked downcast to a concrete object `N` (C++ `obj.as<N>()`):",
-            "/// `Some(&N)` iff the runtime header type index matches, else `None`.",
-            "pub fn downcast<N: tvm_ffi::ObjectCore>(&self) -> Option<&N> {",
-            "    unsafe {",
-            "        let raw = ObjectArc::as_raw(&self.data) as *const N;",
-            "        let header = raw as *const tvm_ffi::tvm_ffi_sys::TVMFFIObject;",
-            "        if (*header).type_index == <N as tvm_ffi::ObjectCore>::type_index() {",
-            "            Some(&*raw)",
-            "        } else {",
-            "            None",
-            "        }",
-            "    }",
+            f"pub fn {rust_name}(&self) -> ::tvm_ffi::Result<{ret}> {{",
+            f"    {body}",
             "}",
         ]
 
-    def _impl_block(self, native: bool) -> list[str]:
-        """Emit `impl <T> { same_as; downcast; ffi_new; methods }`."""
-        methods = [
-            m for m in self.info.methods if m.schema.name.rsplit(".", 1)[-1] != "__ffi_init__"
-        ]
-
-        sections: list[list[str]] = [self._ref_helper_lines()]
-        if native:  # `native` implies `has_init` (see `_native_blocker`)
-            sections.append(self._new_fn_native())
-        sections += [self._method_fn(method) for method in methods]
-
+    @staticmethod
+    def _impl_block(target: str, sections: list[list[str]]) -> list[str]:
+        """Wrap non-empty method sections in one inherent ``impl`` block."""
+        if not sections:
+            return []
         inner: list[str] = []
         for i, section in enumerate(sections):
             if i:
                 inner.append("")
             inner += section
-
         return [
-            f"impl {self.leaf} {{",
+            f"impl {target} {{",
             *[f"    {line}" if line else "" for line in inner],
             "}",
             "",
         ]
+
+    def _non_overloaded_methods(self) -> list[FuncInfo]:
+        """Return methods Rust can name uniquely, skipping overloaded groups."""
+        groups: dict[tuple[str, bool], list[FuncInfo]] = {}
+        for method in self.info.methods:
+            ffi_name = method.schema.name.rsplit(".", 1)[-1]
+            if ffi_name == "__ffi_init__":
+                continue
+            try:
+                rust_name = rust_identifier(ffi_name)
+            except UnsupportedTypeError as err:
+                print(
+                    f"{C.TERM_YELLOW}[Warning] object {self.info.type_key}: skipping "
+                    f"Rust method {ffi_name!r}: {err}{C.TERM_RESET}"
+                )
+                continue
+            groups.setdefault((rust_name, method.is_member), []).append(method)
+
+        methods: list[FuncInfo] = []
+        for (rust_name, _is_member), overloads in groups.items():
+            if len(overloads) == 1:
+                methods.append(overloads[0])
+                continue
+            print(
+                f"{C.TERM_YELLOW}[Warning] object {self.info.type_key}: skipping "
+                f"overloaded Rust method {rust_name!r}; use Function reflection explicitly"
+                f"{C.TERM_RESET}"
+            )
+        return methods
+
+    def _object_impl_block(self, methods: list[FuncInfo]) -> list[str]:
+        """Emit own fields and instance methods on ``Obj`` for inheritance."""
+        named_sections: list[tuple[str, list[str]]] = []
+        for field in self.info.fields:
+            try:
+                named_sections.append((rust_identifier(field.name), self._field_fn(field)))
+            except UnsupportedTypeError as err:
+                print(
+                    f"{C.TERM_YELLOW}[Warning] object {self.info.type_key}: skipping "
+                    f"Rust field accessor {field.name!r}: {err}{C.TERM_RESET}"
+                )
+        named_sections += [
+            (rust_identifier(method.schema.name.rsplit(".", 1)[-1]), self._method_fn(method))
+            for method in methods
+        ]
+        named_sections = self._dedupe_sections(named_sections, self.obj_struct)
+        return self._impl_block(self.obj_struct, [section for _, section in named_sections])
+
+    def _ref_impl_block(self, methods: list[FuncInfo]) -> list[str]:
+        """Emit the reflected constructor and static methods on the ref type."""
+        named_sections: list[tuple[str, list[str]]] = []
+        constructor = self._constructor_fn()
+        if constructor is not None:
+            named_sections.append(("ffi_new", constructor))
+        named_sections += [
+            (rust_identifier(method.schema.name.rsplit(".", 1)[-1]), self._method_fn(method))
+            for method in methods
+        ]
+        named_sections = self._dedupe_sections(named_sections, self.leaf)
+        return self._impl_block(self.leaf, [section for _, section in named_sections])
+
+    def _dedupe_sections(
+        self, named_sections: list[tuple[str, list[str]]], target: str
+    ) -> list[tuple[str, list[str]]]:
+        """Keep the first API for each Rust name and warn about later collisions."""
+        seen: set[str] = set()
+        unique: list[tuple[str, list[str]]] = []
+        for name, section in named_sections:
+            if name in seen:
+                print(
+                    f"{C.TERM_YELLOW}[Warning] object {self.info.type_key}: skipping duplicate "
+                    f"Rust method {name!r} on {target}{C.TERM_RESET}"
+                )
+                continue
+            seen.add(name)
+            unique.append((name, section))
+        return unique
 
     def _upcast_lines(self) -> list[str]:
         """`impl From<Leaf> for <ParentRef>` -- offset-0 prefix retype (upcast).
@@ -468,199 +321,160 @@ class _ObjectRenderer:
         only -- the parent's ref is the generated `<ParentLeaf>`; a root object
         has no ref-typed parent (its `base` is the bare `Object` data struct).
         """
-        self.imports.record("tvm_ffi::ObjectRefCore")
-        parent_ref = self.base_type[:-3]  # `<ParentLeaf>Obj` -> `<ParentLeaf>`
+        parent = self.info.parent_type_key
+        assert isinstance(parent, str)
+        parent_ref = self.imports.record(self._generated_type_path(parent))
         parent_obj = self.base_type
         return [
-            f"impl From<{self.leaf}> for {parent_ref} {{",
+            f"impl ::core::convert::From<{self.leaf}> for {parent_ref} {{",
             f"    fn from(x: {self.leaf}) -> {parent_ref} {{",
-            f"        let arc = <{self.leaf} as tvm_ffi::ObjectRefCore>::into_data(x);",
+            f"        let arc = <{self.leaf} as ::tvm_ffi::ObjectRefCore>::into_data(x);",
             "        let up = unsafe {",
-            f"            ObjectArc::from_raw(ObjectArc::into_raw(arc) as *const {parent_obj})",
+            "            ::tvm_ffi::ObjectArc::from_raw("
+            f"::tvm_ffi::ObjectArc::into_raw(arc) as *const {parent_obj})",
             "        };",
-            f"        <{parent_ref} as tvm_ffi::ObjectRefCore>::from_data(up)",
+            f"        <{parent_ref} as ::tvm_ffi::ObjectRefCore>::from_data(up)",
             "    }",
             "}",
             "",
         ]
 
-    def _obj_literal_lines(self) -> list[str]:
-        """Render the ``<Obj> { .. }`` literal moving the builder's fields in.
-
-        Defaulted fields move straight from the builder; the rest bind the
-        like-named locals that :meth:`_unwrap_lines` just checked (on derived
-        types ``base`` binds the local :meth:`_base_resolve_lines` produced).
-        """
-        base_entry = "    base: self.base," if self.is_root else "    base,"
-        lines = [f"{self.obj_struct} {{", base_entry]
-        # Entries bind by name; memory order just mirrors the struct definition.
-        for field in _layout_fields(self.info.fields):
-            if field.default is MISSING:
-                lines.append(f"    {field.name},")  # the unwrapped local
-            else:
-                lines.append(f"    {field.name}: self.{field.name},")
-        lines.append("}")
-        return lines
-
-    def _base_resolve_lines(self) -> list[str]:
-        """``let base = ..`` resolving a derived builder's base (empty for roots).
-
-        An unset ``base`` falls back to the parent's all-default builder. Its
-        error is re-contextualized: the parent's bare "field `x` is not set"
-        would point at a field this type does not have.
-        """
-        if self.is_root:
-            return []
-        parent_ref = (self.info.parent_type_key or "").rsplit(".", 1)[-1]
+    def _cached_getter_lines(
+        self, fvar: str, ffi_name: str, *, type_attr: bool = False
+    ) -> list[str]:
+        """Bind ``fvar`` to a reflected callable cached at this call site."""
+        lookup = "cached_type_attr" if type_attr else "cached_type_method"
         return [
-            "let base = match self.base {",
-            "    Some(base) => base,",
-            f"    None => {parent_ref}::ffi_new().build_obj().map_err(|e| tvm_ffi::Error::new(",
-            "        tvm_ffi::VALUE_ERROR,",
-            f'        &format!("field `base` is not set and default `{parent_ref}` '
-            'construction failed: {}", e.message()),',
-            '        "",',
-            "    ))?,",
-            "};",
+            f"    let {fvar} = ::tvm_ffi::{lookup}!("
+            f"<{self.obj_struct} as ::tvm_ffi::ObjectCore>::type_index(), "
+            f"{_rust_string_literal(ffi_name)})?;"
         ]
 
-    def _unwrap_lines(self) -> list[str]:
-        """``let <f> = self.<f>.ok_or_else(..)?;`` for every field without a default."""
-        return [
-            f"let {field.name} = self.{field.name}.ok_or_else(|| tvm_ffi::Error::new("
-            f'tvm_ffi::VALUE_ERROR, "field `{field.name}` is not set", ""))?;'
-            for field in _layout_fields(self.info.fields)
-            if field.default is MISSING
+    @staticmethod
+    def _callable_local(params: list[tuple[str, str, bool]]) -> str:
+        """Choose an internal function variable that cannot shadow a parameter."""
+        used = {name for name, _ty, _dynamic in params}
+        name = "__tvm_ffi_func"
+        while name in used:
+            name = "_" + name
+        return name
+
+    def _auto_constructor_params(self) -> list[tuple[str, str, bool]] | None:
+        """Render reflected init fields with unique, stable Rust parameter names."""
+        field_names = [field.name for field in self.info.init_fields]
+        if len(field_names) != len(set(field_names)):
+            print(
+                f"{C.TERM_YELLOW}[Warning] object {self.info.type_key}: skipping typed "
+                "Rust constructor because inherited init fields have duplicate names"
+                f"{C.TERM_RESET}"
+            )
+            return None
+
+        rendered: list[tuple[str | None, str, bool]] = []
+        used: set[str] = set()
+        for field in self.info.init_fields:
+            ty, dynamic = self.render_param(field.schema)
+            try:
+                preferred: str | None = rust_identifier(field.name)
+            except UnsupportedTypeError:
+                preferred = None
+            if preferred is not None:
+                used.add(preferred)
+            rendered.append((preferred, ty, dynamic))
+
+        params: list[tuple[str, str, bool]] = []
+        for index, (preferred, ty, dynamic) in enumerate(rendered):
+            chosen = preferred or f"_{index}"
+            while preferred is None and chosen in used:
+                chosen = "_" + chosen
+            used.add(chosen)
+            params.append((chosen, ty, dynamic))
+        return params
+
+    def _constructor_fn(self) -> list[str] | None:
+        """Emit a thin, FFI-backed constructor when reflection exposes one."""
+        init_methods = [
+            method
+            for method in self.info.methods
+            if method.schema.name.rsplit(".", 1)[-1] == "__ffi_init__"
         ]
+        if len(init_methods) > 1:
+            print(
+                f"{C.TERM_YELLOW}[Warning] object {self.info.type_key}: skipping "
+                "overloaded Rust constructor; use Function reflection explicitly"
+                f"{C.TERM_RESET}"
+            )
+            return None
 
-    def _new_fn_native(self) -> list[str]:
-        """Emit ``fn ffi_new() -> <T>Builder``, opening the builder chain.
-
-        Uniformly nullary: every input -- own fields and a derived type's
-        ``base`` alike -- is set through its like-named builder setter.
-        Defaulted fields start prefilled with their stubgen-rendered default,
-        the rest start unset and ``build()`` errors on any still missing (an
-        unset ``base`` is default-constructed through the parent's builder
-        instead; see :meth:`_base_resolve_lines`). Named ``ffi_new`` (not
-        ``new``); a user who needs the faithful C++ constructor semantics
-        hand-writes ``new`` (outside the markers) delegating to the builder.
-        """
-        builder = f"{self.leaf}Builder"
-        lines = [f"pub fn ffi_new() -> {builder} {{", f"    {builder} {{"]
-        if self.is_root:
-            lines.append(f"        base: {self.base_type}::new(),")
+        params: list[tuple[str, str, bool]] = []
+        type_attr = not init_methods
+        if init_methods:
+            method = init_methods[0]
+            args = method.schema.args or ()
+            for i, schema in enumerate(args[1:]):
+                ty, dynamic = self.render_param(schema)
+                params.append((f"_{i}", ty, dynamic))
+        elif self.info.has_init:
+            auto_params = self._auto_constructor_params()
+            if auto_params is None:
+                return None
+            params = auto_params
         else:
-            lines.append("        base: None,")
-        for field in _layout_fields(self.info.fields):
-            if field.default is MISSING:
-                lines.append(f"        {field.name}: None,")
-            else:
-                # `_native_blocker` already guaranteed the default renders.
-                lines.append(f"        {field.name}: {_default_expr(field)},")
-        lines += ["    }", "}"]
-        return lines
+            return None
 
-    def _builder_lines(self) -> list[str]:
-        """Emit ``pub struct <T>Builder`` + its ``impl`` (setters, ``build``, ``build_obj``).
-
-        One consuming setter per own field, plus ``base`` on derived types
-        (stored ``Option<ParentObj>``; left unset it is default-constructed
-        through the parent's builder at build time). Defaulted fields are
-        stored prefilled; fields without a default are stored as ``Option<T>``
-        and checked by ``build_obj``, which returns ``Err`` when one is still
-        unset. ``build_obj`` is public -- it returns the bare struct value a
-        derived type's ``base`` setter takes -- and ``build`` delegates to it,
-        wrapping the struct in the allocated ref type.
-        """
-        builder = f"{self.leaf}Builder"
-        fields = _layout_fields(self.info.fields)
-        base_store = self.base_type if self.is_root else f"Option<{self.base_type}>"
-        lines = [f"pub struct {builder} {{", f"    base: {base_store},"]
-        for field in fields:
-            ty = self.render_struct_field(field)
-            store = ty if field.default is not MISSING else f"Option<{ty}>"
-            lines.append(f"    {field.name}: {store},")
-        lines += ["}", ""]
-
-        inner: list[str] = []
-        if not self.is_root:
-            inner += [
-                f"pub fn base(mut self, base: {self.base_type}) -> Self {{",
-                "    self.base = Some(base);",
-                "    self",
-                "}",
-                "",
-            ]
-        for field in fields:
-            ty = self.render_struct_field(field)
-            value = field.name if field.default is not MISSING else f"Some({field.name})"
-            inner += [
-                f"pub fn {field.name}(mut self, {field.name}: {ty}) -> Self {{",
-                f"    self.{field.name} = {value};",
-                "    self",
-                "}",
-                "",
-            ]
-        self.imports.record("tvm_ffi::Result")
-        prelude = [*self._base_resolve_lines(), *self._unwrap_lines()]
-        literal = self._obj_literal_lines()
-        inner += [
-            f"pub fn build(self) -> Result<{self.leaf}> {{",
-            f"    Ok({self.leaf} {{",
-            "        data: ObjectArc::new(self.build_obj()?),",
-            "    })",
-            "}",
-            "",
-            f"pub fn build_obj(self) -> Result<{self.obj_struct}> {{",
-            *[f"    {line}" for line in prelude],
-            f"    Ok({literal[0]}",
-            *[f"    {line}" for line in literal[1:-1]],
-            f"    {literal[-1]})",
-            "}",
-        ]
-        lines += [
-            f"impl {builder} {{",
-            *[f"    {line}" if line else "" for line in inner],
-            "}",
-            "",
-        ]
-        return lines
-
-    def _cached_getter_lines(self, fvar: str, ffi_name: str) -> list[str]:
-        """Body lines binding ``fvar`` to the reflected method, cached per call site.
-
-        A ``thread_local!`` ``OnceCell`` makes the crate's method-table scan run
-        once per thread (``Function`` is not ``Sync``, ruling out a ``OnceLock``).
-        """
-        cell = fvar.upper()
+        signature = ", ".join(f"{name}: {ty}" for name, ty, _ in params)
+        fvar = self._callable_local(params)
+        getter = self._cached_getter_lines(fvar, "__ffi_init__", type_attr=type_attr)
+        if type_attr:
+            packed = ""
+            kwargs = (
+                ", ".join(
+                    f"({_rust_string_literal(field.name)}, "
+                    f"{name if dynamic else f'::tvm_ffi::AnyView::from(&{name})'})"
+                    for field, (name, _ty, dynamic) in zip(self.info.init_fields, params)
+                )
+                or None
+            )
+        else:
+            packed = _packed_args_expr(params, None)
+            kwargs = None
         return [
-            f"    thread_local!(static {cell}: std::cell::OnceCell<tvm_ffi::Function> = "
-            "const { std::cell::OnceCell::new() });",
-            f"    let {fvar} = tvm_ffi::Function::from_type_method_cached(&{cell}, "
-            f'{self.obj_struct}::type_index(), "{ffi_name}")?;',
+            "/// Construct through the registered `__ffi_init__` function.",
+            f"pub fn ffi_new({signature}) -> ::tvm_ffi::Result<Self> {{",
+            *_packed_call_lines(fvar, getter, packed, False, kwargs=kwargs),
+            "}",
         ]
 
     def _method_fn(self, method: FuncInfo) -> list[str]:
-        """Emit one reflected method (instance or static) on `impl <T>`."""
+        """Emit one reflected method on its object or reference wrapper."""
         ffi_name = method.schema.name.rsplit(".", 1)[-1]
+        rust_name = rust_identifier(ffi_name)
         args = method.schema.args or ()
-        # The return type stays owning (a top-level `Any` is `Any`, not `AnyView`).
-        ret = render_rust_type(args[0], self._ty_render) if args else self._ty_render("Any")
-        rest = args[2:] if method.is_member else args[1:]
-        params = [(f"_{i}", self.render_param(p)) for i, p in enumerate(rest)]
-
-        self_recv = "&mut self" if self.info.mutable else "&self"
-        if method.is_member:
-            sig_parts = [self_recv, *[f"{n}: {t}" for n, t in params]]
+        if args:
+            ret, dynamic_result = self.render_result(args[0])
         else:
-            sig_parts = [f"{n}: {t}" for n, t in params]
-        self.imports.record("tvm_ffi::Result")
-        if method.is_member or params:
-            self.imports.record("tvm_ffi::AnyView")
-        packed = _packed_args_expr(params, method.is_member)
-        getter = self._cached_getter_lines("f", ffi_name)
-        header = f"pub fn {ffi_name}({', '.join(sig_parts)}) -> Result<{ret}> {{"
-        return [header, *_packed_call_lines("f", getter, packed, ret), "}"]
+            ret, dynamic_result = "::tvm_ffi::Any", True
+        rest = args[2:] if method.is_member else args[1:]
+        params: list[tuple[str, str, bool]] = []
+        for i, schema in enumerate(rest):
+            ty, dynamic = self.render_param(schema)
+            params.append((f"_{i}", ty, dynamic))
+
+        if method.is_member:
+            sig_parts = ["&self", *[f"{name}: {ty}" for name, ty, _ in params]]
+            self_expr = "::tvm_ffi::object::object_core_as_any_view(self)"
+        else:
+            sig_parts = [f"{name}: {ty}" for name, ty, _ in params]
+            self_expr = None
+        packed = _packed_args_expr(params, self_expr)
+        fvar = self._callable_local(params)
+        getter = self._cached_getter_lines(fvar, ffi_name)
+        header = f"pub fn {rust_name}({', '.join(sig_parts)}) -> ::tvm_ffi::Result<{ret}> {{"
+        return [
+            header,
+            *_packed_call_lines(fvar, getter, packed, dynamic_result),
+            "}",
+        ]
 
 
 def generate_rust_object(
@@ -670,27 +484,20 @@ def generate_rust_object(
     opt: Options,
     obj_info: ObjectInfo,
 ) -> None:
-    """Emit a Rust ``struct``/``impl`` binding for an ``object/<key>`` block.
-
-    Emits ``<T>Obj`` (``#[repr(C)]``, parent embedded as ``base``), the ``<T>``
-    ref wrapper, ``Deref``/``DerefMut``, ``impl <T>`` with ``ffi_new`` plus the
-    reflected methods, and the ``<T>Builder`` (when natively constructible).
-    Raises :class:`UnsupportedTypeError` for types the crate cannot represent;
-    ``cli`` catches it and skips the block (any ``use``s already recorded are
-    harmless -- generated files allow unused imports).
-    """
+    """Emit an opaque Rust object wrapper with owning reflected accessors."""
     assert len(code.lines) >= 2
     type_key = obj_info.type_key
     assert isinstance(type_key, str)
-    leaf = type_key.rsplit(".", 1)[-1]
-    obj_struct = f"{leaf}Obj"
+    type_leaf = type_key.rsplit(".", 1)[-1]
+    leaf = rust_identifier(type_leaf)
+    obj_struct = rust_identifier(f"{type_leaf}Obj")
     parent_key = obj_info.parent_type_key
     is_root = parent_key in (None, "ffi.Object")
     if is_root:
         base_type = "Object"
     else:
         assert isinstance(parent_key, str)
-        base_type = f"{parent_key.rsplit('.', 1)[-1]}Obj"
+        base_type = rust_identifier(f"{parent_key.rsplit('.', 1)[-1]}Obj")
     renderer = _ObjectRenderer(
         info=obj_info,
         leaf=leaf,
@@ -702,9 +509,12 @@ def generate_rust_object(
         mod_segments=tuple(type_key.split(".")[:-1]),
     )
 
-    body = renderer.body()
-
-    _warn_offset_mismatch(type_key, _layout_fields(obj_info.fields))
+    import_checkpoint = len(imports.items)
+    try:
+        body = renderer.body()
+    except UnsupportedTypeError:
+        del imports.items[import_checkpoint:]
+        raise
 
     indent = " " * code.indent
     code.lines = [
@@ -712,7 +522,7 @@ def generate_rust_object(
         *[(indent + line) if line else "" for line in body],
         code.lines[-1],
     ]
-    _ = opt  # accepted for protocol parity; Rust object layout needs no `opt`
+    _ = opt  # accepted for protocol parity
 
 
 # --- import section (`use` statements) --------------------------------------
@@ -726,21 +536,19 @@ def generate_rust_import_section(
 ) -> None:
     """Render the collected ``use`` statements into an ``import-section`` block.
 
-    Imports for types defined in this same file are dropped; the rest are
-    deduped and sorted.
+    Imports are deduped and sorted. Local generated names were reserved before
+    rendering, so a recorded item is always a real external/cross-module use.
     """
     assert len(code.lines) >= 2
     # `record` never admits bare types, so every `as_use_line()` is non-empty.
-    use_lines = sorted(
-        {item.as_use_line() for item in imports.items if item.path not in defined_types}
-    )
+    use_lines = sorted({item.as_use_line() for item in imports.items})
     indent = " " * code.indent
     code.lines = [
         code.lines[0],
         *[indent + line for line in use_lines],
         code.lines[-1],
     ]
-    _ = opt  # accepted for protocol parity; Rust needs no indent/TYPE_CHECKING handling
+    _ = (opt, defined_types)  # accepted for protocol parity
 
 
 # --- whole-file scaffolding (`--init` mode) ---------------------------------
@@ -758,8 +566,10 @@ def generate_rust_api_file(
     """Scaffold a single Rust binding file (one file per module prefix)."""
     append = ""
     if not code_blocks:
-        append += "#![allow(dead_code, unused_imports)]\n"
-        append += f"\n//! FFI bindings for `{module_name}` (generated by tvm-ffi-stubgen).\n\n"
+        # This may be appended to an intermediate ``mod.rs`` that already has
+        # child-module declarations, so use a regular comment rather than an
+        # inner attribute or inner doc comment that would be illegal there.
+        append += f"// FFI bindings for `{module_name}` (generated by tvm-ffi-stubgen).\n\n"
     if not any(c.kind == "import-section" for c in code_blocks):
         append += f"{syntax.begin} import-section\n{syntax.end}\n\n"
     defined = {c.param for c in code_blocks if c.kind == "object"}
@@ -774,14 +584,17 @@ def generate_rust_api_file(
 
 # --- module-tree stitching (auto-form `pub mod` declarations) ----------------
 
+_RUST_MODULES_BEGIN = "// tvm-ffi-stubgen-modules(begin)"
+_RUST_MODULES_END = "// tvm-ffi-stubgen-modules(end)"
 
-def finalize_rust_module_tree(init_path: Path, prefixes: set[str]) -> None:
+
+def finalize_rust_module_tree(init_path: Path, prefixes: set[str]) -> None:  # noqa: PLR0912
     """Stitch the generated tree under ``init_path`` into a valid Rust module tree.
 
-    Ensures every generated prefix is declared via ``pub mod`` in its parent's
-    ``mod.rs``, creating intermediate ``mod.rs`` files as needed; declarations
-    are appended only when absent. The user still mounts ``init_path`` with one
-    ``mod`` line at the crate root (stubgen does not edit ``lib.rs``/``main.rs``).
+    Generated declarations live in a sorted marker block and are merged with
+    declarations from earlier prefix-scoped invocations. Existing user-owned
+    ``mod`` declarations outside that block are left untouched. The user still
+    mounts ``init_path`` from the crate root.
     """
     children: dict[Path, set[str]] = {}
     for prefix in prefixes:
@@ -790,17 +603,56 @@ def finalize_rust_module_tree(init_path: Path, prefixes: set[str]) -> None:
             parent = init_path.joinpath(*segs[:i])
             children.setdefault(parent, set()).add(seg)
 
-    for parent, names in children.items():
+    begin = _RUST_MODULES_BEGIN
+    end = _RUST_MODULES_END
+    parents = set(children)
+    if init_path.exists():
+        for mod_rs in init_path.rglob("mod.rs"):
+            if begin in mod_rs.read_text(encoding="utf-8"):
+                parents.add(mod_rs.parent)
+
+    for parent in sorted(parents):
+        names = {rust_identifier(name) for name in children.get(parent, set())}
         parent.mkdir(parents=True, exist_ok=True)
         mod_rs = parent / "mod.rs"
         existing = mod_rs.read_text(encoding="utf-8") if mod_rs.exists() else ""
-        to_add = [f"pub mod {n};" for n in sorted(names) if f"pub mod {n};" not in existing]
-        if not to_add:
-            continue
-        text = existing
-        if text and not text.endswith("\n"):
-            text += "\n"
-        if text.strip():  # separate from any existing bindings
-            text += "\n"
-        text += "\n".join(to_add) + "\n"
-        mod_rs.write_text(text, encoding="utf-8")
+        lines = existing.splitlines()
+        try:
+            start = lines.index(begin)
+            stop = lines.index(end, start + 1)
+        except ValueError:
+            start = stop = -1
+        if start >= 0:
+            managed = re.compile(r"^pub mod ((?:r#)?[A-Za-z_][A-Za-z0-9_]*);$")
+            names.update(
+                match.group(1) for line in lines[start + 1 : stop] if (match := managed.match(line))
+            )
+
+        outside = lines if start < 0 else lines[:start] + lines[stop + 1 :]
+        generated_items: set[str] = set()
+        object_marker = re.compile(rf"^\s*{re.escape(C.RUST_SYNTAX.begin)}\s+object/(\S+)\s*$")
+        for line in outside:
+            if match := object_marker.match(line):
+                raw_leaf = match.group(1).rsplit(".", 1)[-1]
+                generated_items.add(rust_identifier(raw_leaf))
+                generated_items.add(rust_identifier(f"{raw_leaf}Obj"))
+        declarations: list[str] = []
+        for ident in sorted(names):
+            if ident in generated_items:
+                raise UnsupportedTypeError(
+                    ident,
+                    f"generated Rust item {ident!r} conflicts with child module {ident!r}",
+                )
+            pattern = re.compile(
+                rf"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+{re.escape(ident)}\s*(?:;|\{{)"
+            )
+            if not any(pattern.match(line) for line in outside):
+                declarations.append(f"pub mod {ident};")
+        block = [begin, *declarations, end]
+        if start >= 0:
+            lines[start : stop + 1] = block
+        elif names:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.extend(block)
+        mod_rs.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")

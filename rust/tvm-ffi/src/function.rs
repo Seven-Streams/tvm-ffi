@@ -20,12 +20,12 @@ use crate::any::{Any, AnyView};
 use crate::derive::{Object, ObjectRef};
 use crate::error::{Error, Result};
 use crate::function_internal::{AsPackedCallable, TupleAsPackedArgs};
-use crate::object::{Object, ObjectArc, ObjectCore};
+use crate::object::{Object, ObjectArc, ObjectCore, ObjectRef as FFIObjectRef};
 use crate::type_traits::AnyCompatible;
 use tvm_ffi_sys::{
     TVMFFIAny, TVMFFIByteArray, TVMFFIFunctionCell, TVMFFIFunctionCreate, TVMFFIFunctionGetGlobal,
-    TVMFFIFunctionSetGlobal, TVMFFIGetTypeInfo, TVMFFIObjectHandle, TVMFFISafeCallType,
-    TVMFFITypeIndex,
+    TVMFFIFunctionSetGlobal, TVMFFIGetTypeAttrColumn, TVMFFIGetTypeInfo, TVMFFIObjectHandle,
+    TVMFFISafeCallType, TVMFFITypeIndex,
 };
 
 /// function object
@@ -124,6 +124,45 @@ impl Function {
                 Err(Error::from_raised())
             }
         }
+    }
+
+    /// Call a packed function using the FFI keyword-argument protocol.
+    ///
+    /// Keyword arguments are encoded as
+    /// `[KWARGS, key0, value0, key1, value1, ...]` after any positional
+    /// arguments. This is primarily used by generated reflection constructors.
+    #[doc(hidden)]
+    pub fn call_packed_with_kwargs(
+        &self,
+        positional: &[AnyView<'_>],
+        kwargs: &[(&str, AnyView<'_>)],
+    ) -> Result<Any> {
+        if kwargs.is_empty() {
+            return self.call_packed(positional);
+        }
+
+        static KWARGS: std::sync::OnceLock<FFIObjectRef> = std::sync::OnceLock::new();
+        let marker = if let Some(marker) = KWARGS.get() {
+            marker.clone()
+        } else {
+            let marker: FFIObjectRef = Function::get_global("ffi.GetKwargsObject")?
+                .call_packed(&[])?
+                .try_into()?;
+            let _ = KWARGS.set(marker.clone());
+            KWARGS.get().cloned().unwrap_or(marker)
+        };
+        let keys = kwargs
+            .iter()
+            .map(|(key, _)| crate::String::from(*key))
+            .collect::<Vec<_>>();
+        let mut packed = Vec::with_capacity(positional.len() + 1 + 2 * kwargs.len());
+        packed.extend_from_slice(positional);
+        packed.push(AnyView::from(&marker));
+        for ((_, value), key) in kwargs.iter().zip(&keys) {
+            packed.push(AnyView::from(key));
+            packed.push(*value);
+        }
+        self.call_packed(&packed)
     }
 
     pub fn call_tuple<TupleType>(&self, tuple_args: TupleType) -> Result<Any>
@@ -248,22 +287,79 @@ impl Function {
 
     /// Cached front of [`Function::from_type_method`], used by generated bindings.
     ///
-    /// `cell` is a per-call-site `thread_local!` `OnceCell` (a `Function` is not
-    /// `Sync`, ruling out a `OnceLock`), so the method-table scan runs once per
-    /// thread.
+    /// `cell` is a per-call-site `OnceLock`, so the method-table scan runs once.
     pub fn from_type_method_cached(
-        cell: &'static std::thread::LocalKey<std::cell::OnceCell<Function>>,
+        cell: &'static std::sync::OnceLock<Function>,
         type_index: i32,
         method_name: &str,
     ) -> Result<Function> {
-        cell.with(|c| {
-            if let Some(f) = c.get() {
-                return Ok(f.clone());
+        if let Some(f) = cell.get() {
+            return Ok(f.clone());
+        }
+        let f = Function::from_type_method(type_index, method_name)?;
+        let _ = cell.set(f.clone());
+        Ok(cell.get().cloned().unwrap_or(f))
+    }
+
+    /// Look up a callable stored in a reflected type-attribute column.
+    ///
+    /// Auto-generated constructors such as `__ffi_init__` are registered as
+    /// type attributes rather than ordinary type methods.
+    pub fn from_type_attr(type_index: i32, attr_name: &str) -> Result<Function> {
+        unsafe {
+            let attr_name_arg = TVMFFIByteArray::from_str(attr_name);
+            let column = TVMFFIGetTypeAttrColumn(&attr_name_arg);
+            if column.is_null() || (*column).data.is_null() {
+                crate::bail!(
+                    crate::error::TYPE_ERROR,
+                    "type attribute `{}` not found",
+                    attr_name
+                );
             }
-            let f = Function::from_type_method(type_index, method_name)?;
-            let _ = c.set(f.clone());
-            Ok(f)
-        })
+            let offset = type_index - (*column).begin_index;
+            if offset < 0 || offset >= (*column).size {
+                crate::bail!(
+                    crate::error::TYPE_ERROR,
+                    "type attribute `{}` not found on type_index `{}`",
+                    attr_name,
+                    type_index
+                );
+            }
+            let value = &*(*column).data.add(offset as usize);
+            if value.type_index == TVMFFITypeIndex::kTVMFFINone as i32 {
+                crate::bail!(
+                    crate::error::TYPE_ERROR,
+                    "type attribute `{}` not found on type_index `{}`",
+                    attr_name,
+                    type_index
+                );
+            }
+            if !<Function as AnyCompatible>::check_any_strict(value) {
+                crate::bail!(
+                    crate::error::TYPE_ERROR,
+                    "type attribute `{}` on type_index `{}` is not a Function",
+                    attr_name,
+                    type_index
+                );
+            }
+            Ok(<Function as AnyCompatible>::copy_from_any_view_after_check(
+                value,
+            ))
+        }
+    }
+
+    /// Cached front of [`Function::from_type_attr`], used by generated bindings.
+    pub fn from_type_attr_cached(
+        cell: &'static std::sync::OnceLock<Function>,
+        type_index: i32,
+        attr_name: &str,
+    ) -> Result<Function> {
+        if let Some(f) = cell.get() {
+            return Ok(f.clone());
+        }
+        let f = Function::from_type_attr(type_index, attr_name)?;
+        let _ = cell.set(f.clone());
+        Ok(cell.get().cloned().unwrap_or(f))
     }
 
     /// Register a function as a global function

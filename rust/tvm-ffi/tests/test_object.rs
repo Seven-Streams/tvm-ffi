@@ -147,30 +147,6 @@ fn test_object_arc_option_size() {
     );
 }
 
-// Compile-only: mirrors the exact shape stubgen now emits for an object with a
-// generic-object field. If `ObjectRef` failed the crate's container/optional
-// `AnyCompatible` bounds (or the derives rejected it) in any of these positions,
-// this would not build. Never instantiated (the type key is unregistered), so
-// the runtime `type_index()` lookup is never triggered.
-#[repr(C)]
-#[derive(tvm_ffi::derive::Object)]
-#[type_key = "test.ObjRefHolder"]
-#[allow(dead_code)]
-struct ObjRefHolderObj {
-    base: Object,
-    child: tvm_ffi::object::ObjectRef,
-    kids: tvm_ffi::Array<tvm_ffi::object::ObjectRef>,
-    named: tvm_ffi::Map<tvm_ffi::String, tvm_ffi::object::ObjectRef>,
-    maybe: Option<tvm_ffi::object::ObjectRef>,
-}
-
-#[repr(C)]
-#[derive(tvm_ffi::derive::ObjectRef, Clone)]
-#[allow(dead_code)]
-struct ObjRefHolder {
-    data: ObjectArc<ObjRefHolderObj>,
-}
-
 #[test]
 fn test_objectref_base_carries_runtime_type() {
     use tvm_ffi::object::ObjectRef;

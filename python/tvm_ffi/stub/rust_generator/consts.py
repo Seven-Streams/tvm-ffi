@@ -26,75 +26,36 @@ RUST_TY_MAP_DEFAULTS = {
     "float": "f64",
     "bool": "bool",
     "None": "()",
-    "str": "tvm_ffi::String",
-    "bytes": "tvm_ffi::Bytes",
-    "Any": "tvm_ffi::Any",
-    "Callable": "tvm_ffi::Function",
-    "Array": "tvm_ffi::Array",  # the crate's own Array<T>, NOT Vec
-    "Map": "tvm_ffi::Map",  # the crate's own Map<K, V>, NOT HashMap
+    "str": "::tvm_ffi::String",
+    "bytes": "::tvm_ffi::Bytes",
+    "Any": "::tvm_ffi::Any",
+    "Callable": "::tvm_ffi::Function",
+    "Array": "::tvm_ffi::Array",  # the crate's own Array<T>, NOT Vec
+    "Map": "::tvm_ffi::Map",  # the crate's own Map<K, V>, NOT HashMap
     # A generic/opaque object VALUE is the single-pointer `ObjectRef` handle
     # (AnyCompatible, niche-optimizable), NOT the 24-byte `Object` data struct
     # (which is only ever the embedded struct `base`, spelled literally by codegen).
-    "Object": "tvm_ffi::object::ObjectRef",
-    "Tensor": "tvm_ffi::Tensor",
-    "Shape": "tvm_ffi::Shape",
-    "Device": "tvm_ffi::DLDevice",
-    "dtype": "tvm_ffi::DLDataType",
-    "DataType": "tvm_ffi::DLDataType",
+    "Object": "::tvm_ffi::object::ObjectRef",
+    "Tensor": "::tvm_ffi::Tensor",
+    "Shape": "::tvm_ffi::Shape",
+    "Device": "::tvm_ffi::DLDevice",
+    "dtype": "::tvm_ffi::DLDataType",
+    "DataType": "::tvm_ffi::DLDataType",
     # --- builtin object type keys (ffi.*) ---
-    "ffi.String": "tvm_ffi::String",
-    "ffi.Bytes": "tvm_ffi::Bytes",
-    "ffi.Module": "tvm_ffi::Module",
-    "ffi.Error": "tvm_ffi::Error",
-    "ffi.Object": "tvm_ffi::object::ObjectRef",
-    "ffi.Tensor": "tvm_ffi::Tensor",
-    "ffi.Shape": "tvm_ffi::Shape",
-    "ffi.Function": "tvm_ffi::Function",
-}
-
-#: Width-correct scalar for a ``#[repr(C)]`` struct field, keyed by
-#: ``(ffi origin, sizeof(T))``: the type schema erases scalar widths, but the
-#: generated structs read fields at their real offsets, so the width must be
-#: recovered from the reflected field size. Signedness is not recorded;
-#: unsigned C++ fields render as the same-width signed type.
-RUST_SCALAR_BY_SIZE = {
-    ("int", 1): "i8",
-    ("int", 2): "i16",
-    ("int", 4): "i32",
-    ("int", 8): "i64",
-    ("float", 4): "f32",
-    ("float", 8): "f64",
+    "ffi.String": "::tvm_ffi::String",
+    "ffi.Bytes": "::tvm_ffi::Bytes",
+    "ffi.Module": "::tvm_ffi::Module",
+    "ffi.Error": "::tvm_ffi::Error",
+    "ffi.Object": "::tvm_ffi::object::ObjectRef",
+    "ffi.Tensor": "::tvm_ffi::Tensor",
+    "ffi.Shape": "::tvm_ffi::Shape",
+    "ffi.Function": "::tvm_ffi::Function",
 }
 
 #: Origins the crate has no FFI type for (do NOT map to ``HashMap``/``Vec``;
 #: Rust tuples don't match ``ffi::Tuple``'s layout). ``render_rust_type``
-#: raises wherever one appears and the enclosing object is skipped.
+#: raises so the object renderer can use its lossless dynamic fallback.
 RUST_UNSUPPORTED_ORIGINS = frozenset({"Dict", "List", "Union", "tuple"})
-
-#: In-place mirror of a non-object ``Optional<T>`` FIELD: C++ ``ffi::Optional<T>``
-#: is a single 16-byte ``TVMFFIAny`` cell (``nullopt == kTVMFFINone``) for
-#: storage-enabled non-``ObjectRef`` payloads. Object-class payloads use the
-#: pointer-sized object optional instead (the #701 ABI) and mirror as Rust's
-#: niche-optimized ``Option<T>``, never this type.
-RUST_OPTIONAL_PATH = "tvm_ffi::Optional"
-#: Reflected size of the Any-backed (non-object) optional field layout. Any
-#: other size for these payloads is the ``std::optional`` fallback of
-#: storage-disabled types, which has no mirror.
-RUST_OPTIONAL_FIELD_SIZE = 16
-#: Reflected size of the pointer-sized object optional field layout
-#: (``use_object_ref_optional_v``: the C++ ``Optional<T> : public ObjectRef``
-#: form, ``nullopt == nullptr``), mirrored by Rust's ``Option<T>`` null niche.
-RUST_OBJECT_OPTIONAL_FIELD_SIZE = 8
-
-#: ``Optional`` payload origins whose C++ optional stays 16-byte Any-backed
-#: under the #701 split: everything NOT derived from ``ObjectRef``. A nested
-#: ``Optional`` payload also stays Any-backed (``!is_optional_type_v``); it is
-#: special-cased where this set is consulted. Every other renderable payload
-#: (strings, bytes, containers, functions, tensors, object classes) is
-#: ``ObjectRef``-derived and takes the pointer-sized form.
-RUST_ANY_BACKED_OPTIONAL_PAYLOADS = frozenset(
-    {"int", "float", "bool", "Device", "dtype", "DataType"}
-)
 
 #: Module-prefix rewrites for ``use`` paths: builtin ``ffi.*`` type keys live at
 #: the crate root.

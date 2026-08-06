@@ -52,7 +52,7 @@ pub fn derive_object(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_error]
-#[proc_macro_derive(ObjectRef, attributes(type_key, type_index))]
+#[proc_macro_derive(ObjectRef, attributes(type_key, type_index, root_object_ref))]
 pub fn derive_object_ref(input: TokenStream) -> TokenStream {
     TokenStream::from(object_macros::derive_object_ref(input))
 }

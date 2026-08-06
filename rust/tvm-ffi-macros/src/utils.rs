@@ -25,7 +25,7 @@ pub(crate) fn get_tvm_ffi_crate() -> TokenStream {
     if env::var("CARGO_CRATE_NAME").unwrap() == "tvm_ffi" {
         quote!(crate)
     } else {
-        quote!(tvm_ffi)
+        quote!(::tvm_ffi)
     }
 }
 

@@ -54,7 +54,9 @@ def __main__() -> int:
         importlib.import_module(imp)
     dlls = [ctypes.CDLL(lib) for lib in opt.dlls]
     files: list[FileInfo] = collect_files([Path(f) for f in opt.files])
-    global_funcs: dict[str, list[FuncInfo]] = collect_global_funcs()
+    global_funcs: dict[str, list[FuncInfo]] = (
+        collect_global_funcs() if generator.supports_global_funcs else {}
+    )
     init_path: Path | None = None
     if opt.files:
         init_path = Path(opt.files[0]).resolve()
@@ -102,7 +104,7 @@ def __main__() -> int:
 
     # Stage 4. Let the generator stitch the generated tree together (runs after the
     # files are fully written, so language-specific wiring isn't clobbered).
-    if opt.init and generated_prefixes:
+    if opt.init:
         assert init_path is not None
         generator.finalize_init(init_path, generated_prefixes)
     del dlls
@@ -152,7 +154,7 @@ def _stage_2(
     }
     defined_objs: set[str] = {  # ty: ignore[invalid-assignment]
         code.param for file in files for code in file.code_blocks if code.kind == "object"
-    } | C.BUILTIN_TYPE_KEYS
+    } | set(generator.builtin_type_keys)
 
     # Step 0. Generate missing `_ffi_api.py` and `__init__.py` under each prefix.
     prefix_filter = init_cfg.prefix.strip()
@@ -160,21 +162,28 @@ def _stage_2(
         prefix_filter += "."
     root_prefix = prefix_filter.rstrip(".")
     prefixes: dict[str, list[str]] = collect_type_keys()
-    for prefix in global_funcs:
-        prefixes.setdefault(prefix, [])
+    if generator.supports_global_funcs:
+        for prefix in global_funcs:
+            prefixes.setdefault(prefix, [])
     generated_prefixes: set[str] = set()
     for prefix, obj_names in prefixes.items():
         if not (prefix == root_prefix or prefix.startswith(prefix_filter)):
             continue
-        funcs = sorted(
-            [] if prefix in defined_func_prefixes else global_funcs.get(prefix, []),
-            key=lambda f: f.schema.name,
+        funcs = (
+            sorted(
+                [] if prefix in defined_func_prefixes else global_funcs.get(prefix, []),
+                key=lambda f: f.schema.name,
+            )
+            if generator.supports_global_funcs
+            else []
         )
-        objs = sorted(set(obj_names) - defined_objs)
+        registered_objs = set(obj_names) - set(generator.builtin_type_keys)
+        if registered_objs or funcs:
+            generated_prefixes.add(prefix)
+        objs = sorted(registered_objs - defined_objs)
         object_infos = toposort_objects(objs)
         if not funcs and not object_infos:
             continue
-        generated_prefixes.add(prefix)
         # Step 1. Create target directory if not exists
         directory = init_path / prefix.replace(".", "/")
         directory.mkdir(parents=True, exist_ok=True)
@@ -215,6 +224,20 @@ def _stage_3(  # noqa: PLR0912
     defined_funcs: set[str] = set()
     defined_types: set[str] = set()
     imports = generator.new_imports()
+    candidate_types: set[str] = set()
+    for code in file.code_blocks:
+        if code.kind != "object":
+            continue
+        type_key = code.param
+        assert isinstance(type_key, str)
+        try:
+            # Definitions keep the reflected type key's leaf; ``ty-map`` only
+            # changes references to that type.
+            candidate_types.add(generator.canonical_type_name(type_key))
+        except UnsupportedTypeError:
+            # The normal object-generation path below reports the invalid name.
+            pass
+    generator.reserve_defined_types(imports, candidate_types)
     # Stage 1. Collect `tvm-ffi-stubgen(import-object): ...`
     for code in file.code_blocks:
         if code.kind == "import-object":

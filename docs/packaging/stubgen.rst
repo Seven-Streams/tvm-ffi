@@ -276,11 +276,9 @@ For a complete list of options, run ``tvm-ffi-stubgen --help``.
 Rust Code Stubgen (Experimental)
 --------------------------------
 
-TVM-FFI provides an efficient, easy-to-use mechanism for exposing C++ classes to Rust.
-Objects share the same memory representation, so Rust code can directly access objects
-created in C++. However, users have to hand-write the Rust definition of each registered
-object to avoid memory layout and alignment mismatches between the two sides. To eliminate
-this manual work, ``tvm-ffi-stubgen`` supports generating Rust code directly.
+TVM-FFI exposes registered C++ classes to Rust through opaque object handles.
+``tvm-ffi-stubgen`` generates the Rust object/reference types plus typed accessors
+for the reflection metadata; it does not duplicate the trailing C++ object layout.
 
 To generate Rust stubs, pass ``STUB_TARGET rust`` to ``tvm_ffi_configure_target``
 (see :ref:`sec-stubgen-cmake`) or ``--target rust`` on the command line
@@ -307,10 +305,13 @@ Key Features
 ~~~~~~~~~~~~
 
 - Generate Rust code for registered C++ classes automatically (via CLI or CMake).
-- Mirror the C++ memory layout exactly in Rust.
-- Provide Rust-native builder-style constructors for registered classes, with
-  reflected default values prefilled and overridable through setters.
-- Expose methods of registered classes through cross-language calls.
+- Read fields through owning reflection getters, including inherited fields.
+- Construct objects through their registered ``__ffi_init__`` function.
+- Expose inherited instance methods and static methods through typed FFI calls.
+- Preserve dynamic schemas losslessly as ``Any`` / ``AnyView``.
+
+Stubgen only rewrites its marked regions and does not run ``rustfmt`` over the
+surrounding file. Run the project's normal ``cargo fmt`` step after generation.
 
 Generation Output
 ~~~~~~~~~~~~~~~~~
@@ -332,10 +333,7 @@ For this type the tool generates the following Rust code (bodies abridged):
    #[derive(tvm_ffi::derive::Object)]
    #[type_key = "rust_stubgen.IntPair"]
    pub struct IntPairObj {
-       base: Object,   // the parent type, embedded as the first field
-       pub a: i64,
-       pub b: i64,
-       pub scale: i64,
+       base: Object,
    }
 
    #[repr(C)]
@@ -344,123 +342,59 @@ For this type the tool generates the following Rust code (bodies abridged):
        data: ObjectArc<IntPairObj>,
    }
 
+   impl IntPairObj {
+       pub fn a(&self) -> Result<i64> { /* owning reflection getter */ }
+       pub fn b(&self) -> Result<i64> { /* owning reflection getter */ }
+       pub fn scale(&self) -> Result<i64> { /* owning reflection getter */ }
+       pub fn sum(&self) -> Result<i64> { /* reflected C++ method */ }
+   }
+
    impl IntPair {
-       pub fn ffi_new() -> IntPairBuilder { /* ... */ }
-       pub fn sum(&mut self) -> Result<i64> { /* ... */ }
+       pub fn ffi_new(a: i64, b: i64) -> Result<Self> { /* reflected constructor */ }
    }
 
-   pub struct IntPairBuilder { /* base + every field */ }
+``IntPairObj`` contains only the object-system prefix needed for typed
+``Deref`` and inheritance. The allocation remains owned by the runtime, and every
+getter returns an owning Rust value, so a returned string/container/object can
+outlive the source handle. Instance methods live on ``IntPairObj`` so a derived
+object inherits them through its ``Deref`` chain.
 
-   impl IntPairBuilder {
-       pub fn a(mut self, a: i64) -> Self { /* ... */ }
-       pub fn b(mut self, b: i64) -> Self { /* ... */ }
-       pub fn scale(mut self, scale: i64) -> Self { /* ... */ }
-       pub fn build(self) -> Result<IntPair> { /* ... */ }
-       pub fn build_obj(self) -> Result<IntPairObj> { /* ... */ }
-   }
-
-``IntPairObj`` mirrors the C++ memory layout exactly, so Rust code can directly
-access objects created in C++ and vice versa. ``IntPair`` is the reference type
-that owns an allocation of it; fields are read through ``Deref`` (and written
-through ``DerefMut``, since the class declares ``_type_mutable = true``), and
-``sum`` calls into the C++ implementation through the FFI.
-
-Builder-style Construction
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Construction is fully Rust-native -- no FFI call is involved -- and uniform: a
-nullary ``ffi_new()`` opens the builder, every field is set through its
-like-named consuming setter, and ``build()`` finishes the chain:
+Construction also crosses the FFI boundary. An explicit reflected constructor
+uses its registered signature. For an auto-generated ``__ffi_init__``, Rust has
+no default or keyword-only parameters, so ``ffi_new`` takes every
+``init=true`` field and sends it by reflected name. This includes fields with a
+C++ default and lets a rewrite pass preserve non-default spans, annotations, and
+other metadata exactly. Fields declared ``init=false`` remain runtime-managed.
 
 .. code-block:: rust
 
-   let pair = IntPair::ffi_new().a(1).b(2).build()?;             // scale = 1 (default)
-   let scaled = IntPair::ffi_new().a(1).b(2).scale(10).build()?; // override the default
-   let err = IntPair::ffi_new().a(1).build();                    // Err: field `b` is not set
+   use tvm_ffi::ObjectRefCore;
 
-``ffi_new() -> IntPairBuilder``
-   Opens the builder. A field with a ``refl::default_value`` (here ``scale``)
-   starts prefilled with its default, rendered as a Rust literal at
-   stub-generation time; every other field starts unset.
-
-``a(..)`` / ``b(..)`` / ``scale(..)``
-   One consuming setter per field. Setting a defaulted field overrides its
-   default.
-
-``build() -> Result<IntPair>``
-   Validates and allocates: returns an error if a field without a default is
-   still unset (the ``err`` case above), otherwise wraps the assembled value
-   in ``ObjectArc`` and returns the reference type. This is the endpoint to
-   use in ordinary code.
-
-``build_obj() -> Result<IntPairObj>``
-   Performs the same validation and assembly as ``build()`` -- ``build()`` in
-   fact delegates to it -- but stops at the bare, unallocated struct value.
-   It exists for inheritance: a C++ class deriving from ``IntPair`` embeds
-   ``IntPairObj`` as its first field, and the derived type's generated builder
-   gains a ``base(..)`` setter that takes exactly this value:
-
-   .. code-block:: rust
-
-      // for a hypothetical `Derived` extending IntPair with a field `c`
-      let d = Derived::ffi_new()
-          .base(IntPair::ffi_new().a(1).b(2).build_obj()?)
-          .c(3)
-          .build()?;
-
-   When ``base`` is left unset, the derived ``build()`` falls back to
-   default-constructing the parent through its all-default builder. This
-   succeeds silently when every parent field has a default; for ``IntPair``
-   it would fail with an error naming ``base``, since ``a`` and ``b`` carry
-   no default.
-
-The builder deliberately bypasses any C++ constructor logic (it never runs
-``IntPairObj``'s C++ constructor); users who need the faithful C++ semantics
-can hand-write a ``new`` constructor (outside the generated markers) on top of
-the builder.
+   let pair = IntPair::ffi_new(1, 2)?;
+   assert_eq!(pair.a()?, 1);
+   assert_eq!(pair.scale()?, 1);
+   assert_eq!(pair.sum()?, 3);
+   assert!(pair.same_as(&pair.clone()));
 
 Limitations
 ~~~~~~~~~~~
 
-A type that mentions an origin the Rust crate cannot represent -- in any
-position: field, method argument, return type, or nested inside another
-container -- is explicitly unsupported: the whole binding is skipped with a
-warning. This covers ``Dict`` / ``List`` / ``Union`` (no Rust counterpart) as
-well as ``tuple`` (Rust tuples do not match the C++ ``ffi::Tuple`` memory
-layout).
+Typed ``Array<T>``, ``Map<K, V>``, and ``Optional<T>`` values render as the
+corresponding Rust container types. A schema that cannot be represented
+faithfully -- for example ``Map<String, Any>``, ``List``, ``Dict``, ``Union``,
+or ``tuple`` -- remains available as an owning ``Any`` result or an ``AnyView``
+parameter. It is never rewritten to a misleading ``ObjectRef`` element type.
 
-``Map<K, V>`` renders as the crate's ``tvm_ffi::Map<K, V>`` when both ``K``
-and ``V`` are typed; an untyped ``Map`` (``Map<Any, Any>``) is skipped because
-``Any`` does not satisfy the crate's ``AnyCompatible`` bounds.
+Rust has no function overloading. If reflection reports multiple signatures
+with the same method name and receiver kind, stubgen skips that typed method
+with a warning; callers can still use ``Function::from_type_method`` explicitly.
 
-``Optional<T>`` in argument/return position renders as plain ``Option<T>``.
-An ``Optional<T>`` *field* mirrors the C++ layout, which splits by payload
-kind: an ``ObjectRef``-derived payload (strings, containers, object classes)
-is a pointer-sized nullable pointer in C++ and renders as Rust's
-niche-optimized ``Option<T>``; every other storage-enabled payload is a
-single 16-byte ``TVMFFIAny`` cell and renders as ``tvm_ffi::Optional<T>``,
-the crate's in-place cell mirror. The payload follows the container-element
-rules (an ``Any`` payload skips the object: the crate has no
-``OptionalCompatible`` mirror for it); scalars render at the schema-erased
-width (``i64`` / ``f64``). A field whose reflected size matches neither
-layout -- the ``std::optional`` fallback of types without Any storage, e.g.
-the ``std::string`` alias of ``str`` -- skips the object instead of emitting
-a wrong ``#[repr(C)]`` overlay.
+Generated fields are read-only accessors. Rewriting code should construct a
+replacement object through ``ffi_new`` or another registered factory rather
+than mutating shared object storage. Global registry functions are not yet
+emitted as typed Rust wrappers and remain available through
+``Function::get_global``.
 
-For ``Optional`` fields only the ``nullopt`` default renders; an engaged
-default value suppresses the generated constructor like any other
-unrenderable default.
-
-The Rust backend targets natively-laid-out C++ objects only. Running it on
-Python-defined (``py_class``) types is undefined: their fields use
-Python-side storage conventions (``Optional``/``str`` origins are inline
-``Any`` cells), not the native C++ struct layout these mirrors assume.
-
-A constructor alone cannot be generated when a default comes from a
-``refl::default_factory`` or when a default value has no Rust literal
-rendering: such types are emitted without ``ffi_new`` (a warning explains why),
-and construction stays on the C++ side -- e.g. through a ``def_static``
-factory.
 
 .. _sec-stubgen-advanced:
 
