@@ -416,11 +416,12 @@ explicitly from a `StructuralVisitor`, or skip it with a pre-order
 ### Structural Mapping and Mutation
 
 `structural_map` is the transforming counterpart to `structural_walk`. Put
-`#[dispatch(map)]` on an impl whose `map_*` methods return `Any` or
-`Result<Any>`. Methods are tested in source order, the first matching argument
-type wins, and an unmatched value is preserved. A method may take an optional
-trailing `DefRegionKind`; a `&MapValue` method is a catch-all and should
-therefore come last:
+`#[dispatch(map)]` on an impl whose `map_*` methods return a value convertible
+into `Any` (such as `i64` or `Any` itself; `()` becomes `None`), optionally
+wrapped in `Result`. Methods are tested in source order, the first matching
+argument type wins, and an unmatched value is preserved. A method may take an
+optional trailing `DefRegionKind`; a `&MapValue` method is a catch-all and
+should therefore come last:
 
 ```rust
 use tvm_ffi::{
@@ -434,9 +435,9 @@ struct Increment {
 
 #[dispatch(map)]
 impl Increment {
-    fn map_integer(&mut self, value: i64, _kind: DefRegionKind) -> Any {
+    fn map_integer(&mut self, value: i64, _kind: DefRegionKind) -> i64 {
         self.integers += 1;
-        Any::from(value + 1)
+        value + 1
     }
 
     fn map_other(&mut self, value: &MapValue) -> Result<Any> {
@@ -489,9 +490,11 @@ mutator and can recurse through its language-independent vtable. This lets the
 implementation that registered the type own its storage and mutation rules.
 When a type has no hook, object-backed values use reflected fields.
 
-Callbacks may return `Result<Any>` to report failures. Errors propagate with
-object or reflected-field context. In-place changes completed before a later
-error are not rolled back, and the consumed root is not returned on error.
+Callbacks may return `Result<T>` for any `T: Into<Any>` to report failures; a
+callback that only ever fails must still name its `Ok` type, for example
+`-> Result<Any>`. Errors propagate with object or reflected-field context.
+In-place changes completed before a later error are not rolled back, and the
+consumed root is not returned on error.
 
 `structural_mutate` accepts typed callbacks in addition to a
 `StructuralMutator`. Callbacks receive `MutateContext`; `MutateCallbacks` adds

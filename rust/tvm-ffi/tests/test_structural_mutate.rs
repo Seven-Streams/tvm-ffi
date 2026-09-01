@@ -1070,6 +1070,8 @@ fn function_setter_releases_partial_result_on_error() {
 #[test]
 fn callback_errors_preserve_message_and_add_object_context() {
     ensure_test_types_registered();
+    // A non-`Any` `Ok` type exercises error propagation through the generic
+    // `Result<T>` conversion; the callbacks below keep the `Result<Any>` form.
     let error = match structural_map(
         Array::new(vec![1i64]),
         |_integer: i64| -> Result<i64> {
@@ -1087,7 +1089,7 @@ fn callback_errors_preserve_message_and_add_object_context() {
 
     let error = match structural_mutate(
         Array::new(vec![1i64]),
-        |_integer: i64, _mutator: &mut MutateContext<'_, ()>| -> Result<i64> {
+        |_integer: i64, _mutator: &mut MutateContext<'_, ()>| -> Result<Any> {
             Err(Error::new(
                 RUNTIME_ERROR,
                 "callback mutator failed",
@@ -1293,7 +1295,7 @@ fn shared_map_callback_error_preserves_source_and_reports_object_context() {
     let source: Map<i64, i64> = [(1, 10), (2, 20)].into_iter().collect();
     let error = match structural_map(
         source.clone(),
-        |_integer: i64| -> Result<i64> {
+        |_integer: i64| -> Result<Any> {
             Err(Error::new(RUNTIME_ERROR, "map mapper failed", "origin"))
         },
         WalkOrder::PostOrder,
@@ -1627,6 +1629,18 @@ fn callbacks_return_values_convertible_into_any() {
     .and_then(Array::<i64>::try_from)
     .unwrap();
     assert_eq!(mutated.iter().collect::<Vec<_>>(), vec![2, 4]);
+
+    // `()` converts to `None`, so a body that forgets its value maps to `None`.
+    let mapped = structural_map(
+        Array::new(vec![1i64, 2]),
+        |_integer: i64| {},
+        WalkOrder::PostOrder,
+    )
+    .and_then(Array::<Any>::try_from)
+    .unwrap();
+    assert!(mapped
+        .iter()
+        .all(|value| value.type_index() == TypeIndex::kTVMFFINone as i32));
 }
 
 #[test]

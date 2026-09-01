@@ -73,8 +73,24 @@ pub type MapResult = Result<Any>;
 /// Convert an infallible or fallible callback result into [`MapResult`].
 ///
 /// A callback may return any value convertible into [`Any`], or wrap it in
-/// [`Result`] to use `?`.
-pub trait IntoMapResult {
+/// [`Result`] to use `?`. Because the `Result<T>` conversion is generic, a
+/// callback that only ever returns `Err(..)` must name its `Ok` type, for
+/// example `-> Result<Any>`:
+///
+/// ```compile_fail,E0282
+/// use tvm_ffi::{structural_map, Array, Error, WalkOrder, RUNTIME_ERROR};
+/// let _ = structural_map(
+///     Array::new(vec![1_i64]),
+///     |_value: i64| Err(Error::new(RUNTIME_ERROR, "failed", "origin")),
+///     WalkOrder::PostOrder,
+/// );
+/// ```
+///
+/// Note that `()` and `Result<()>` convert to `None`, so a callback whose body
+/// ends in `;` or `?;` compiles and replaces each matched value with `None`.
+///
+/// This trait is sealed and cannot be implemented outside this crate.
+pub trait IntoMapResult: sealed_result::SealedResult {
     fn into_map_result(self) -> MapResult;
 }
 
@@ -90,6 +106,15 @@ impl<T: Into<Any>> IntoMapResult for Result<T> {
     fn into_map_result(self) -> MapResult {
         self.map(Into::into)
     }
+}
+
+mod sealed_result {
+    use super::{Any, Result};
+
+    pub trait SealedResult {}
+
+    impl<T: Into<Any>> SealedResult for T {}
+    impl<T: Into<Any>> SealedResult for Result<T> {}
 }
 
 /// State and recursive operations available to a mutation callback.
@@ -220,10 +245,9 @@ impl<U: StructuralMutator> IntoMutator<U> for &mut U {
 
 /// Convert a mutation callback result into [`Result<Any>`].
 ///
-/// A callback may return any value convertible into [`Any`], or wrap it in
-/// [`Result`] to use `?`.
+/// Sealed; follows the same conversion rules as [`IntoMapResult`].
 #[doc(hidden)]
-pub trait IntoMutateResult {
+pub trait IntoMutateResult: sealed_result::SealedResult {
     fn into_mutate_result(self) -> Result<Any>;
 }
 
@@ -477,6 +501,22 @@ where
 /// `None` means no handler matched and preserves the current value.  A
 /// generated `#[dispatch(map)]` implementation tests `map_*` methods in
 /// source order and returns the first match.
+///
+/// A handler must declare its return type; `()` would convert to `None` and
+/// replace every matched value, so the macro rejects such a method:
+///
+/// ```compile_fail
+/// use tvm_ffi::dispatch;
+///
+/// struct Count(usize);
+///
+/// #[dispatch(map)]
+/// impl Count {
+///     fn map_integer(&mut self, _value: i64) {
+///         self.0 += 1;
+///     }
+/// }
+/// ```
 pub trait MapDispatch: Sized {
     fn dispatch_map(
         &mut self,

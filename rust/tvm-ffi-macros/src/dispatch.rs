@@ -20,7 +20,10 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{quote, quote_spanned};
-use syn::{parse_macro_input, FnArg, ImplItem, ImplItemMethod, ItemImpl, Meta, NestedMeta, Type};
+use syn::{
+    parse_macro_input, FnArg, ImplItem, ImplItemMethod, ItemImpl, Meta, NestedMeta, ReturnType,
+    Type,
+};
 
 use crate::utils::get_tvm_ffi_crate;
 
@@ -367,6 +370,18 @@ fn parse_handler(method: &ImplItemMethod, mode: DispatchMode) -> syn::Result<Han
             format!(
                 "{} handlers must take `&mut self`, a node, and optionally a trailing \
                  `DefRegionKind` argument",
+                mode.name()
+            ),
+        ));
+    }
+    if matches!(mode, DispatchMode::Map | DispatchMode::Mutate)
+        && matches!(method.sig.output, ReturnType::Default)
+    {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            format!(
+                "{} handlers must declare a return type; a handler returning `()` would \
+                 replace every matched value with `None`",
                 mode.name()
             ),
         ));
