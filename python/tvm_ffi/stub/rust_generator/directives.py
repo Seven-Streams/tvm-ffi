@@ -19,18 +19,23 @@
 The pipeline hands every declared directive to the generator as
 ``(name, payload, lineno)`` (see :class:`~tvm_ffi.stub.generator.Generator`);
 this module owns what the payloads mean. Three address one reflected field as
-``<type_key>.<field>``, one addresses a type::
+``<type_key>.<field>``, three address a type::
 
     // tvm-ffi-stubgen(field): tirx.Add.a -> PrimExpr
     // tvm-ffi-stubgen(nullable): ir.Expr.span
     // tvm-ffi-stubgen(enum): tirx.For.kind -> ForKind(i32) { Serial=0, Parallel=1 }
     // tvm-ffi-stubgen(opaque): ir.SourceName
+    // tvm-ffi-stubgen(upcast): tirx.Add -> PrimExpr
+    // tvm-ffi-stubgen(custom-new): tirx.Add
 
 ``field`` names the Rust type of the field (a bare name the file has in scope,
-or a ``::`` path to ``use``). ``nullable`` wraps the field's type in ``Option``.
-``enum`` declares an open integer newtype for the field. ``opaque`` vetoes the
-by-value mirror of a type whose layout is reproducible but which must not be
-allocated outside its native runtime.
+or a ``::`` path to ``use``); on a field inherited from an ancestor it narrows
+the allocator parameter instead. ``nullable`` wraps the field's type in
+``Option``. ``enum`` declares an open integer newtype for the field. ``opaque``
+vetoes the by-value mirror of a type whose layout is reproducible but which
+must not be allocated outside its native runtime. ``upcast`` adds a typed view
+outside the ancestor chain to the type's ``impl_object_upcast!`` list.
+``custom-new`` marks a type whose ``new`` is hand-written, so none is generated.
 """
 
 from __future__ import annotations
@@ -58,18 +63,20 @@ class EnumSpec:
 
 @dataclasses.dataclass
 class Directives:
-    """The Rust directives of one file, keyed by ``<type_key>.<field>``."""
+    """The Rust directives of one file, keyed by ``<type_key>.<field>`` or ``<type_key>``."""
 
     field_types: dict[str, str] = dataclasses.field(default_factory=dict)
     nullable: set[str] = dataclasses.field(default_factory=set)
     enums: dict[str, EnumSpec] = dataclasses.field(default_factory=dict)
     opaque: set[str] = dataclasses.field(default_factory=set)
+    upcasts: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    custom_new: set[str] = dataclasses.field(default_factory=set)
 
     def add(self, name: str, payload: str, lineno: int) -> None:
         """Parse and store one directive; raise :class:`DirectiveError` when malformed."""
         if name == "field":
-            target, rust_type = _split_arrow(name, payload, lineno)
-            self.field_types[target] = rust_type
+            lhs, rust_type = _split_arrow(name, payload, lineno, "<type_key>.<field> -> <RustType>")
+            self.field_types[_field_target(name, lhs, lineno)] = rust_type
         elif name == "nullable":
             self.nullable.add(_field_target(name, payload, lineno))
         elif name == "enum":
@@ -77,6 +84,11 @@ class Directives:
             self.enums[target] = spec
         elif name == "opaque":
             self.opaque.add(_type_target(name, payload, lineno))
+        elif name == "upcast":
+            lhs, rust_type = _split_arrow(name, payload, lineno, "<type_key> -> <RustType>")
+            self.upcasts.setdefault(_type_target(name, lhs, lineno), []).append(rust_type)
+        elif name == "custom-new":
+            self.custom_new.add(_type_target(name, payload, lineno))
         else:
             raise DirectiveError(f"Unknown directive `{name}` at line {lineno}")
 
@@ -101,12 +113,12 @@ def _field_target(name: str, text: str, lineno: int) -> str:
     return target
 
 
-def _split_arrow(name: str, payload: str, lineno: int) -> tuple[str, str]:
-    """Split ``<type_key>.<field> -> <rust type>``."""
+def _split_arrow(name: str, payload: str, lineno: int, expected: str) -> tuple[str, str]:
+    """Split ``<target> -> <rust type>``; the caller validates the target."""
     lhs, arrow, rhs = payload.partition("->")
     if not arrow or not rhs.strip():
-        raise _invalid(name, lineno, "<type_key>.<field> -> <RustType>")
-    return _field_target(name, lhs, lineno), rhs.strip()
+        raise _invalid(name, lineno, expected)
+    return lhs, rhs.strip()
 
 
 def _parse_enum(payload: str, lineno: int) -> tuple[str, EnumSpec]:
