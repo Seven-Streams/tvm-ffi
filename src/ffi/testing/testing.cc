@@ -30,6 +30,8 @@
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/enum.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/structural_mutate.h>
+#include <tvm/ffi/extra/structural_visit.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/optional.h>
 #include <tvm/ffi/reflection/accessor.h>
@@ -38,6 +40,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -716,6 +719,316 @@ TVM_FFI_STATIC_INIT_BLOCK() {
              return result;
            });
   // NOLINTEND(performance-unnecessary-value-param)
+}
+
+// -----------------------------------------------------------------------------
+// Structural visit / mutate fixtures for the Rust structural tests.
+//
+// The type table leaves registration unsynchronized with lookups, and Rust
+// tests run concurrently, so the Rust structural tests must not register types
+// or type attributes at run time. Every fixture those tests need beyond the
+// built-in containers is defined here and registered when this library loads.
+// -----------------------------------------------------------------------------
+
+/*! \brief FreeVar identity whose only reflected child is a plain (use) field. */
+class TestStructuralFreeVarObj : public Object {
+ public:
+  Any value;
+
+  explicit TestStructuralFreeVarObj(Any value) : value(std::move(value)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindFreeVar;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.TestStructuralFreeVar", TestStructuralFreeVarObj,
+                                    Object);
+};
+
+/*! \brief DAG identity that maps once and reuses that result on every later occurrence. */
+class TestStructuralDagNodeObj : public Object {
+ public:
+  Any value;
+
+  explicit TestStructuralDagNodeObj(Any value) : value(std::move(value)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindDAGNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.TestStructuralDagNode", TestStructuralDagNodeObj,
+                                    Object);
+};
+
+/*!
+ * \brief Tree node whose reflected fields carry every def-region flag combination.
+ *
+ * ``recursive`` opens a recursive def region, ``non_recursive`` a non-recursive one, ``both``
+ * carries both flags (non-recursive wins), ``plain`` inherits the surrounding region and
+ * ``ignored`` is skipped by structural traversal entirely.
+ */
+class TestStructuralDefRegionObj : public Object {
+ public:
+  Any recursive;
+  Any plain;
+  Any non_recursive;
+  Any both;
+  Any ignored;
+
+  TestStructuralDefRegionObj(Any recursive, Any plain, Any non_recursive, Any both, Any ignored)
+      : recursive(std::move(recursive)),
+        plain(std::move(plain)),
+        non_recursive(std::move(non_recursive)),
+        both(std::move(both)),
+        ignored(std::move(ignored)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.TestStructuralDefRegion", TestStructuralDefRegionObj,
+                                    Object);
+};
+
+/*!
+ * \brief Node with a registered ``__s_visit__`` hook.
+ *
+ * Reflection would visit all three fields. The hook visits ``selected`` under the inherited
+ * def region, ``recursive`` under an explicit recursive def region, and never ``ignored``.
+ */
+class TestStructuralVisitHookObj : public Object {
+ public:
+  Any selected;
+  Any recursive;
+  Any ignored;
+
+  TestStructuralVisitHookObj(Any selected, Any recursive, Any ignored)
+      : selected(std::move(selected)),
+        recursive(std::move(recursive)),
+        ignored(std::move(ignored)) {}
+
+  static TVMFFIAny StructuralVisit(StructuralVisitorObj* visitor, AnyView value) noexcept {
+    const auto* self = value.cast<const TestStructuralVisitHookObj*>();
+    TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(visitor->VisitExpected(self->selected));
+    auto result = visitor->WithDefRegionKind(
+        kTVMFFIDefRegionKindRecursive, [&]() { return visitor->VisitExpected(self->recursive); });
+    return details::ExpectedUnsafe::MoveToTVMFFIAny(std::move(result));
+  }
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.TestStructuralVisitHook", TestStructuralVisitHookObj,
+                                    Object);
+};
+
+/*!
+ * \brief DAG node with registered ``__s_mutate__`` and ``__s_maybe_inplace_mutate__`` hooks.
+ *
+ * Reflection would mutate both fields; the hooks only mutate ``value`` and leave ``ignored``
+ * alone, which lets a caller tell hook dispatch apart from the reflected fallback. As a DAG
+ * identity the hooks own the variable-remap policy: the first occurrence is mutated and
+ * recorded, every later occurrence returns the recorded result.
+ */
+class TestStructuralMutateHookObj : public Object {
+ public:
+  Any value;
+  Any ignored;
+
+  TestStructuralMutateHookObj(Any value, Any ignored)
+      : value(std::move(value)), ignored(std::move(ignored)) {}
+
+  static TVMFFIAny StructuralMutate(StructuralMutatorObj* mutator, AnyView value) noexcept {
+    Expected<Any> cached = mutator->VarRemapGetExpected(value);
+    TVM_FFI_S_MUTATE_MAYBE_EARLY_RETURN(cached);
+    if (details::ExpectedUnsafe::GetData(cached).type_index() != TypeIndex::kTVMFFINone) {
+      return details::ExpectedUnsafe::MoveToTVMFFIAny(std::move(cached));
+    }
+    const auto* self = value.cast<const TestStructuralMutateHookObj*>();
+    Expected<Any> mutated = mutator->MutateExpected(self->value);
+    TVM_FFI_S_MUTATE_MAYBE_EARLY_RETURN(mutated);
+    Any mutated_value = details::ExpectedUnsafe::GetData(mutated);
+    Any result = mutated_value.same_as(self->value) ? Any(value)
+                                                    : Any(make_object<TestStructuralMutateHookObj>(
+                                                          std::move(mutated_value), self->ignored));
+    return Remember(mutator, value, std::move(result));
+  }
+
+  static TVMFFIAny StructuralMaybeInplaceMutate(StructuralMutatorObj* mutator,
+                                                AnyView value) noexcept {
+    Expected<Any> cached = mutator->VarRemapGetExpected(value);
+    TVM_FFI_S_MUTATE_MAYBE_EARLY_RETURN(cached);
+    if (details::ExpectedUnsafe::GetData(cached).type_index() != TypeIndex::kTVMFFINone) {
+      return details::ExpectedUnsafe::MoveToTVMFFIAny(std::move(cached));
+    }
+    // The engine only dispatches here when in-place mutation of `value` is permitted.
+    auto* self =
+        const_cast<TestStructuralMutateHookObj*>(value.cast<const TestStructuralMutateHookObj*>());
+    Expected<Any> mutated = mutator->MaybeInplaceMutateExpected(self->value);
+    TVM_FFI_S_MUTATE_MAYBE_EARLY_RETURN(mutated);
+    self->value = details::ExpectedUnsafe::GetData(mutated);
+    return Remember(mutator, value, Any(value));
+  }
+
+  static constexpr bool _type_mutable = true;
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindDAGNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.TestStructuralMutateHook", TestStructuralMutateHookObj,
+                                    Object);
+
+ private:
+  static TVMFFIAny Remember(StructuralMutatorObj* mutator, AnyView source, Any result) noexcept {
+    Expected<void> stored = mutator->VarRemapSetExpected(source, result);
+    if (stored.is_err()) {
+      return details::ExpectedUnsafe::MoveToTVMFFIAny(
+          Expected<Any>(Unexpected(std::move(stored).error())));
+    }
+    return details::AnyUnsafe::MoveAnyToTVMFFIAny(std::move(result));
+  }
+};
+
+/*! \brief Object whose reflected getter writes an owning result and then fails. */
+class TestStructuralFailingGetterObj : public Object {
+ public:
+  Any value;
+
+  explicit TestStructuralFailingGetterObj(Any value) : value(std::move(value)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.TestStructuralFailingGetter",
+                                    TestStructuralFailingGetterObj, Object);
+};
+
+/*! \brief Object whose reflected ``ffi.Function`` setter writes an owning result and then fails. */
+class TestStructuralFailingSetterObj : public Object {
+ public:
+  Any value;
+
+  explicit TestStructuralFailingSetterObj(Any value) : value(std::move(value)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.TestStructuralFailingSetter",
+                                    TestStructuralFailingSetterObj, Object);
+};
+
+namespace {
+
+constexpr const char* kStructuralAccessorFailure = "callback failed after writing an owning result";
+
+int StructuralAnyFieldGetter(void* field, TVMFFIAny* result) {
+  return TVMFFIAnyViewToOwnedAny(reinterpret_cast<const TVMFFIAny*>(field), result);
+}
+
+int StructuralAnyFieldSetter(void* field, const TVMFFIAny* value) {
+  TVM_FFI_SAFE_CALL_BEGIN();
+  *reinterpret_cast<Any*>(field) = AnyView::CopyFromTVMFFIAny(*value);
+  TVM_FFI_SAFE_CALL_END();
+}
+
+int StructuralFailingFieldGetter(void* field, TVMFFIAny* result) {
+  int code = StructuralAnyFieldGetter(field, result);
+  if (code != 0) {
+    return code;
+  }
+  TVMFFIErrorSetRaisedFromCStr("RuntimeError", kStructuralAccessorFailure);
+  return -1;
+}
+
+// A function-valued setter receives (field address, value); it stores the value as an owning
+// result and then fails, so the caller must release that partial result.
+int StructuralFailingFieldSetter(void*, const TVMFFIAny* args, int32_t num_args,
+                                 TVMFFIAny* result) {
+  if (num_args != 2) {
+    TVMFFIErrorSetRaisedFromCStr("TypeError", "field setter expects (field, value)");
+    return -1;
+  }
+  int code = TVMFFIAnyViewToOwnedAny(&args[1], result);
+  if (code != 0) {
+    return code;
+  }
+  TVMFFIErrorSetRaisedFromCStr("RuntimeError", kStructuralAccessorFailure);
+  return -1;
+}
+
+// Register an `Any` field with hand-written accessors. ObjectDef always pairs a field with
+// its generated getter and setter, so an accessor that fails on purpose must be registered
+// through the C API directly. The metadata matches what ObjectDef would have emitted.
+void RegisterStructuralAnyField(int32_t type_index, const char* name, int64_t offset, int64_t flags,
+                                TVMFFIFieldGetter getter, void* setter) {
+  static const std::string metadata =
+      std::string(R"({"type_schema":)") +
+      EscapeStringJSON(String(::tvm::ffi::details::TypeSchema<Any>::v())).c_str() + "}";
+  TVMFFIFieldInfo info{};
+  info.name = TVMFFIByteArray{name, std::char_traits<char>::length(name)};
+  info.doc = TVMFFIByteArray{nullptr, 0};
+  info.metadata = TVMFFIByteArray{metadata.c_str(), metadata.size()};
+  info.flags = flags;
+  info.size = sizeof(Any);
+  info.alignment = alignof(Any);
+  info.offset = offset;
+  info.getter = getter;
+  info.setter = setter;
+  info.default_value_or_factory = AnyView(nullptr).CopyToTVMFFIAny();
+  info.field_static_type_index = TypeIndex::kTVMFFIAny;
+  TVM_FFI_CHECK_SAFE_CALL(TVMFFITypeRegisterField(type_index, &info));
+}
+
+}  // namespace
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+
+  refl::ObjectDef<TestStructuralFreeVarObj>()
+      .def(refl::init<Any>())
+      .def_ro("value", &TestStructuralFreeVarObj::value);
+
+  refl::ObjectDef<TestStructuralDagNodeObj>()
+      .def(refl::init<Any>())
+      .def_ro("value", &TestStructuralDagNodeObj::value);
+
+  refl::ObjectDef<TestStructuralDefRegionObj>()
+      .def(refl::init<Any, Any, Any, Any, Any>())
+      .def_ro("recursive", &TestStructuralDefRegionObj::recursive,
+              refl::AttachFieldFlag::SEqHashDefRecursive())
+      .def_ro("plain", &TestStructuralDefRegionObj::plain)
+      .def_ro("non_recursive", &TestStructuralDefRegionObj::non_recursive,
+              refl::AttachFieldFlag::SEqHashDefNonRecursive())
+      .def_ro("both", &TestStructuralDefRegionObj::both,
+              refl::AttachFieldFlag::SEqHashDefRecursive(),
+              refl::AttachFieldFlag::SEqHashDefNonRecursive())
+      .def_ro("ignored", &TestStructuralDefRegionObj::ignored,
+              refl::AttachFieldFlag::SEqHashIgnore());
+
+  refl::ObjectDef<TestStructuralVisitHookObj>()
+      .def(refl::init<Any, Any, Any>())
+      .def_ro("selected", &TestStructuralVisitHookObj::selected)
+      .def_ro("recursive", &TestStructuralVisitHookObj::recursive)
+      .def_ro("ignored", &TestStructuralVisitHookObj::ignored);
+  refl::EnsureTypeAttrColumn(refl::type_attr::kStructuralVisit);
+  refl::TypeAttrDef<TestStructuralVisitHookObj>().attr(
+      refl::type_attr::kStructuralVisit, reinterpret_cast<void*>(static_cast<FStructuralVisit>(
+                                             &TestStructuralVisitHookObj::StructuralVisit)));
+
+  refl::ObjectDef<TestStructuralMutateHookObj>()
+      .def(refl::init<Any, Any>())
+      .def_rw("value", &TestStructuralMutateHookObj::value)
+      .def_rw("ignored", &TestStructuralMutateHookObj::ignored);
+  refl::EnsureTypeAttrColumn(refl::type_attr::kStructuralMutate);
+  refl::EnsureTypeAttrColumn(refl::type_attr::kStructuralMaybeInplaceMutate);
+  refl::TypeAttrDef<TestStructuralMutateHookObj>()
+      .attr(refl::type_attr::kStructuralMutate,
+            reinterpret_cast<void*>(
+                static_cast<FStructuralMutate>(&TestStructuralMutateHookObj::StructuralMutate)))
+      .attr(refl::type_attr::kStructuralMaybeInplaceMutate,
+            reinterpret_cast<void*>(static_cast<FStructuralMutate>(
+                &TestStructuralMutateHookObj::StructuralMaybeInplaceMutate)));
+
+  // ObjectDef still supplies the constructor, creator and shallow-copy hook; only the field
+  // is registered by hand so its getter can fail after producing an owning value.
+  refl::ObjectDef<TestStructuralFailingGetterObj>().def(refl::init<Any>());
+  RegisterStructuralAnyField(TestStructuralFailingGetterObj::_GetOrAllocRuntimeTypeIndex(), "value",
+                             refl::GetFieldByteOffsetToObject<TestStructuralFailingGetterObj, Any>(
+                                 &TestStructuralFailingGetterObj::value),
+                             0, StructuralFailingFieldGetter,
+                             reinterpret_cast<void*>(StructuralAnyFieldSetter));
+
+  refl::ObjectDef<TestStructuralFailingSetterObj>().def(refl::init<Any>());
+  // The setter Function must outlive every use of the field, so it is intentionally leaked.
+  static const Function* failing_setter =
+      new Function(Function::FromExternC(nullptr, StructuralFailingFieldSetter, nullptr));
+  RegisterStructuralAnyField(TestStructuralFailingSetterObj::_GetOrAllocRuntimeTypeIndex(), "value",
+                             refl::GetFieldByteOffsetToObject<TestStructuralFailingSetterObj, Any>(
+                                 &TestStructuralFailingSetterObj::value),
+                             kTVMFFIFieldFlagBitSetterIsFunctionObj, StructuralAnyFieldGetter,
+                             const_cast<void*>(static_cast<const void*>(failing_setter->get())));
 }
 
 }  // namespace ffi

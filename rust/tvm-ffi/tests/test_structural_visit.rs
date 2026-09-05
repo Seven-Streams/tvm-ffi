@@ -18,9 +18,10 @@
  */
 
 use std::cell::{Cell, RefCell};
+use tvm_ffi::derive::Object as DeriveObject;
 use tvm_ffi::object::ObjectRef;
 use tvm_ffi::{
-    dispatch, get_type_attr, structural_visit, structural_walk, Any, Array, DLDataType,
+    dispatch, get_type_attr, structural_visit, structural_walk, Any, AnyView, Array, DLDataType,
     DLDataTypeCode, DefRegionKind, Error, FieldGetter, Function, Map, Object, ObjectRefCore,
     Result, String as FfiString, StructuralVisitor, TypeIndex, VisitCallbacks, VisitContext,
     VisitInterrupt, VisitValue, WalkOrder, WalkResult, RUNTIME_ERROR,
@@ -28,6 +29,111 @@ use tvm_ffi::{
 
 fn runtime_error(message: &str) -> Error {
     Error::new(RUNTIME_ERROR, message, "")
+}
+
+// ---------------------------------------------------------------------------
+// Fixtures registered by the C++ testing library at load time.
+//
+// The type table does not synchronize registration with lookups and Rust
+// tests run concurrently, so nothing in this file registers a type, field or
+// type attribute. The mirrors below only resolve an already-registered type
+// key to its index; objects are built through each type's `__ffi_init__`.
+// ---------------------------------------------------------------------------
+
+/// Keep the C++ testing library linked so its startup registrations are
+/// available even when a single test runs on its own.
+fn link_testing_library() {
+    assert_eq!(
+        unsafe { tvm_ffi::tvm_ffi_sys::TVMFFITestingDummyTarget() },
+        0
+    );
+}
+
+/// FreeVar identity with one plain reflected child.
+#[repr(C)]
+#[derive(DeriveObject)]
+#[type_key = "testing.TestStructuralFreeVar"]
+#[type_final]
+#[allow(dead_code)]
+struct TestStructuralFreeVarObj {
+    base: Object,
+    value: Any,
+}
+
+fn free_var(value: impl Into<Any>) -> Any {
+    link_testing_library();
+    Function::from_type_key_method("testing.TestStructuralFreeVar", "__ffi_init__")
+        .unwrap()
+        .call_tuple((value.into(),))
+        .unwrap()
+}
+
+/// Tree node whose fields carry every def-region flag combination, in
+/// reflection order: recursive, plain, non_recursive, both, ignored.
+#[repr(C)]
+#[derive(DeriveObject)]
+#[type_key = "testing.TestStructuralDefRegion"]
+#[type_final]
+#[allow(dead_code)]
+struct TestStructuralDefRegionObj {
+    base: Object,
+    recursive: Any,
+    plain: Any,
+    non_recursive: Any,
+    both: Any,
+    ignored: Any,
+}
+
+fn def_region(
+    recursive: impl Into<Any>,
+    plain: impl Into<Any>,
+    non_recursive: impl Into<Any>,
+    both: impl Into<Any>,
+    ignored: impl Into<Any>,
+) -> Any {
+    link_testing_library();
+    Function::from_type_key_method("testing.TestStructuralDefRegion", "__ffi_init__")
+        .unwrap()
+        .call_tuple((
+            recursive.into(),
+            plain.into(),
+            non_recursive.into(),
+            both.into(),
+            ignored.into(),
+        ))
+        .unwrap()
+}
+
+/// Node with a C++ `__s_visit__` hook that visits `selected` under the
+/// inherited def region, `recursive` under a recursive def region, and never
+/// `ignored`.
+#[repr(C)]
+#[derive(DeriveObject)]
+#[type_key = "testing.TestStructuralVisitHook"]
+#[type_final]
+#[allow(dead_code)]
+struct TestStructuralVisitHookObj {
+    base: Object,
+    selected: Any,
+    recursive: Any,
+    ignored: Any,
+}
+
+fn visit_hook(selected: impl Into<Any>, recursive: impl Into<Any>, ignored: impl Into<Any>) -> Any {
+    link_testing_library();
+    Function::from_type_key_method("testing.TestStructuralVisitHook", "__ffi_init__")
+        .unwrap()
+        .call_tuple((selected.into(), recursive.into(), ignored.into()))
+        .unwrap()
+}
+
+/// Object whose reflected getter writes an owning result and then fails.
+fn failing_getter(value: impl Into<Any>) -> Any {
+    link_testing_library();
+    Function::from_type_key_method("testing.TestStructuralFailingGetter", "__ffi_init__")
+        .unwrap()
+        .call_tuple((value.into(),))
+        .unwrap()
 }
 
 #[test]
@@ -83,6 +189,144 @@ fn plain_walk_uses_registered_array_hook() {
     .unwrap()
     .is_none());
     assert_eq!(integers, 3);
+}
+
+#[test]
+fn reflected_getter_releases_partial_result_on_error() {
+    let tracked = FfiString::from("a reference-counted reflected visit field");
+    let root = failing_getter(tracked.clone());
+    let count_before = AnyView::from(&tracked).debug_strong_count();
+
+    let error = match structural_walk(
+        &root,
+        |_value: &VisitValue| WalkResult::Advance,
+        WalkOrder::PreOrder,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("failing getter unexpectedly succeeded"),
+    };
+    assert_eq!(
+        error.message(),
+        "callback failed after writing an owning result"
+    );
+    assert!(error.backtrace().contains("field `value`"));
+    assert_eq!(AnyView::from(&tracked).debug_strong_count(), count_before);
+}
+
+#[test]
+fn registered_hook_controls_children_and_def_regions() {
+    let root = visit_hook(11i64, 12i64, 99i64);
+
+    // Reflection would visit all three fields. The registered hook visits
+    // `selected` under the inherited region and `recursive` under an explicit
+    // recursive region, and never reaches `ignored`.
+    let mut seen = Vec::new();
+    assert!(structural_walk(
+        &root,
+        |value: i64, kind: DefRegionKind| {
+            seen.push((value, kind));
+            WalkResult::Advance
+        },
+        WalkOrder::PreOrder,
+    )
+    .unwrap()
+    .is_none());
+    assert_eq!(
+        seen,
+        vec![(11, DefRegionKind::None), (12, DefRegionKind::Recursive)]
+    );
+
+    #[derive(Default)]
+    struct RecordingVisitor {
+        integers: Vec<i64>,
+    }
+    impl StructuralVisitor for RecordingVisitor {
+        fn visit(
+            &mut self,
+            value: &VisitValue,
+            def_region_kind: DefRegionKind,
+        ) -> Result<Option<VisitInterrupt>> {
+            if let Some(integer) = value.cast::<i64>() {
+                self.integers.push(integer);
+            }
+            self.default_visit_children(value, def_region_kind)
+        }
+    }
+    let mut visitor = RecordingVisitor::default();
+    assert!(structural_visit(&root, &mut visitor).unwrap().is_none());
+    assert_eq!(visitor.integers, vec![11, 12]);
+
+    let callback_integers = RefCell::new(Vec::new());
+    assert!(
+        structural_visit(&root, |value: i64, _visitor: &mut VisitContext<'_, ()>| {
+            callback_integers.borrow_mut().push(value)
+        })
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(*callback_integers.borrow(), vec![11, 12]);
+
+    // The hook inherits the def region of the reflected field that reaches it.
+    let wrapped = def_region(root.clone(), Any::new(), Any::new(), Any::new(), Any::new());
+    let mut seen = Vec::new();
+    assert!(structural_walk(
+        &wrapped,
+        |value: i64, kind: DefRegionKind| {
+            seen.push((value, kind));
+            WalkResult::Advance
+        },
+        WalkOrder::PreOrder,
+    )
+    .unwrap()
+    .is_none());
+    assert_eq!(
+        seen,
+        vec![
+            (11, DefRegionKind::Recursive),
+            (12, DefRegionKind::Recursive)
+        ]
+    );
+}
+
+#[test]
+fn registered_hook_propagates_interrupts_and_errors() {
+    let root = visit_hook(11i64, 12i64, 99i64);
+
+    let mut visited = Vec::new();
+    let outcome = structural_walk(
+        &root,
+        |value: i64| {
+            visited.push(value);
+            match value {
+                11 => WalkResult::interrupt_with(FfiString::from("stop")),
+                _ => WalkResult::Advance,
+            }
+        },
+        WalkOrder::PreOrder,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(FfiString::try_from(outcome.value).unwrap().as_str(), "stop");
+    assert_eq!(visited, vec![11]);
+
+    let error = match structural_walk(
+        &root,
+        |value: i64| -> Result<WalkResult> {
+            if value == 12 {
+                Err(runtime_error("hook child failed"))
+            } else {
+                Ok(WalkResult::Advance)
+            }
+        },
+        WalkOrder::PreOrder,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("failing handler under a registered hook unexpectedly succeeded"),
+    };
+    assert_eq!(error.message(), "hook child failed");
+    assert!(error
+        .backtrace()
+        .contains("object `testing.TestStructuralVisitHook`"));
 }
 
 #[test]
@@ -1006,6 +1250,94 @@ fn def_region_is_inherited_through_containers() {
 }
 
 #[test]
+fn reflected_field_def_region_reaches_typed_handler() {
+    let root = def_region(1i64, 2i64, 3i64, 4i64, 5i64);
+    let mut seen = Vec::new();
+    assert!(structural_walk(
+        &root,
+        |_value: i64, kind: DefRegionKind| {
+            seen.push(kind);
+            WalkResult::Advance
+        },
+        WalkOrder::PreOrder,
+    )
+    .unwrap()
+    .is_none());
+    // `ignored` carries SEqHashIgnore and is never visited; `both` resolves
+    // to the non-recursive region.
+    assert_eq!(
+        seen,
+        vec![
+            DefRegionKind::Recursive,
+            DefRegionKind::None,
+            DefRegionKind::NonRecursive,
+            DefRegionKind::NonRecursive,
+        ]
+    );
+}
+
+struct FreeVarClampProbe {
+    at_root: bool,
+    seen: Vec<(&'static str, DefRegionKind)>,
+}
+
+impl StructuralVisitor for FreeVarClampProbe {
+    fn visit(
+        &mut self,
+        value: &VisitValue,
+        def_region_kind: DefRegionKind,
+    ) -> Result<Option<VisitInterrupt>> {
+        if self.at_root {
+            self.at_root = false;
+            let root = value.cast::<Array<Any>>().unwrap();
+            for child in root.iter() {
+                if let Some(interrupt) = self.visit_child(&child, DefRegionKind::NonRecursive)? {
+                    return Ok(Some(interrupt));
+                }
+            }
+            return Ok(None);
+        }
+
+        if value.as_node::<TestStructuralFreeVarObj>().is_some() {
+            self.seen.push(("free_var", def_region_kind));
+        } else if value.cast::<Array<i64>>().is_some() {
+            self.seen.push(("array", def_region_kind));
+        } else if let Some(integer) = value.cast::<i64>() {
+            self.seen.push((
+                if integer == 6 {
+                    "free_child"
+                } else {
+                    "array_child"
+                },
+                def_region_kind,
+            ));
+        }
+        self.default_visit_children(value, def_region_kind)
+    }
+}
+
+#[test]
+fn non_recursive_region_is_clamped_for_free_var_children_only() {
+    // A non-recursive def applies to the FreeVar itself but not to its own
+    // reflected children; a plain container under the same region keeps it.
+    let root = Array::new(vec![free_var(6i64), Any::from(Array::new(vec![7i64]))]);
+    let mut probe = FreeVarClampProbe {
+        at_root: true,
+        seen: Vec::new(),
+    };
+    assert!(structural_visit(&root, &mut probe).unwrap().is_none());
+    assert_eq!(
+        probe.seen,
+        vec![
+            ("free_var", DefRegionKind::NonRecursive),
+            ("free_child", DefRegionKind::None),
+            ("array", DefRegionKind::NonRecursive),
+            ("array_child", DefRegionKind::NonRecursive),
+        ]
+    );
+}
+
+#[test]
 fn reflected_fields_reach_typed_handlers() {
     // Reference the existing test library so its C++ startup registrations are linked.
     assert_eq!(
@@ -1285,6 +1617,39 @@ fn callback_visit_supports_node_links_and_nested_tuples() {
     assert_eq!(
         *seen.borrow(),
         vec![(1, DefRegionKind::None), (2, DefRegionKind::None)]
+    );
+}
+
+#[test]
+fn callback_visit_node_link_sees_reflected_def_regions() {
+    let root = def_region(1i64, 2i64, 3i64, 4i64, 5i64);
+    let seen = RefCell::new(Vec::new());
+
+    assert!(structural_visit(
+        &root,
+        (
+            (
+                |_value: f64, _visitor: &mut VisitContext<'_, ()>| {},
+                |_node: &TestStructuralDefRegionObj, visitor: &mut VisitContext<'_, ()>| {
+                    assert_eq!(visitor.def_region_kind(), DefRegionKind::None);
+                    visitor.visit_children()
+                },
+            ),
+            |value: i64, visitor: &mut VisitContext<'_, ()>| {
+                seen.borrow_mut().push((value, visitor.def_region_kind()));
+            },
+        ),
+    )
+    .unwrap()
+    .is_none());
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            (1, DefRegionKind::Recursive),
+            (2, DefRegionKind::None),
+            (3, DefRegionKind::NonRecursive),
+            (4, DefRegionKind::NonRecursive),
+        ]
     );
 }
 
